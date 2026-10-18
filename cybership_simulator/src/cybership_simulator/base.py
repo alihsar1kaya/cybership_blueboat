@@ -18,6 +18,8 @@ from geometry_msgs.msg import (
     WrenchStamped,
     PoseWithCovarianceStamped,
 )
+from geometry_msgs.msg import Vector3
+from cybership_interfaces.msg import ThrusterState
 from tf2_ros import TransformBroadcaster
 from rosgraph_msgs.msg import Clock
 
@@ -225,6 +227,43 @@ class BaseSimulator(Node, ABC):
         msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z = (float(v) for v in tau[0:3])
         msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = (float(v) for v in tau[3:6])
         self.publisher_applied_force.publish(msg)
+
+    def publish_thruster_state(self, name: str, frame_link: str, fx: float, fy: float = 0.0, azimuth: bool = False):
+        """
+        Publish the actual state of one thruster on thruster/<name>/state.
+        fx, fy: force actually applied in the sim (after clipping/deadband), in the thruster's mounting frame.
+        For azimuth thrusters the angle is atan2(fy, fx); fixed thrusters report angle 0.
+        The sim has no propeller model yet, so rpm is NaN.
+        """
+        if not hasattr(self, "_thruster_state_pubs"):
+            self._thruster_state_pubs = {}
+            self._thruster_last = {}  # name -> (angle, time_s)
+        if name not in self._thruster_state_pubs:
+            self._thruster_state_pubs[name] = self.create_publisher(ThrusterState, f"thruster/{name}/state", 10)
+
+        now = self.get_clock().now()
+        now_s = now.nanoseconds * 1e-9
+        last_angle, last_t = self._thruster_last.get(name, (0.0, None))
+
+        if azimuth and np.hypot(fx, fy) > 0.0:
+            angle = float(np.arctan2(fy, fx))
+        else:
+            angle = last_angle if azimuth else 0.0
+
+        angle_rate = 0.0
+        if last_t is not None and now_s > last_t:
+            d_angle = (angle - last_angle + np.pi) % (2 * np.pi) - np.pi
+            angle_rate = d_angle / (now_s - last_t)
+        self._thruster_last[name] = (angle, now_s)
+
+        msg = ThrusterState()
+        msg.header.stamp = now.to_msg()
+        msg.header.frame_id = self._frame(frame_link)
+        msg.force = Vector3(x=float(fx), y=float(fy), z=0.0)
+        msg.rpm = float("nan")
+        msg.angle = angle
+        msg.angle_rate = float(angle_rate)
+        self._thruster_state_pubs[name].publish(msg)
 
     def publish_clock(self):
         """

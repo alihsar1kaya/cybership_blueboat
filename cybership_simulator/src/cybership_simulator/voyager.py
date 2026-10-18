@@ -93,6 +93,7 @@ class VoyagerSimulator(BaseSimulator):
         issued.header.stamp = self.get_clock().now().to_msg()
         issued.wrench.force.x = msg.force.x
         self.publisher_tunnel_thruster.publish(issued)
+        self.publish_thruster_state("tunnel", "bow_tunnel_thruster_link", float(self.u[0, 0]))
 
     def cb_port_thruster(self, msg: geometry_msgs.msg.Wrench):
         fx = np.clip(msg.force.x, -1.0, 1.0)
@@ -109,6 +110,7 @@ class VoyagerSimulator(BaseSimulator):
         issued.wrench.force.x = fx
         issued.wrench.force.y = fy
         self.publisher_port_thruster.publish(issued)
+        self.publish_thruster_state("port", "stern_port_thruster_link", fx, fy, azimuth=True)
 
     def cb_starboard_thruster(self, msg: geometry_msgs.msg.Wrench):
         fx = np.clip(msg.force.x, -1.0, 1.0)
@@ -125,6 +127,7 @@ class VoyagerSimulator(BaseSimulator):
         issued.wrench.force.x = fx
         issued.wrench.force.y = fy
         self.publisher_starboard_thruster.publish(issued)
+        self.publish_thruster_state("starboard", "stern_starboard_thruster_link", fx, fy, azimuth=True)
 
 # ----------------------------------------------------------------------------
 # Main entry point
