@@ -59,6 +59,9 @@ class BaseSimulator(Node, ABC):
         self.publisher_odom = self.create_publisher(Odometry, "measurement/odom", 1)
         self.publisher_pose = self.create_publisher(PoseWithCovarianceStamped, "measurement/pose", 1)
 
+        # Total generalized force actually applied to the vessel (tau_applied), in the body frame
+        self.publisher_applied_force = self.create_publisher(WrenchStamped, "control/force/applied", 1)
+
         # Add clock publisher for simulated time
         self.sim_time = 0.0
         self.clock_msg = Clock()
@@ -208,6 +211,20 @@ class BaseSimulator(Node, ABC):
 
         self.publish_odom()
         self.publish_tf()
+        self.publish_applied_force(tau)
+
+    def publish_applied_force(self, tau):
+        """
+        Publish the total force/moment applied to the vessel (body frame).
+        Lets tests compare what the controller asked for (control/force/command)
+        with what the vessel actually received.
+        """
+        msg = WrenchStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._frame(self.body_frame_id)
+        msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z = (float(v) for v in tau[0:3])
+        msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = (float(v) for v in tau[3:6])
+        self.publisher_applied_force.publish(msg)
 
     def publish_clock(self):
         """
