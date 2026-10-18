@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Configurable vessel simulator.
+
+Instead of one hand-written class per vessel (voyager.py, enterprise.py, ...), this
+simulator builds the hull and thrusters from a YAML file:
+
+    cybership_config/config/<vessel_model>/vessel.yaml
+
+Run:
+    ros2 run cybership_simulator vessel.py --ros-args -r __ns:=/voyager \
+        -p vessel_model:=voyager -p tf_prefix:=voyager
+"""
+
+import os
+
+import numpy as np
+import yaml
+import rclpy
+import geometry_msgs.msg
+import shoeboxpy.model6dof
+import skadipy
+from ament_index_python.packages import get_package_share_directory
+
+from cybership_simulator.base import BaseSimulator
+
+
+class ConfigurableSimulator(BaseSimulator):
+    """Simulator whose hull and thrusters come from vessel.yaml."""
+
+    def __init__(self):
+        super().__init__(node_name="vessel_simulator")
+
+    # ------------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------------
+
+    def _load_config(self):
+        """Read vessel.yaml once. Called from _create_vessel (the first hook BaseSimulator runs)."""
+        if hasattr(self, "config"):
+            return
+        self.declare_parameter("vessel_model", "voyager")
+        self.declare_parameter("vessel_config", "")  # optional explicit path, overrides vessel_model
+        path = self.get_parameter("vessel_config").value
+        if not path:
+            model = self.get_parameter("vessel_model").value
+            path = os.path.join(
+                get_package_share_directory("cybership_config"), "config", model, "vessel.yaml"
+            )
+        with open(path, "r") as f:
+            self.config = yaml.safe_load(f)
+        self.get_logger().info(
+            f"Loaded vessel '{self.config['name']}' with "
+            f"{len(self.config['thrusters'])} thrusters from {path}"
+        )
+
+    # ------------------------------------------------------------------------
+    # BaseSimulator hooks
+    # ------------------------------------------------------------------------
+
+    def _create_vessel(self):
+        self._load_config()
+        hull = self.config["hull"]
+        return shoeboxpy.model6dof.Shoebox(
+            L=hull["length"], B=hull["beam"], T=hull["draft"],
+            GM_phi=hull.get("GM_phi", 0.0), GM_theta=hull.get("GM_theta", 0.0),
+            eta0=self.eta0.flatten(),
+        )
+
+    def _init_allocator(self):
+        """Build skadipy actuators from the thruster list. The simulator only uses the B matrix."""
+        actuators = []
+        self._thruster_index = {}  # name -> first column in u
+        col = 0
+        for t in self.config["thrusters"]:
+            position = skadipy.toolbox.Point(t["position"])
+            if t["type"] == "fixed":
+                actuators.append(skadipy.actuator.Fixed(
+                    position=position,
+                    orientation=skadipy.toolbox.Quaternion(
+                        axis=(0.0, 0.0, 1.0), radians=np.deg2rad(t.get("direction_deg", 0.0))
+                    ),
+                ))
+                self._thruster_index[t["name"]] = col
+                col += 1
+            elif t["type"] == "azimuth":
+                actuators.append(skadipy.actuator.Azimuth(position=position))
+                self._thruster_index[t["name"]] = col
+                col += 2
+            else:
+                raise ValueError(f"Unknown thruster type '{t['type']}' for thruster '{t['name']}'")
+        self._n_inputs = col
+
+        dofs = [
+            skadipy.allocator._base.ForceTorqueComponent.X,
+            skadipy.allocator._base.ForceTorqueComponent.Y,
+            skadipy.allocator._base.ForceTorqueComponent.Z,
+            skadipy.allocator._base.ForceTorqueComponent.K,
+            skadipy.allocator._base.ForceTorqueComponent.M,
+            skadipy.allocator._base.ForceTorqueComponent.N,
+        ]
+        return skadipy.allocator.PseudoInverse(actuators=actuators, force_torque_components=dofs)
+
+    def setup_thrusters(self):
+        self.u = np.zeros((self._n_inputs, 1))
+        self._issued_pubs = {}
+        for t in self.config["thrusters"]:
+            name = t["name"]
+            self._issued_pubs[name] = self.create_publisher(
+                geometry_msgs.msg.WrenchStamped, f"thruster/{name}/issued", 1
+            )
+            self.create_subscription(
+                geometry_msgs.msg.Wrench, f"thruster/{name}/command",
+                lambda msg, t=t: self._on_thruster_command(t, msg), 10,
+            )
+
+    # ------------------------------------------------------------------------
+    # Thruster command handling (same clipping/deadband as the old per-vessel callbacks)
+    # ------------------------------------------------------------------------
+
+    def _on_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
+        name = t["name"]
+        idx = self._thruster_index[name]
+        max_f = float(t.get("max_force", np.inf))
+        deadband = float(t.get("deadband", 0.0))
+
+        if t["type"] == "fixed":
+            fx = float(np.clip(msg.force.x, -max_f, max_f))
+            if abs(fx) < deadband:
+                fx = 0.0
+            fy = 0.0
+            self.u[idx, 0] = fx
+        else:  # azimuth
+            fx = float(np.clip(msg.force.x, -max_f, max_f))
+            fy = float(np.clip(msg.force.y, -max_f, max_f))
+            if np.hypot(fx, fy) < deadband:
+                fx, fy = 0.0, 0.0
+            self.u[idx, 0] = fx
+            self.u[idx + 1, 0] = fy
+
+        issued = geometry_msgs.msg.WrenchStamped()
+        issued.header.frame_id = self._frame(t["frame"])
+        issued.header.stamp = self.get_clock().now().to_msg()
+        issued.wrench.force.x = fx
+        issued.wrench.force.y = fy
+        self._issued_pubs[name].publish(issued)
+
+        self.publish_thruster_state(name, t["frame"], fx, fy, azimuth=(t["type"] == "azimuth"))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    simulator = ConfigurableSimulator()
+    try:
+        rclpy.spin(simulator)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        pass  # normal stop (Ctrl+C / launch shutdown)
+    finally:
+        simulator.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

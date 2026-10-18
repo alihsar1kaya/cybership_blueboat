@@ -1,0 +1,43 @@
+# Vessel description for the configurable simulator (cybership_simulator/vessel.py).
+# Adding a new vessel = copying this file to config/<vessel>/vessel.yaml and changing the numbers.
+#
+# Frames: body frame is NED (x forward, y starboard, z down), origin at CO.
+# Values below are copied from cybership_simulator/voyager.py so behaviour is unchanged.
+
+name: voyager
+
+# Hull model: shoeboxpy 6DOF "shoebox" (mass = rho * length * beam * draft).
+hull:
+  length: 1.0        # [m]
+  beam: 0.3          # [m]
+  draft: 0.08        # [m]
+  GM_phi: 0.02       # metacentric height, roll [m]
+  GM_theta: 0.02     # metacentric height, pitch [m]
+
+# Thrusters. Topics: thruster/<name>/command (in), thruster/<name>/state (out).
+#   type: fixed   -> one force along its direction (direction_deg about z, 0 = forward)
+#   type: azimuth -> force vector (fx, fy) in the body frame (extended thrust)
+#   max_force: per-component limit [N] (.inf = no limit)
+#   deadband:  commands smaller than this are set to zero [N]
+thrusters:
+  - name: tunnel
+    type: fixed
+    frame: bow_tunnel_thruster_link
+    position: [0.3875, 0.0, -0.01]   # [m] from CO
+    direction_deg: 90.0              # pushes to starboard
+    max_force: .inf
+    deadband: 0.05
+
+  - name: port
+    type: azimuth
+    frame: stern_port_thruster_link
+    position: [-0.4574, -0.055, -0.1]
+    max_force: 1.0
+    deadband: 0.1
+
+  - name: starboard
+    type: azimuth
+    frame: stern_starboard_thruster_link
+    position: [-0.4547, 0.055, -0.1]
+    max_force: 1.0
+    deadband: 0.1

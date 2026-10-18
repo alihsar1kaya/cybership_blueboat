@@ -23,6 +23,7 @@ install(
     src/${PROJECT_NAME}/voyager.py
     src/${PROJECT_NAME}/enterprise.py
     src/${PROJECT_NAME}/drillship.py
+    src/${PROJECT_NAME}/vessel.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
