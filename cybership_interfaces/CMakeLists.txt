@@ -13,6 +13,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 set(msg_files
   msg/PerformanceMetrics.msg
+  msg/ThrusterState.msg
 )
 set(srv_files
   srv/ResetSimulator.srv
