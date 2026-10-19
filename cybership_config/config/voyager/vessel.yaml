@@ -1,8 +1,10 @@
-# Vessel description for the configurable simulator (cybership_simulator/vessel.py).
+# Vessel description, shared by the configurable simulator (cybership_simulator/vessel.py)
+# and the configurable thrust allocation (cybership_dp/vessel_allocation_node.py).
 # Adding a new vessel = copying this file to config/<vessel>/vessel.yaml and changing the numbers.
 #
 # Frames: body frame is NED (x forward, y starboard, z down), origin at CO.
-# Values below are copied from cybership_simulator/voyager.py so behaviour is unchanged.
+# Values below are copied from cybership_simulator/voyager.py and
+# cybership_dp/voyager/force_controller.py so behaviour is unchanged.
 
 name: voyager
 
@@ -14,11 +16,22 @@ hull:
   GM_phi: 0.02       # metacentric height, roll [m]
   GM_theta: 0.02     # metacentric height, pitch [m]
 
+# Thrust allocation (used by the allocation node, not by the simulator).
+#   method: pseudo_inverse (weighted, with optional bias forces in the null space)
+#   dofs:   which components of tau the allocator solves for
+allocation:
+  method: pseudo_inverse
+  dofs: [X, Y, N]
+
 # Thrusters. Topics: thruster/<name>/command (in), thruster/<name>/state (out).
 #   type: fixed   -> one force along its direction (direction_deg about z, 0 = forward)
 #   type: azimuth -> force vector (fx, fy) in the body frame (extended thrust)
-#   max_force: per-component limit [N] (.inf = no limit)
-#   deadband:  commands smaller than this are set to zero [N]
+#   max_force: per-component limit in the simulator [N] (.inf = no limit)
+#   deadband:  commands smaller than this are set to zero in the simulator [N]
+#   allocation (optional):
+#     weight:           cost weight in the pseudo-inverse (higher = used less), default 1.0
+#     bias_force:       [fx, fy] the azimuth should push when tau = 0 (keeps the angle from flapping)
+#     saturation_limit, rate_limit, reference_angle_deg: for the dynamic allocator (not used yet)
 thrusters:
   - name: tunnel
     type: fixed
@@ -27,6 +40,10 @@ thrusters:
     direction_deg: 90.0              # pushes to starboard
     max_force: .inf
     deadband: 0.05
+    allocation:
+      weight: 10.0
+      saturation_limit: 0.7
+      rate_limit: 0.1
 
   - name: port
     type: azimuth
@@ -34,6 +51,11 @@ thrusters:
     position: [-0.4574, -0.055, -0.1]
     max_force: 1.0
     deadband: 0.1
+    allocation:
+      bias_force: [0.0, 0.05]
+      saturation_limit: 1.0
+      rate_limit: 0.1
+      reference_angle_deg: 90.0
 
   - name: starboard
     type: azimuth
@@ -41,3 +63,8 @@ thrusters:
     position: [-0.4547, 0.055, -0.1]
     max_force: 1.0
     deadband: 0.1
+    allocation:
+      bias_force: [0.0, -0.05]
+      saturation_limit: 1.0
+      rate_limit: 0.1
+      reference_angle_deg: -90.0
