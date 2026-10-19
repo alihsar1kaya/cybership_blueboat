@@ -1,8 +1,11 @@
 # Helga: NTNU's customized BlueBoat (catamaran).
 # 2 fixed thrusters at the stern (one under each hull) + 1 azimuth at the bow on the centerline.
 #
-# !!! ALL NUMBERS ARE ESTIMATES (BlueBoat / T200 datasheets) until measured on the real boat. !!!
-# Still missing: thruster positions, mass/CG, azimuth rotation range and speed, thrust curves.
+# !!! Numbers are from the stock BlueBoat datasheet (bluerobotics.com, read 2026-10-20) or estimates.
+# Helga is modified (extra bow azimuth, electronics), so replace them with measurements when available.
+# Datasheet: 120 x 93 x 46 cm (L x W x H, deployed), 14.5 kg without batteries, 2 batteries 2.4 kg,
+# freeboard 160 mm (2 batteries), max static thrust 8.2 kgf (both motors), max speed 3 m/s.
+# Still missing: real mass with modifications, CG, thruster positions, azimuth range/speed, thrust curves.
 #
 # Frames: body frame NED (x forward, y starboard, z down), origin at CO on the waterline.
 # Positions must match cybership_description/urdf/model/helga/base.urdf.xacro.
@@ -11,12 +14,13 @@ name: helga
 
 # Hull model: shoeboxpy 6DOF box (mass = rho * length * beam * draft).
 # A catamaran is NOT a box: with the real draft the box mass would be ~6x too high.
-# Workaround until mass can be given directly: 'draft' is chosen so the box mass is ~18 kg
-# (1000 * 1.2 * 1.0 * 0.015). This is a modelling hack, not the real draft (~0.1 m).
+# Workaround until mass can be given directly: 'draft' is chosen so the box mass is
+# 14.5 kg + 2.4 kg (2 batteries) = 16.9 kg: 1000 * 1.2 * 0.93 * 0.0151 = 16.9 kg.
+# This is a modelling hack, not the real draft (~0.1 m).
 hull:
-  length: 1.2        # [m] overall length (estimate)
-  beam: 1.0          # [m] overall width over both hulls (estimate)
-  draft: 0.015       # [m] EFFECTIVE draft giving ~18 kg, see note above
+  length: 1.2        # [m] overall length (datasheet)
+  beam: 0.93         # [m] overall width over both hulls, deployed (datasheet)
+  draft: 0.0151      # [m] EFFECTIVE draft giving 16.9 kg, see note above
   GM_phi: 0.3        # [m] catamarans are very stable in roll (estimate)
   GM_theta: 0.5      # [m] (estimate)
 
@@ -28,9 +32,9 @@ thrusters:
   - name: port
     type: fixed
     frame: stern_port_thruster_link
-    position: [-0.55, -0.4, 0.13]    # [m] under the port hull (estimate)
+    position: [-0.55, -0.365, 0.13]    # [m] under the port hull (estimate)
     direction_deg: 0.0               # pushes forward
-    max_force: 40.0                  # [N] T200 at ~16 V, forward (estimate; reverse is lower)
+    max_force: 40.0                  # [N] datasheet: 8.2 kgf (80 N) for both motors -> 40 N each, forward
     deadband: 0.5
     allocation:
       weight: 1.0
@@ -38,7 +42,7 @@ thrusters:
   - name: starboard
     type: fixed
     frame: stern_starboard_thruster_link
-    position: [-0.55, 0.4, 0.13]
+    position: [-0.55, 0.365, 0.13]
     direction_deg: 0.0
     max_force: 40.0
     deadband: 0.5

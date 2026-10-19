@@ -3,7 +3,7 @@
   Helga: NTNU's customized BlueBoat (catamaran).
   2 fixed thrusters at the stern (one under each hull) + 1 azimuth thruster at the bow on the centerline.
 
-  ALL DIMENSIONS ARE ESTIMATES (BlueBoat datasheet ~1.2 m x 1.0 m) until measured on the real boat.
+  Overall size from the BlueBoat datasheet (120 x 93 cm deployed); hull width and other details are estimates.
   Visual geometry is drawn in base_link (x forward, y left, z up, origin at CO on the waterline).
   Thruster/sensor frames are in base_link_ned (x forward, y starboard, z down), like the other vessels,
   and must match the positions in cybership_config/config/helga/vessel.yaml.
@@ -13,10 +13,10 @@
     <xacro:property name="hull_length" value="1.2" />
     <xacro:property name="hull_width" value="0.2" />
     <xacro:property name="hull_height" value="0.25" />
-    <xacro:property name="hull_offset" value="0.4" />   <!-- hull centerline distance from boat centerline -->
+    <xacro:property name="hull_offset" value="0.365" />   <!-- hull centerline distance from boat centerline -->
     <xacro:property name="draft" value="0.1" />         <!-- hull depth below waterline -->
 
-    <material name="hull_blue"><color rgba="0.10 0.30 0.65 1.0" /></material>
+    <material name="hull_blue"><color rgba="0.20 0.40 0.80 1.0" /></material>
     <material name="deck_grey"><color rgba="0.55 0.58 0.60 1.0" /></material>
     <material name="thruster_yellow"><color rgba="0.95 0.80 0.10 1.0" /></material>
     <material name="dark"><color rgba="0.15 0.15 0.15 1.0" /></material>
@@ -127,8 +127,8 @@
         </joint>
     </xacro:macro>
 
-    <xacro:thruster thruster_name="stern_port_thruster"      origin_xyz="-0.55 -0.4 0.13" origin_rpy="0 0 0" />
-    <xacro:thruster thruster_name="stern_starboard_thruster" origin_xyz="-0.55 0.4 0.13"  origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="stern_port_thruster"      origin_xyz="-0.55 -0.365 0.13" origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="stern_starboard_thruster" origin_xyz="-0.55 0.365 0.13" origin_rpy="0 0 0" />
     <xacro:thruster thruster_name="bow_azimuth_thruster"     origin_xyz="0.45 0 0.15"     origin_rpy="0 0 0" />
 
 </robot>
