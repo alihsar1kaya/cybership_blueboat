@@ -25,6 +25,7 @@ def _launch_setup(context, *args, **kwargs):
     vessel = launch.substitutions.LaunchConfiguration("vessel").perform(context)
     vessel_name = launch.substitutions.LaunchConfiguration("vessel_name").perform(context) or vessel
     use_gui = launch.substitutions.LaunchConfiguration("use_gui").perform(context).lower() == "true"
+    use_dp = launch.substitutions.LaunchConfiguration("dp").perform(context).lower() == "true"
 
     # URDF: vessel-specific if it exists, else the generic 'any' model
     description_dir = get_package_share_directory("cybership_description")
@@ -69,6 +70,8 @@ def _launch_setup(context, *args, **kwargs):
             }],
         ),
     ]
+    if use_dp:
+        actions += _dp_actions(vessel, vessel_name)
     if use_gui:
         actions.append(launch_ros.actions.Node(
             package="rviz2",
@@ -78,6 +81,69 @@ def _launch_setup(context, *args, **kwargs):
             arguments=["-d", rviz_config],
             parameters=[{"use_sim_time": True}],
         ))
+    return actions
+
+
+def _dp_actions(vessel, vessel_name):
+    """Allocation, force mux, position controller and goal client (the DP stack)."""
+    config_dir = os.path.join(get_package_share_directory("cybership_config"), "config")
+    controller_params = os.path.join(config_dir, vessel, "controller_position.yaml")
+    actions = []
+    if not os.path.exists(controller_params):
+        actions.append(launch.actions.LogInfo(
+            msg=f"No controller_position.yaml for '{vessel}', using voyager's gains"))
+        controller_params = os.path.join(config_dir, "voyager", "controller_position.yaml")
+
+    actions += [
+        # Workaround: position_control_node transforms goals into frame 'odom',
+        # which nothing publishes in simulation (see known bugs).
+        launch_ros.actions.Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name=f"world_to_odom_{vessel_name}",
+            arguments=["--frame-id", "world", "--child-frame-id", "odom"],
+        ),
+        # Thrust allocation from vessel.yaml
+        launch_ros.actions.Node(
+            package="cybership_dp",
+            executable="vessel_allocation_node.py",
+            namespace=vessel_name,
+            output="screen",
+            parameters=[{"vessel_model": vessel, "frequency": 20.0}],
+            remappings=[("control/force/command", "control/force/command/mux")],
+        ),
+        # Force mux. The first input is selected at start, so the position controller drives the boat.
+        launch_ros.actions.Node(
+            package="topic_tools",
+            executable="mux",
+            namespace=vessel_name,
+            name="force_mux",
+            arguments=[
+                "control/force/command/mux",       # output
+                "control/force/command/position",  # inputs (first = selected at start)
+                "control/force/command",
+                "control/force/command/manual",
+                "control/force/command/velocity",
+                "control/force/command/los",
+            ],
+        ),
+        # Position (DP) controller and the client that turns /goal_pose (RViz "2D Goal Pose") into goals
+        launch_ros.actions.Node(
+            package="cybership_dp",
+            executable="position_control_node.py",
+            namespace=vessel_name,
+            name="position_controller",
+            output="screen",
+            parameters=[controller_params],
+            remappings=[("control/force/command", "control/force/command/position")],
+        ),
+        launch_ros.actions.Node(
+            package="cybership_dp",
+            executable="position_control_client_node.py",
+            namespace=vessel_name,
+            name="position_control_client",
+        ),
+    ]
     return actions
 
 
@@ -91,5 +157,8 @@ def generate_launch_description():
             description="Namespace for the vessel (default: same as vessel)"),
         launch.actions.DeclareLaunchArgument(
             "use_gui", default_value="true", description="Start RViz"),
+        launch.actions.DeclareLaunchArgument(
+            "dp", default_value="false",
+            description="Also start the DP stack (allocation, mux, position controller)"),
         launch.actions.OpaqueFunction(function=_launch_setup),
     ])
