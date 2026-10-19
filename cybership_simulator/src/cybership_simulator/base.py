@@ -273,7 +273,8 @@ class BaseSimulator(Node, ABC):
         self.clock_msg.clock.nanosec = int((self.sim_time - int(self.sim_time)) * 1e9)
         self.publisher_clock.publish(self.clock_msg)
 
-        print(f"Sim time: {self.sim_time:.2f} s")
+        # Was a print() every step (100 Hz), which flooded the terminal. Use --log-level debug to see it.
+        self.get_logger().debug(f"Sim time: {self.sim_time:.2f} s")
 
     def publish_odom(self):
         eta, nu = self.vessel.get_states()
