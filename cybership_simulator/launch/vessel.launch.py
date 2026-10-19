@@ -16,6 +16,7 @@ import launch.actions
 import launch.conditions
 import launch.substitutions
 import launch_ros.actions
+import launch_ros.parameter_descriptions
 from ament_index_python.packages import get_package_share_directory
 
 from cybership_utilities.launch import anon
@@ -62,11 +63,15 @@ def _launch_setup(context, *args, **kwargs):
             namespace=vessel_name,
             name=f"robot_state_publisher_{anon()}",
             parameters=[{
-                "robot_description": launch.substitutions.Command(
-                    ["xacro ", urdf, " gazebo:=ignition namespace:=", vessel_name]
+                # value_type=str: otherwise ROS tries to parse the URDF text as YAML
+                "robot_description": launch_ros.parameter_descriptions.ParameterValue(
+                    launch.substitutions.Command(
+                        ["xacro ", urdf, " gazebo:=ignition namespace:=", vessel_name]
+                    ),
+                    value_type=str,
                 ),
                 "frame_prefix": f"{vessel_name}/",
-                "use_sim_time": True,
+                "use_sim_time": False,  # sim stamps messages with wall-clock time
             }],
         ),
     ]
@@ -79,7 +84,7 @@ def _launch_setup(context, *args, **kwargs):
             namespace=vessel_name,
             name=f"rviz_{anon()}",
             arguments=["-d", rviz_config],
-            parameters=[{"use_sim_time": True}],
+            parameters=[{"use_sim_time": False}],  # must match the sim's wall-clock stamps
         ))
     return actions
 

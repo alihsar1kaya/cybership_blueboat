@@ -1,0 +1,134 @@
+<?xml version="1.0"?>
+<!--
+  Helga: NTNU's customized BlueBoat (catamaran).
+  2 fixed thrusters at the stern (one under each hull) + 1 azimuth thruster at the bow on the centerline.
+
+  ALL DIMENSIONS ARE ESTIMATES (BlueBoat datasheet ~1.2 m x 1.0 m) until measured on the real boat.
+  Visual geometry is drawn in base_link (x forward, y left, z up, origin at CO on the waterline).
+  Thruster/sensor frames are in base_link_ned (x forward, y starboard, z down), like the other vessels,
+  and must match the positions in cybership_config/config/helga/vessel.yaml.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="helga">
+
+    <xacro:property name="hull_length" value="1.2" />
+    <xacro:property name="hull_width" value="0.2" />
+    <xacro:property name="hull_height" value="0.25" />
+    <xacro:property name="hull_offset" value="0.4" />   <!-- hull centerline distance from boat centerline -->
+    <xacro:property name="draft" value="0.1" />         <!-- hull depth below waterline -->
+
+    <material name="hull_blue"><color rgba="0.10 0.30 0.65 1.0" /></material>
+    <material name="deck_grey"><color rgba="0.55 0.58 0.60 1.0" /></material>
+    <material name="thruster_yellow"><color rgba="0.95 0.80 0.10 1.0" /></material>
+    <material name="dark"><color rgba="0.15 0.15 0.15 1.0" /></material>
+
+    <!-- Hull macro: one pontoon with a pointed bow -->
+    <xacro:macro name="hull" params="side y">
+        <visual name="hull_${side}">
+            <origin xyz="-0.05 ${y} ${hull_height/2 - draft}" rpy="0 0 0" />
+            <geometry><box size="${hull_length - 0.1} ${hull_width} ${hull_height}" /></geometry>
+            <material name="hull_blue" />
+        </visual>
+        <visual name="hull_${side}_bow">
+            <origin xyz="${hull_length/2 - 0.1} ${y} ${hull_height/2 - draft}" rpy="0 0 0.785398" />
+            <geometry><box size="${hull_width*0.7071} ${hull_width*0.7071} ${hull_height}" /></geometry>
+            <material name="hull_blue" />
+        </visual>
+    </xacro:macro>
+
+    <link name="base_link">
+        <xacro:hull side="port" y="${hull_offset}" />
+        <xacro:hull side="starboard" y="${-hull_offset}" />
+
+        <!-- Deck / electronics box between the hulls -->
+        <visual name="deck">
+            <origin xyz="-0.05 0 ${hull_height - draft + 0.02}" rpy="0 0 0" />
+            <geometry><box size="0.7 ${2*hull_offset} 0.04" /></geometry>
+            <material name="deck_grey" />
+        </visual>
+        <visual name="electronics_box">
+            <origin xyz="-0.05 0 ${hull_height - draft + 0.10}" rpy="0 0 0" />
+            <geometry><box size="0.4 0.3 0.12" /></geometry>
+            <material name="dark" />
+        </visual>
+
+        <!-- Front crossbeam carrying the bow azimuth -->
+        <visual name="front_beam">
+            <origin xyz="0.45 0 ${hull_height - draft}" rpy="0 0 0" />
+            <geometry><box size="0.08 ${2*hull_offset} 0.04" /></geometry>
+            <material name="deck_grey" />
+        </visual>
+
+        <!-- Bow azimuth: vertical shaft + thruster pod -->
+        <visual name="azimuth_shaft">
+            <origin xyz="0.45 0 0.0" rpy="0 0 0" />
+            <geometry><cylinder radius="0.015" length="0.30" /></geometry>
+            <material name="dark" />
+        </visual>
+        <visual name="azimuth_pod">
+            <origin xyz="0.45 0 -0.15" rpy="0 1.5708 0" />
+            <geometry><cylinder radius="0.045" length="0.12" /></geometry>
+            <material name="thruster_yellow" />
+        </visual>
+
+        <!-- Stern thrusters, one under each hull -->
+        <visual name="stern_port_thruster">
+            <origin xyz="-0.55 ${hull_offset} ${-draft - 0.03}" rpy="0 1.5708 0" />
+            <geometry><cylinder radius="0.045" length="0.12" /></geometry>
+            <material name="thruster_yellow" />
+        </visual>
+        <visual name="stern_starboard_thruster">
+            <origin xyz="-0.55 ${-hull_offset} ${-draft - 0.03}" rpy="0 1.5708 0" />
+            <geometry><cylinder radius="0.045" length="0.12" /></geometry>
+            <material name="thruster_yellow" />
+        </visual>
+
+        <!-- GNSS antenna mast -->
+        <visual name="gnss_mast">
+            <origin xyz="-0.2 0 ${hull_height - draft + 0.25}" rpy="0 0 0" />
+            <geometry><cylinder radius="0.01" length="0.3" /></geometry>
+            <material name="dark" />
+        </visual>
+        <visual name="gnss_antenna">
+            <origin xyz="-0.2 0 ${hull_height - draft + 0.42}" rpy="0 0 0" />
+            <geometry><cylinder radius="0.05" length="0.03" /></geometry>
+            <material name="deck_grey" />
+        </visual>
+    </link>
+
+    <link name="base_link_ned"/>
+    <joint name="base_link_to_ned" type="fixed">
+        <child link="base_link"/>
+        <parent link="base_link_ned"/>
+        <origin xyz="0 0 0" rpy="-3.1415926 0 0.0"/>
+    </joint>
+
+    <!-- Sensor frames (NED) -->
+    <link name="imu_link"/>
+    <joint name="imu_joint" type="fixed">
+        <parent link="base_link_ned"/>
+        <child link="imu_link"/>
+        <origin xyz="-0.05 0 ${-(hull_height - draft + 0.10)}" rpy="0 0 0"/>
+    </joint>
+
+    <link name="gnss_link"/>
+    <joint name="gnss_joint" type="fixed">
+        <parent link="base_link_ned"/>
+        <child link="gnss_link"/>
+        <origin xyz="-0.2 0 ${-(hull_height - draft + 0.43)}" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Thruster frames (NED). Positions must match vessel.yaml. -->
+    <xacro:macro name="thruster" params="thruster_name origin_xyz origin_rpy">
+        <link name="${thruster_name}_link" />
+        <joint name="${thruster_name}_joint" type="fixed">
+            <parent link="base_link_ned" />
+            <child link="${thruster_name}_link" />
+            <origin xyz="${origin_xyz}" rpy="${origin_rpy}" />
+        </joint>
+    </xacro:macro>
+
+    <xacro:thruster thruster_name="stern_port_thruster"      origin_xyz="-0.55 -0.4 0.13" origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="stern_starboard_thruster" origin_xyz="-0.55 0.4 0.13"  origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="bow_azimuth_thruster"     origin_xyz="0.45 0 0.15"     origin_rpy="0 0 0" />
+
+</robot>

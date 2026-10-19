@@ -1,0 +1,56 @@
+# Helga: NTNU's customized BlueBoat (catamaran).
+# 2 fixed thrusters at the stern (one under each hull) + 1 azimuth at the bow on the centerline.
+#
+# !!! ALL NUMBERS ARE ESTIMATES (BlueBoat / T200 datasheets) until measured on the real boat. !!!
+# Still missing: thruster positions, mass/CG, azimuth rotation range and speed, thrust curves.
+#
+# Frames: body frame NED (x forward, y starboard, z down), origin at CO on the waterline.
+# Positions must match cybership_description/urdf/model/helga/base.urdf.xacro.
+
+name: helga
+
+# Hull model: shoeboxpy 6DOF box (mass = rho * length * beam * draft).
+# A catamaran is NOT a box: with the real draft the box mass would be ~6x too high.
+# Workaround until mass can be given directly: 'draft' is chosen so the box mass is ~18 kg
+# (1000 * 1.2 * 1.0 * 0.015). This is a modelling hack, not the real draft (~0.1 m).
+hull:
+  length: 1.2        # [m] overall length (estimate)
+  beam: 1.0          # [m] overall width over both hulls (estimate)
+  draft: 0.015       # [m] EFFECTIVE draft giving ~18 kg, see note above
+  GM_phi: 0.3        # [m] catamarans are very stable in roll (estimate)
+  GM_theta: 0.5      # [m] (estimate)
+
+allocation:
+  method: pseudo_inverse
+  dofs: [X, Y, N]
+
+thrusters:
+  - name: port
+    type: fixed
+    frame: stern_port_thruster_link
+    position: [-0.55, -0.4, 0.13]    # [m] under the port hull (estimate)
+    direction_deg: 0.0               # pushes forward
+    max_force: 40.0                  # [N] T200 at ~16 V, forward (estimate; reverse is lower)
+    deadband: 0.5
+    allocation:
+      weight: 1.0
+
+  - name: starboard
+    type: fixed
+    frame: stern_starboard_thruster_link
+    position: [-0.55, 0.4, 0.13]
+    direction_deg: 0.0
+    max_force: 40.0
+    deadband: 0.5
+    allocation:
+      weight: 1.0
+
+  - name: bow_azimuth
+    type: azimuth                    # can rotate the full circle (per hardware team; exact range TBD)
+    frame: bow_azimuth_thruster_link
+    position: [0.45, 0.0, 0.15]      # [m] on the centerline at the front crossbeam (estimate)
+    max_force: 40.0
+    deadband: 0.5
+    allocation:
+      weight: 1.0
+      bias_force: [0.0, 0.0]
