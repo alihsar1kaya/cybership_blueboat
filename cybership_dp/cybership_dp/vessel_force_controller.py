@@ -11,13 +11,11 @@ so the thruster layout is written in exactly one place. Replaces the per-vessel 
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import skadipy
 import skadipy.allocator
-import yaml
-from ament_index_python.packages import get_package_share_directory
+
+from cybership_utilities import vessel_model
 
 from cybership_dp.force_controller_base import BaseForceControllerROS
 from cybership_dp.force_controller_base import ThrusterPublisherSpec
@@ -50,14 +48,9 @@ class VesselForceControllerROS(BaseForceControllerROS):
             self.declare_parameter("vessel_model", "voyager")
         if not self.has_parameter("vessel_config"):
             self.declare_parameter("vessel_config", "")
-        path = self.get_parameter("vessel_config").value
-        if not path:
-            model = self.get_parameter("vessel_model").value
-            path = os.path.join(
-                get_package_share_directory("cybership_config"), "config", model, "vessel.yaml"
-            )
-        with open(path, "r") as f:
-            self.config = yaml.safe_load(f)
+        self.config, path = vessel_model.load_vessel_config(
+            self.get_parameter("vessel_model").value, self.get_parameter("vessel_config").value
+        )
         self.get_logger().info(f"Allocation for vessel '{self.config['name']}' from {path}")
 
     def _initialize_thrusters(self) -> None:

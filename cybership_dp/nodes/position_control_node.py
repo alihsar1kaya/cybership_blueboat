@@ -27,6 +27,7 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse, ActionClien
 from rclpy.executors import MultiThreadedExecutor
 from cybership_tests.go_to_client import NavigateToPoseClient
 from shoeboxpy.model3dof import Shoebox
+from cybership_utilities import vessel_model
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger, Empty
@@ -106,7 +107,10 @@ class PositionController(Node):
                 # Require being within tolerance for this long before success
                 ('control.success_hold_time', 1.0),
 
-                # Vessel properties
+                # Vessel properties. If vessel_model is set, the model comes from
+                # cybership_config/config/<vessel_model>/vessel.yaml (same as the simulator)
+                # and vessel.length/beam/draft are ignored.
+                ('vessel_model', ''),
                 ('vessel.length', 1.0),
                 ('vessel.beam', 0.3),
                 ('vessel.draft', 0.02),
@@ -249,11 +253,18 @@ class PositionController(Node):
         vessel_draft = self.get_parameter('vessel.draft').value
 
         # Create vessel model
-        self.shoebox = Shoebox(
-            L=vessel_length,
-            B=vessel_beam,
-            T=vessel_draft,
-        )
+        model_name = self.get_parameter('vessel_model').value
+        if model_name:
+            config, path = vessel_model.load_vessel_config(model_name)
+            self.M_eff = vessel_model.M_eff_3dof(vessel_model.model_parameters(config))
+            self.get_logger().info(
+                f"Vessel model from {path}: M_eff diag {np.round(np.diag(self.M_eff), 2).tolist()}")
+        else:
+            self.M_eff = Shoebox(
+                L=vessel_length,
+                B=vessel_beam,
+                T=vessel_draft,
+            ).M_eff
 
         # Get performance metrics parameters
         self.window_size = self.get_parameter('metrics.window_size').value
@@ -565,7 +576,7 @@ class PositionController(Node):
             [desired_vel[0] - current_vx, desired_vel[1] - current_vy])
         error_yaw_rate = desired_vel[2] - current_yaw_rate
 
-        acc = self.shoebox.M_eff @ self.ref_filter.get_nu_d()
+        acc = self.M_eff @ self.ref_filter.get_nu_d()
 
         self.integral_error_pos += error_pos * self.dt
         self.integral_error_yaw += error_yaw * self.dt

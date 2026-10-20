@@ -12,17 +12,36 @@
 
 name: helga
 
-# Hull model: shoeboxpy 6DOF box (mass = rho * length * beam * draft).
-# A catamaran is NOT a box: with the real draft the box mass would be ~6x too high.
-# Workaround until mass can be given directly: 'draft' is chosen so the box mass is
-# 14.5 kg + 2.4 kg (2 batteries) = 16.9 kg: 1000 * 1.2 * 0.93 * 0.0151 = 16.9 kg.
-# This is a modelling hack, not the real draft (~0.1 m).
+# Hull: used for the shoeboxpy box (roll/pitch restoring). Mass, inertia, added mass and
+# damping come from the 'model' section below instead of from the box.
 hull:
   length: 1.2        # [m] overall length (datasheet)
   beam: 0.93         # [m] overall width over both hulls, deployed (datasheet)
-  draft: 0.0151      # [m] EFFECTIVE draft giving 16.9 kg, see note above
-  GM_phi: 0.3        # [m] catamarans are very stable in roll (estimate)
-  GM_theta: 0.5      # [m] (estimate)
+  draft: 0.1         # [m] approximate, not used for mass when 'model' is given
+  # GM from Capytaine hydrostatics (two 1.2 x 0.2 m box hulls, CG on the waterline):
+  # tools/capytaine_catamaran.py. A higher CG lowers these a little.
+  GM_phi: 3.86       # [m]
+  GM_theta: 3.39     # [m]
+
+# Rigid-body + hydrodynamic model, diagonal, about CO. Order: surge, sway, heave, roll, pitch, yaw.
+# Read by both the simulator and the DP controller (cybership_utilities/vessel_model.py).
+model:
+  # 14.5 kg (no batteries) + 2.4 kg (2 batteries), datasheet. Helga's extra equipment not included.
+  mass: 16.9
+  # [kg m^2] Mass assumed in the two hulls (y0 = 0.365 m), each a slender rod of length 1.2 m:
+  # Ix ~ m*y0^2 + hull section, Iy ~ m*L^2/12, Iz ~ m*L^2/12 + m*y0^2. Measure Iz with a bifilar pendulum.
+  inertia: [2.4, 2.1, 4.3]
+  # [kg, kg m^2] Capytaine, omega = 0 (slow DP motion), two 1.2 x 0.2 m box hulls at +-0.365 m,
+  # draft 35 mm from the mass: cybership_config/tools/capytaine_catamaran.py.
+  # Sensitive to hull width: sway 13.0 (0.15 m) / 8.2 (0.20 m) / 5.7 (0.25 m). Replace with the hull CAD.
+  # Heave is large because the hulls are flat; it does not matter for DP.
+  added_mass: [1.18, 8.17, 109.51, 8.90, 6.49, 1.01]
+  # [N s/m, N m s/rad] Linear damping, tuned for DP speeds (< 1 m/s).
+  # Surge from the datasheet: 80 N -> 3 m/s and ~30 W at 1 m/s give ~10 N per m/s around 1 m/s.
+  # Sway ~4x surge (side area), yaw ~ sway*L^2/12 + surge*y0^2. Heave: shoebox default.
+  # Roll/pitch: damping ratio ~0.2 with the Capytaine GM, d = 2*0.2*sqrt(m*g*GM*(I + A)).
+  # All ESTIMATES until speed tests in water.
+  damping_linear: [10.0, 40.0, 4.2, 34.0, 28.0, 6.0]
 
 allocation:
   method: pseudo_inverse

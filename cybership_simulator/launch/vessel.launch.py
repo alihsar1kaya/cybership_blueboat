@@ -139,7 +139,8 @@ def _dp_actions(vessel, vessel_name):
             namespace=vessel_name,
             name="position_controller",
             output="screen",
-            parameters=[controller_params],
+            # vessel_model: mass/added mass from vessel.yaml, the same model the simulator uses
+            parameters=[controller_params, {"vessel_model": vessel}],
             remappings=[("control/force/command", "control/force/command/position")],
         ),
         launch_ros.actions.Node(

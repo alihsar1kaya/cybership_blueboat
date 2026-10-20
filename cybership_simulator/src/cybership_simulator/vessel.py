@@ -13,17 +13,14 @@ Run:
         -p vessel_model:=voyager -p tf_prefix:=voyager
 """
 
-import os
-
 import numpy as np
-import yaml
 import rclpy
 import geometry_msgs.msg
 import shoeboxpy.model6dof
 import skadipy
-from ament_index_python.packages import get_package_share_directory
 
 from cybership_simulator.base import BaseSimulator
+from cybership_utilities import vessel_model
 
 
 class ConfigurableSimulator(BaseSimulator):
@@ -42,14 +39,9 @@ class ConfigurableSimulator(BaseSimulator):
             return
         self.declare_parameter("vessel_model", "voyager")
         self.declare_parameter("vessel_config", "")  # optional explicit path, overrides vessel_model
-        path = self.get_parameter("vessel_config").value
-        if not path:
-            model = self.get_parameter("vessel_model").value
-            path = os.path.join(
-                get_package_share_directory("cybership_config"), "config", model, "vessel.yaml"
-            )
-        with open(path, "r") as f:
-            self.config = yaml.safe_load(f)
+        self.config, path = vessel_model.load_vessel_config(
+            self.get_parameter("vessel_model").value, self.get_parameter("vessel_config").value
+        )
         self.get_logger().info(
             f"Loaded vessel '{self.config['name']}' with "
             f"{len(self.config['thrusters'])} thrusters from {path}"
@@ -62,11 +54,19 @@ class ConfigurableSimulator(BaseSimulator):
     def _create_vessel(self):
         self._load_config()
         hull = self.config["hull"]
-        return shoeboxpy.model6dof.Shoebox(
+        shoebox = shoeboxpy.model6dof.Shoebox(
             L=hull["length"], B=hull["beam"], T=hull["draft"],
             GM_phi=hull.get("GM_phi", 0.0), GM_theta=hull.get("GM_theta", 0.0),
             eta0=self.eta0.flatten(),
         )
+        # Mass, added mass and damping from vessel.yaml ('model' section, else from 'hull')
+        params = vessel_model.model_parameters(self.config)
+        vessel_model.apply_to_shoebox(shoebox, params)
+        self.get_logger().info(
+            f"Model from '{params['source']}': mass {params['mass']:.2f} kg, "
+            f"MA {np.round(params['MA'], 2).tolist()}, D {np.round(params['D'], 2).tolist()}"
+        )
+        return shoebox
 
     def _init_allocator(self):
         """Build skadipy actuators from the thruster list. The simulator only uses the B matrix."""

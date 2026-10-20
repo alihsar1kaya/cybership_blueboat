@@ -8,6 +8,7 @@
   <license>GPL-3.0-only</license>
 
   <depend>cybership_interfaces</depend>
+  <exec_depend>cybership_utilities</exec_depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>

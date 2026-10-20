@@ -1,0 +1,58 @@
+/**:
+  ros__parameters:
+    # Helga: gains copied from voyager. Mass/added mass come from helga/vessel.yaml
+    # (vessel_model parameter set by vessel.launch.py), so vessel.* below is unused there.
+    vessel:
+      length: 1.0    # Length of vessel (m)
+      beam: 0.3      # Width of vessel (m)
+      draft: 0.02    # Draft/depth of vessel (m)
+
+    # Controller parameters
+    control:
+      # Position control gains
+      p_gain:
+        pos: 1.6     # Proportional gain for position
+        vel: 0.7     # Proportional gain for velocity
+        yaw: 1.1     # Proportional gain for yaw
+
+      # Integral gains
+      i_gain:
+        pos: 0.2     # Integral gain for position
+        vel: 0.1     # Integral gain for velocity
+        yaw: 0.2     # Integral gain for yaw
+
+      # Derivative gains
+      d_gain:
+        pos: 0.5     # Derivative gain for position
+        vel: 0.5     # Derivative gain for velocity
+        yaw: 0.5     # Derivative gain for yaw
+
+      # Integral error limits
+      # Raised from voyager (1.0 / 0.3): the integral term must be able to exceed Helga's
+      # 0.5 N thruster deadband, otherwise the boat stops short of the goal.
+      max_integral_error:
+        pos: 5.0     # Maximum position error integration (Ki*5 = 1 N)
+        yaw: 1.5     # Maximum yaw error integration
+
+      # Saturation parameters
+      saturation:
+        pos: 0.1     # Position control saturation
+        yaw: 0.1     # Yaw control saturation
+
+      # Target reaching tolerances
+      tolerance:
+        pos: 0.25    # Position reaching tolerance (m)
+        yaw: 0.1     # Yaw angle reaching tolerance (rad)
+
+    # Reference filter parameters
+    filter:
+      omega: [0.25, 0.25, 0.60]  # Natural frequency for reference filter
+      delta: [1.00, 1.00, 1.00]     # Damping ratio for reference filter
+
+    # Performance metrics configuration
+    metrics:
+      window_size: 200    # Number of samples in moving window
+      interval: 1.0       # Time between metrics calculations (seconds)
+
+    # General parameters
+    dt: 0.1              # Control loop time step (seconds)
