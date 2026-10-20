@@ -9,6 +9,15 @@
 
     # Controller parameters
     control:
+      # Model-based DP law (Fossen): gains computed per DOF from M and D in helga/vessel.yaml,
+      #   Kp = M*omega_n^2,  Kd = 2*zeta*M*omega_n - D,  Ki = ki_ratio*omega_n*Kp
+      # so surge, sway and yaw get the same closed-loop behaviour although sway is ~5x heavier.
+      # The fixed p_gain/i_gain/d_gain below are then NOT used.
+      model_based: true
+      omega_n: [0.3, 0.3, 0.6]      # [rad/s] surge, sway, yaw
+      zeta: [0.9, 0.9, 0.9]
+      ki_ratio: 0.1
+      max_integral_force: [10.0, 10.0, 5.0]   # [N, N, Nm] anti-windup
       # Position control gains
       p_gain:
         pos: 1.6     # Proportional gain for position

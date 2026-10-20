@@ -83,3 +83,8 @@ def M_eff_3dof(params):
     """(M_RB + M_A) for surge, sway, yaw as a 3x3 matrix, as used by the DP controllers."""
     idx = [0, 1, 5]
     return np.diag(params["MRB"][idx] + params["MA"][idx])
+
+
+def D_3dof(params):
+    """Linear damping for surge, sway, yaw as a 3x3 matrix."""
+    return np.diag(params["D"][[0, 1, 5]])

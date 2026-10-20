@@ -95,6 +95,14 @@ class PositionController(Node):
                 ('control.i_gain.yaw', 0.2),
                 ('control.d_gain.yaw', 1.0),
 
+                # Model-based DP law (Fossen): gains from the vessel model, all in the body frame.
+                # false = original law with the fixed gains above (kept for voyager etc.)
+                ('control.model_based', False),
+                ('control.omega_n', [0.3, 0.3, 0.6]),          # closed-loop natural frequency [rad/s]
+                ('control.zeta', [0.9, 0.9, 0.9]),             # closed-loop relative damping
+                ('control.ki_ratio', 0.1),                     # Ki = ki_ratio * omega_n * Kp
+                ('control.max_integral_force', [10.0, 10.0, 5.0]),  # anti-windup [N, N, Nm]
+
                 # Controller limits
                 ('control.max_integral_error.pos', 1.0),
                 ('control.max_integral_error.yaw', 1.4),
@@ -195,6 +203,7 @@ class PositionController(Node):
         # Track integral error
         self.integral_error_pos = np.zeros(2)
         self.integral_error_yaw = 0.0
+        self.integral_mb = np.zeros(3)  # model-based law: integral of [x, y, yaw] error
 
         self.error_pos = np.zeros(2)
         self.error_yaw = 0.0
@@ -256,15 +265,36 @@ class PositionController(Node):
         model_name = self.get_parameter('vessel_model').value
         if model_name:
             config, path = vessel_model.load_vessel_config(model_name)
-            self.M_eff = vessel_model.M_eff_3dof(vessel_model.model_parameters(config))
+            params = vessel_model.model_parameters(config)
+            self.M_eff = vessel_model.M_eff_3dof(params)
+            self.D_eff = vessel_model.D_3dof(params)
             self.get_logger().info(
-                f"Vessel model from {path}: M_eff diag {np.round(np.diag(self.M_eff), 2).tolist()}")
+                f"Vessel model from {path}: M_eff diag {np.round(np.diag(self.M_eff), 2).tolist()}, "
+                f"D diag {np.round(np.diag(self.D_eff), 2).tolist()}")
         else:
-            self.M_eff = Shoebox(
+            shoebox = Shoebox(
                 L=vessel_length,
                 B=vessel_beam,
                 T=vessel_draft,
-            ).M_eff
+            )
+            self.M_eff = shoebox.M_eff
+            self.D_eff = shoebox.D
+
+        # Model-based gains (pole placement per DOF): M*e'' + (D + Kd)*e' + Kp*e = 0
+        self.model_based = self.get_parameter('control.model_based').value
+        if self.model_based:
+            m = np.diag(self.M_eff)
+            d = np.diag(self.D_eff)
+            w = np.asarray(self.get_parameter('control.omega_n').value, dtype=float)
+            z = np.asarray(self.get_parameter('control.zeta').value, dtype=float)
+            self.Kp_mb = m * w**2
+            self.Kd_mb = np.maximum(2.0 * z * m * w - d, 0.0)
+            self.Ki_mb = self.get_parameter('control.ki_ratio').value * w * self.Kp_mb
+            self.max_integral_force = np.asarray(
+                self.get_parameter('control.max_integral_force').value, dtype=float)
+            self.get_logger().info(
+                f"Model-based DP: Kp {np.round(self.Kp_mb, 2).tolist()}, "
+                f"Kd {np.round(self.Kd_mb, 2).tolist()}, Ki {np.round(self.Ki_mb, 3).tolist()}")
 
         # Get performance metrics parameters
         self.window_size = self.get_parameter('metrics.window_size').value
@@ -576,6 +606,16 @@ class PositionController(Node):
             [desired_vel[0] - current_vx, desired_vel[1] - current_vy])
         error_yaw_rate = desired_vel[2] - current_yaw_rate
 
+        if self.model_based:
+            self.process_performance_metrics(
+                desired_pose, desired_vel, error_pos, error_vel, error_yaw)
+            control_x, control_y, control_yaw = self._model_based_tau(
+                current_yaw, np.array([error_pos[0], error_pos[1], error_yaw]),
+                desired_vel, desired_acc,
+                np.array([current_vx, current_vy, current_yaw_rate]))
+            self._publish_wrench(control_x, control_y, control_yaw)
+            return
+
         acc = self.M_eff @ self.ref_filter.get_nu_d()
 
         self.integral_error_pos += error_pos * self.dt
@@ -640,6 +680,39 @@ class PositionController(Node):
             f"Control: ({control_x:.2f}, {control_y:.2f}, {control_yaw:.2f})"
         )
 
+    def _model_based_tau(self, psi, error_world, eta_d_dot, eta_d_ddot, nu):
+        """
+        Model-based DP law (Fossen), everything in the body frame:
+
+            tau = M nu_d_dot + D nu_d + Kp R^T e + Kd (nu_d - nu) + Ki R^T int(e) dt
+
+        error_world = eta_d - eta (yaw wrapped), eta_d_dot/eta_d_ddot from the reference filter
+        (world frame), nu = [u, v, r] from odometry (body frame).
+        """
+        R = Rz(psi)
+        e_body = R.T @ error_world
+        nu_d = R.T @ eta_d_dot
+        nu_d_dot = R.T @ eta_d_ddot
+
+        # Integral in the world frame (does not rotate with the boat), with conditional integration
+        self.integral_mb += error_world * self.dt
+        tau_i = self.Ki_mb * (R.T @ self.integral_mb)
+        if np.any(np.abs(tau_i) > self.max_integral_force):
+            self.integral_mb -= error_world * self.dt
+            tau_i = np.clip(self.Ki_mb * (R.T @ self.integral_mb),
+                            -self.max_integral_force, self.max_integral_force)
+
+        tau = (self.M_eff @ nu_d_dot + self.D_eff @ nu_d
+               + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
+        return float(tau[0]), float(tau[1]), float(tau[2])
+
+    def _publish_wrench(self, fx, fy, mz):
+        wrench_msg = Wrench()
+        wrench_msg.force.x = fx
+        wrench_msg.force.y = fy
+        wrench_msg.torque.z = mz
+        self.control_pub.publish(wrench_msg)
+
     def action_goal_callback(self, goal_request):
         self.get_logger().info("Received NavigateToPose goal request")
         return GoalResponse.ACCEPT
@@ -660,6 +733,7 @@ class PositionController(Node):
             self.last_metrics_time = 0.0
             self.integral_error_pos = np.zeros(2)
             self.integral_error_yaw = 0.0
+            self.integral_mb = np.zeros(3)
             self.error_pos = np.zeros(2)
             self.error_yaw = 0.0
             self.ref_filter = None
