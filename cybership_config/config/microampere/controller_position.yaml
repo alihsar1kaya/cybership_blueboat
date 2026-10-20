@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    # Helga: gains copied from voyager. Mass/added mass come from helga/vessel.yaml
+    # Microampere: gains copied from voyager. Mass/added mass come from microampere/vessel.yaml
     # (vessel_model parameter set by vessel.launch.py), so vessel.* below is unused there.
     vessel:
       length: 1.0    # Length of vessel (m)
@@ -9,7 +9,7 @@
 
     # Controller parameters
     control:
-      # Model-based DP law (Fossen): gains computed per DOF from M and D in helga/vessel.yaml,
+      # Model-based DP law (Fossen): gains computed per DOF from M and D in microampere/vessel.yaml,
       #   Kp = M*omega_n^2,  Kd = 2*zeta*M*omega_n - D,  Ki = ki_ratio*omega_n*Kp
       # so surge, sway and yaw get the same closed-loop behaviour although sway is ~5x heavier.
       # The fixed p_gain/i_gain/d_gain below are then NOT used.
@@ -37,7 +37,7 @@
         yaw: 0.5     # Derivative gain for yaw
 
       # Integral error limits
-      # Raised from voyager (1.0 / 0.3): the integral term must be able to exceed Helga's
+      # Raised from voyager (1.0 / 0.3): the integral term must be able to exceed Microampere's
       # 0.5 N thruster deadband, otherwise the boat stops short of the goal.
       max_integral_error:
         pos: 5.0     # Maximum position error integration (Ki*5 = 1 N)

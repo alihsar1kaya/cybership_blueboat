@@ -8,7 +8,7 @@ Figure of what capytaine_from_stl.py does, for one hull STL:
   4. box hulls (capytaine_catamaran.py) vs. the CAD hull
 
     python3 plot_capytaine_hull.py ~/ros_ws/cad/hull/PUB-BR-101381-001.STL \
-        --mass 16.9 --hull-offset 0.3765 --out capytaine_helga.png
+        --mass 16.9 --hull-offset 0.3765 --out capytaine_microampere.png
 """
 
 import argparse

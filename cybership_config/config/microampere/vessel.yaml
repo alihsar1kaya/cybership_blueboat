@@ -1,25 +1,25 @@
-# Helga: NTNU's customized BlueBoat (catamaran).
+# Microampere: NTNU's customized BlueBoat (catamaran).
 # 2 fixed thrusters at the stern (one under each hull) + 1 azimuth at the bow on the centerline.
 #
 # !!! Numbers are from the stock BlueBoat datasheet (bluerobotics.com, read 2026-10-20) or estimates.
-# Helga is modified (extra bow azimuth, electronics), so replace them with measurements when available.
+# Microampere is modified (extra bow azimuth, electronics), so replace them with measurements when available.
 # Datasheet: 120 x 93 x 46 cm (L x W x H, deployed), 14.5 kg without batteries, 2 batteries 2.4 kg,
 # freeboard 160 mm (2 batteries), max static thrust 8.2 kgf (both motors), max speed 3 m/s.
-# From the Helga team (2026-10-20): total mass 30.2 kg with 2 batteries per hull (26.8 kg without),
+# From the Microampere team (2026-10-20): total mass 30.2 kg with 2 batteries per hull (26.8 kg without),
 # all three thrusters max 67 N at 400 W, bow azimuth rotates freely 360 deg at 4 s per turn.
 # Still missing: CG, exact thruster positions, thrust curves (and reverse thrust).
 #
 # Frames: body frame NED (x forward, y starboard, z down), origin at CO on the waterline.
-# Positions must match cybership_description/urdf/model/helga/base.urdf.xacro.
+# Positions must match cybership_description/urdf/model/microampere/base.urdf.xacro.
 
-name: helga
+name: microampere
 
 # Hull: used for the shoeboxpy box (roll/pitch restoring). Mass, inertia, added mass and
 # damping come from the 'model' section below instead of from the box.
 hull:
   length: 1.195      # [m] hull length (Blue Robotics hull CAD, BR-101652)
   beam: 0.93         # [m] overall width over both hulls, deployed (datasheet)
-  # [m] waterline 274 mm above keel at 30.2 kg, freeboard 102 mm (hull CAD). The Helga team measured
+  # [m] waterline 274 mm above keel at 30.2 kg, freeboard 102 mm (hull CAD). The Microampere team measured
   # ~300 mm, which the CAD hull gives at 36.3 kg: unclear whether measured to the keel or to the thrusters.
   draft: 0.274
   # GM from Capytaine hydrostatics on the hull CAD, CG on the waterline:
@@ -30,7 +30,7 @@ hull:
 # Rigid-body + hydrodynamic model, diagonal, about CO. Order: surge, sway, heave, roll, pitch, yaw.
 # Read by both the simulator and the DP controller (cybership_utilities/vessel_model.py).
 model:
-  # [kg] Helga as she runs, with 4 batteries (2 per hull), from the Helga team.
+  # [kg] Microampere as she runs, with 4 batteries (2 per hull), from the Microampere team.
   mass: 30.2
   # [kg m^2] Fossen's radii of gyration, as in the Otter USV model (MSS / PythonVehicleSimulator):
   #   I = m*R^2 with R44 = 0.4*B, R55 = R66 = 0.25*L   (L = 1.2 m, B = 0.93 m)
@@ -47,7 +47,7 @@ model:
   added_mass: [2.53, 129.80, 35.68, 2.73, 0.90, 6.41]
   # [N s/m, N m s/rad] Linear damping, tuned for DP speeds (< 1 m/s).
   # Surge from the stock BlueBoat datasheet (16.9 kg): 80 N -> 3 m/s and ~30 W at 1 m/s give ~10 N per m/s
-  # around 1 m/s. Helga is heavier and deeper, so the real value is probably higher.
+  # around 1 m/s. Microampere is heavier and deeper, so the real value is probably higher.
   # Sway ~4x surge (side area), yaw ~ sway*L^2/12 + surge*y0^2. Heave: shoebox default.
   # Roll/pitch: damping ratio ~0.2 with the Capytaine GM, d = 2*0.2*sqrt(m*g*GM*(I + A)).
   # All ESTIMATES until speed tests in water.
@@ -62,10 +62,10 @@ thrusters:
     type: fixed
     frame: stern_port_thruster_link
     # [m] Drawing BR-101447: propeller just outboard of the vertical inner hull side (y ~ 0.296 m),
-    # 123 mm below the waterline with 2 batteries -> ~177 mm at Helga's 30.2 kg. x is an estimate.
-    position: [-0.55, -0.296, 0.177]
+    # 123 mm below the waterline with 2 batteries -> ~177 mm at Microampere's 30.2 kg. x is an estimate.
+    position: [-0.55, -0.29, 0.177]   # y from the Microampere team sketch (F2)
     direction_deg: 0.0               # pushes forward
-    max_force: 67.0                  # [N] at 400 W (Helga team)
+    max_force: 67.0                  # [N] at 400 W (Microampere team)
     deadband: 0.5
     allocation:
       weight: 1.0
@@ -73,7 +73,7 @@ thrusters:
   - name: starboard
     type: fixed
     frame: stern_starboard_thruster_link
-    position: [-0.55, 0.296, 0.177]
+    position: [-0.55, 0.29, 0.177]    # y from the Microampere team sketch (F3)
     direction_deg: 0.0
     max_force: 67.0
     deadband: 0.5
@@ -81,11 +81,11 @@ thrusters:
       weight: 1.0
 
   - name: bow_azimuth
-    type: azimuth                    # rotates freely, no angle limit (Helga team)
+    type: azimuth                    # rotates freely, no angle limit (Microampere team)
     frame: bow_azimuth_thruster_link
-    position: [0.45, 0.0, 0.248]     # [m] x estimate; depth 248 mm below the waterline (Helga team)
-    max_force: 67.0                  # [N] at 400 W (Helga team)
-    max_rate_deg_s: 90.0             # 4 s per 360 deg (Helga team). NOT yet used by the simulator.
+    position: [0.37, 0.0, 0.248]     # [m] Microampere team sketch (F1): 370 mm ahead of CO, 248 mm deep
+    max_force: 67.0                  # [N] at 400 W (Microampere team)
+    max_rate_deg_s: 90.0             # 4 s per 360 deg (Microampere team). NOT yet used by the simulator.
     deadband: 0.5
     allocation:
       weight: 1.0

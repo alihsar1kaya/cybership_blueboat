@@ -2,7 +2,7 @@
 Generic launch file for the configurable simulator.
 
     ros2 launch cybership_simulator vessel.launch.py vessel:=voyager
-    ros2 launch cybership_simulator vessel.launch.py vessel:=helga use_gui:=false
+    ros2 launch cybership_simulator vessel.launch.py vessel:=microampere use_gui:=false
 
 Loads cybership_config/config/<vessel>/vessel.yaml. Unlike <vessel>.launch.py, the
 vessel name is not restricted to a fixed list. If a vessel has no URDF or RViz config

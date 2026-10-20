@@ -58,19 +58,19 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        helga/base_link:
+        microampere/base_link:
           Value: true
-        helga/base_link_ned:
+        microampere/base_link_ned:
           Value: true
-        helga/bow_tunnel_thruster_link:
+        microampere/bow_tunnel_thruster_link:
           Value: true
-        helga/imu_link:
+        microampere/imu_link:
           Value: true
-        helga/mocap_link:
+        microampere/mocap_link:
           Value: true
-        helga/stern_port_thruster_link:
+        microampere/stern_port_thruster_link:
           Value: true
-        helga/stern_starboard_thruster_link:
+        microampere/stern_starboard_thruster_link:
           Value: true
         world:
           Value: true
@@ -81,17 +81,17 @@ Visualization Manager:
       Show Names: false
       Tree:
         world:
-          helga/base_link_ned:
-            helga/base_link:
-              helga/bow_tunnel_thruster_link:
+          microampere/base_link_ned:
+            microampere/base_link:
+              microampere/bow_tunnel_thruster_link:
                 {}
-              helga/imu_link:
+              microampere/imu_link:
                 {}
-              helga/stern_port_thruster_link:
+              microampere/stern_port_thruster_link:
                 {}
-              helga/stern_starboard_thruster_link:
+              microampere/stern_starboard_thruster_link:
                 {}
-            helga/mocap_link:
+            microampere/mocap_link:
               {}
       Update Interval: 0
       Value: true
@@ -180,7 +180,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/visualization_marker
+        Value: /microampere/visualization_marker
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
@@ -192,7 +192,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/visualization_marker_array
+        Value: /microampere/visualization_marker_array
       Value: true
     - Alpha: 0.800000011920929
       Class: rviz_default_plugins/RobotModel
@@ -204,7 +204,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/robot_description
+        Value: /microampere/robot_description
       Enabled: true
       Links:
         All Links Enabled: true
@@ -245,7 +245,7 @@ Visualization Manager:
         Inertia: false
         Mass: false
       Name: RobotModel
-      TF Prefix: helga
+      TF Prefix: microampere
       Update Interval: 0
       Value: true
       Visual Enabled: true
@@ -260,7 +260,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/obstacles
+        Value: /microampere/obstacles
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
@@ -272,7 +272,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/obstacles_array
+        Value: /microampere/obstacles_array
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
@@ -285,7 +285,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/rrt_tree
+        Value: /microampere/rrt_tree
       Value: true
     - Alpha: 1
       Buffer Length: 1
@@ -313,7 +313,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/planned_path
+        Value: /microampere/planned_path
       Value: true
     - Class: rviz_default_plugins/Axes
       Enabled: true
@@ -336,13 +336,13 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/risk_map
+        Value: /microampere/risk_map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/risk_map_updates
+        Value: /microampere/risk_map_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.699999988079071
@@ -359,13 +359,13 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/costmap
+        Value: /microampere/costmap
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/costmap_updates
+        Value: /microampere/costmap_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.699999988079071
@@ -382,13 +382,13 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/map
+        Value: /microampere/map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/map_updates
+        Value: /microampere/map_updates
       Use Timestamp: false
       Value: false
     - Alpha: 0.699999988079071
@@ -405,13 +405,13 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/static_layer
+        Value: /microampere/static_layer
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /helga/static_layer_updates
+        Value: /microampere/static_layer_updates
       Use Timestamp: false
       Value: true
   Enabled: true
