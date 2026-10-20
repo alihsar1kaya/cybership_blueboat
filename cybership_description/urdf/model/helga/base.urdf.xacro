@@ -12,9 +12,12 @@
 
     <xacro:property name="hull_length" value="1.2" />
     <xacro:property name="hull_width" value="0.2" />
-    <xacro:property name="hull_height" value="0.25" />
-    <xacro:property name="hull_offset" value="0.365" />   <!-- hull centerline distance from boat centerline -->
-    <xacro:property name="draft" value="0.1" />         <!-- hull depth below waterline -->
+    <xacro:property name="hull_height" value="0.376" />  <!-- hull CAD -->
+    <xacro:property name="hull_offset" value="0.374" />   <!-- hull centerline distance from boat centerline -->
+    <xacro:property name="draft" value="0.274" />       <!-- hull depth below waterline at 30.2 kg (hull CAD) -->
+    <xacro:property name="azimuth_depth" value="0.248" />  <!-- azimuth below waterline (Helga team) -->
+    <xacro:property name="stern_thruster_depth" value="0.177" />  <!-- drawing BR-101447, must match vessel.yaml -->
+    <xacro:property name="stern_thruster_y" value="0.296" />      <!-- drawing BR-101447, must match vessel.yaml -->
 
     <material name="hull_blue"><color rgba="0.20 0.40 0.80 1.0" /></material>
     <material name="deck_grey"><color rgba="0.55 0.58 0.60 1.0" /></material>
@@ -60,24 +63,24 @@
 
         <!-- Bow azimuth: vertical shaft + thruster pod -->
         <visual name="azimuth_shaft">
-            <origin xyz="0.45 0 0.0" rpy="0 0 0" />
-            <geometry><cylinder radius="0.015" length="0.30" /></geometry>
+            <origin xyz="0.45 0 ${(hull_height - draft - azimuth_depth) / 2}" rpy="0 0 0" />
+            <geometry><cylinder radius="0.015" length="${hull_height - draft + azimuth_depth}" /></geometry>
             <material name="dark" />
         </visual>
         <visual name="azimuth_pod">
-            <origin xyz="0.45 0 -0.15" rpy="0 1.5708 0" />
+            <origin xyz="0.45 0 ${-azimuth_depth}" rpy="0 1.5708 0" />
             <geometry><cylinder radius="0.045" length="0.12" /></geometry>
             <material name="thruster_yellow" />
         </visual>
 
         <!-- Stern thrusters, one under each hull -->
         <visual name="stern_port_thruster">
-            <origin xyz="-0.55 ${hull_offset} ${-draft - 0.03}" rpy="0 1.5708 0" />
+            <origin xyz="-0.55 ${stern_thruster_y} ${-stern_thruster_depth}" rpy="0 1.5708 0" />
             <geometry><cylinder radius="0.045" length="0.12" /></geometry>
             <material name="thruster_yellow" />
         </visual>
         <visual name="stern_starboard_thruster">
-            <origin xyz="-0.55 ${-hull_offset} ${-draft - 0.03}" rpy="0 1.5708 0" />
+            <origin xyz="-0.55 ${-stern_thruster_y} ${-stern_thruster_depth}" rpy="0 1.5708 0" />
             <geometry><cylinder radius="0.045" length="0.12" /></geometry>
             <material name="thruster_yellow" />
         </visual>
@@ -127,8 +130,8 @@
         </joint>
     </xacro:macro>
 
-    <xacro:thruster thruster_name="stern_port_thruster"      origin_xyz="-0.55 -0.365 0.13" origin_rpy="0 0 0" />
-    <xacro:thruster thruster_name="stern_starboard_thruster" origin_xyz="-0.55 0.365 0.13" origin_rpy="0 0 0" />
-    <xacro:thruster thruster_name="bow_azimuth_thruster"     origin_xyz="0.45 0 0.15"     origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="stern_port_thruster"      origin_xyz="-0.55 ${-stern_thruster_y} ${stern_thruster_depth}" origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="stern_starboard_thruster" origin_xyz="-0.55 ${stern_thruster_y} ${stern_thruster_depth}" origin_rpy="0 0 0" />
+    <xacro:thruster thruster_name="bow_azimuth_thruster"     origin_xyz="0.45 0 ${azimuth_depth}" origin_rpy="0 0 0" />
 
 </robot>

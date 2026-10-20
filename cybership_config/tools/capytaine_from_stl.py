@@ -158,6 +158,8 @@ def main():
                    help="hull centerline to boat centerline [m]; > 0 mirrors the hull (catamaran)")
     p.add_argument("--axes", default="zxy", help="CAD axes for (length, width, height), default zxy")
     p.add_argument("--scale", type=float, default=1e-3, help="CAD units to m (default mm)")
+    p.add_argument("--swap-sides", action="store_true",
+                   help="put the mirrored hull on +y and the STL hull on -y (turns asymmetric hulls around)")
     p.add_argument("--cog-z", type=float, default=0.0, help="CG height above waterline [m]")
     p.add_argument("--stations", type=int, default=36)
     p.add_argument("--heights", type=int, default=12)
@@ -175,9 +177,10 @@ def main():
     stations = hull.sample(z_wl, a.stations, a.heights)
     y0 = hull.y_mid
     n_contour = 2 * a.heights
-    meshes = [panel_mesh(stations, hull.x_mid, y0, z_wl, a.hull_offset, n_contour)]
+    side = -1.0 if a.swap_sides else 1.0
+    meshes = [panel_mesh(stations, hull.x_mid, y0, z_wl, side * a.hull_offset, n_contour)]
     if n_hulls == 2:
-        meshes.append(panel_mesh(stations, hull.x_mid, y0, z_wl, -a.hull_offset, n_contour, mirror=True))
+        meshes.append(panel_mesh(stations, hull.x_mid, y0, z_wl, -side * a.hull_offset, n_contour, mirror=True))
     mesh = meshes[0] if n_hulls == 1 else meshes[0].join_meshes(meshes[1])
     body = cpt.FloatingBody(
         mesh=mesh,

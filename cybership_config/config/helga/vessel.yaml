@@ -5,7 +5,9 @@
 # Helga is modified (extra bow azimuth, electronics), so replace them with measurements when available.
 # Datasheet: 120 x 93 x 46 cm (L x W x H, deployed), 14.5 kg without batteries, 2 batteries 2.4 kg,
 # freeboard 160 mm (2 batteries), max static thrust 8.2 kgf (both motors), max speed 3 m/s.
-# Still missing: real mass with modifications, CG, thruster positions, azimuth range/speed, thrust curves.
+# From the Helga team (2026-10-20): total mass 30.2 kg with 2 batteries per hull (26.8 kg without),
+# all three thrusters max 67 N at 400 W, bow azimuth rotates freely 360 deg at 4 s per turn.
+# Still missing: CG, exact thruster positions, thrust curves (and reverse thrust).
 #
 # Frames: body frame NED (x forward, y starboard, z down), origin at CO on the waterline.
 # Positions must match cybership_description/urdf/model/helga/base.urdf.xacro.
@@ -17,33 +19,39 @@ name: helga
 hull:
   length: 1.195      # [m] hull length (Blue Robotics hull CAD, BR-101652)
   beam: 0.93         # [m] overall width over both hulls, deployed (datasheet)
-  draft: 0.22        # [m] waterline 220 mm above keel at 16.9 kg (hull CAD), not used for mass
+  # [m] waterline 274 mm above keel at 30.2 kg, freeboard 102 mm (hull CAD). The Helga team measured
+  # ~300 mm, which the CAD hull gives at 36.3 kg: unclear whether measured to the keel or to the thrusters.
+  draft: 0.274
   # GM from Capytaine hydrostatics on the hull CAD, CG on the waterline:
   # tools/capytaine_from_stl.py. A higher CG lowers these.
-  GM_phi: 2.05       # [m]
-  GM_theta: 0.82     # [m]
+  GM_phi: 1.07       # [m]
+  GM_theta: 0.535    # [m]
 
 # Rigid-body + hydrodynamic model, diagonal, about CO. Order: surge, sway, heave, roll, pitch, yaw.
 # Read by both the simulator and the DP controller (cybership_utilities/vessel_model.py).
 model:
-  # 14.5 kg (no batteries) + 2.4 kg (2 batteries), datasheet. Helga's extra equipment not included.
-  mass: 16.9
-  # [kg m^2] Mass assumed in the two hulls (y0 = 0.365 m), each a slender rod of length 1.2 m:
-  # Ix ~ m*y0^2 + hull section, Iy ~ m*L^2/12, Iz ~ m*L^2/12 + m*y0^2. Measure Iz with a bifilar pendulum.
-  inertia: [2.4, 2.1, 4.3]
-  # [kg, kg m^2] Capytaine on the Blue Robotics hull CAD (BR-101652, mirrored to +-0.3765 m),
+  # [kg] Helga as she runs, with 4 batteries (2 per hull), from the Helga team.
+  mass: 30.2
+  # [kg m^2] Fossen's radii of gyration, as in the Otter USV model (MSS / PythonVehicleSimulator):
+  #   I = m*R^2 with R44 = 0.4*B, R55 = R66 = 0.25*L   (L = 1.2 m, B = 0.93 m)
+  # Alternative estimate with all mass in the hulls (y0 = 0.365 m) gives Iz ~ 7.7, so Iz is uncertain
+  # by a factor ~3 until it is measured (bifilar pendulum).
+  inertia: [4.18, 2.72, 2.72]
+  # [kg, kg m^2] Capytaine on the Blue Robotics hull CAD (BR-101652, hull centres at +-0.374 m with the
+  # vertical sides facing inward, 570 mm apart, as in drawing BR-101447),
   # omega = 0 (slow DP motion), 1518 panels:
   #   python3 cybership_config/tools/capytaine_from_stl.py ~/ros_ws/cad/hull/PUB-BR-101381-001.STL \
-  #       --mass 16.9 --hull-offset 0.3765
-  # omega = inf for comparison: [0.49, 53.40, 10.69, 3.38, 0.44, 3.83].
-  # Sway is large (5.6 x mass) because the hulls are deep V-shapes with a keel (220 mm draft).
-  added_mass: [0.94, 94.66, 29.89, 5.18, 0.79, 6.05]
+  #       --mass 30.2 --hull-offset 0.374 --swap-sides
+  # omega = inf for comparison: [1.33, 75.55, 15.75, 1.78, 0.61, 4.26].
+  # Sway is large (4.3 x mass) because the hulls are deep V-shapes with a keel (274 mm draft).
+  added_mass: [2.53, 129.80, 35.68, 2.73, 0.90, 6.41]
   # [N s/m, N m s/rad] Linear damping, tuned for DP speeds (< 1 m/s).
-  # Surge from the datasheet: 80 N -> 3 m/s and ~30 W at 1 m/s give ~10 N per m/s around 1 m/s.
+  # Surge from the stock BlueBoat datasheet (16.9 kg): 80 N -> 3 m/s and ~30 W at 1 m/s give ~10 N per m/s
+  # around 1 m/s. Helga is heavier and deeper, so the real value is probably higher.
   # Sway ~4x surge (side area), yaw ~ sway*L^2/12 + surge*y0^2. Heave: shoebox default.
   # Roll/pitch: damping ratio ~0.2 with the Capytaine GM, d = 2*0.2*sqrt(m*g*GM*(I + A)).
   # All ESTIMATES until speed tests in water.
-  damping_linear: [10.0, 40.0, 4.2, 20.3, 7.9, 6.0]
+  damping_linear: [10.0, 40.0, 4.2, 18.7, 9.6, 6.0]
 
 allocation:
   method: pseudo_inverse
@@ -53,9 +61,11 @@ thrusters:
   - name: port
     type: fixed
     frame: stern_port_thruster_link
-    position: [-0.55, -0.365, 0.13]    # [m] under the port hull (estimate)
+    # [m] Drawing BR-101447: propeller just outboard of the vertical inner hull side (y ~ 0.296 m),
+    # 123 mm below the waterline with 2 batteries -> ~177 mm at Helga's 30.2 kg. x is an estimate.
+    position: [-0.55, -0.296, 0.177]
     direction_deg: 0.0               # pushes forward
-    max_force: 40.0                  # [N] datasheet: 8.2 kgf (80 N) for both motors -> 40 N each, forward
+    max_force: 67.0                  # [N] at 400 W (Helga team)
     deadband: 0.5
     allocation:
       weight: 1.0
@@ -63,18 +73,19 @@ thrusters:
   - name: starboard
     type: fixed
     frame: stern_starboard_thruster_link
-    position: [-0.55, 0.365, 0.13]
+    position: [-0.55, 0.296, 0.177]
     direction_deg: 0.0
-    max_force: 40.0
+    max_force: 67.0
     deadband: 0.5
     allocation:
       weight: 1.0
 
   - name: bow_azimuth
-    type: azimuth                    # can rotate the full circle (per hardware team; exact range TBD)
+    type: azimuth                    # rotates freely, no angle limit (Helga team)
     frame: bow_azimuth_thruster_link
-    position: [0.45, 0.0, 0.15]      # [m] on the centerline at the front crossbeam (estimate)
-    max_force: 40.0
+    position: [0.45, 0.0, 0.248]     # [m] x estimate; depth 248 mm below the waterline (Helga team)
+    max_force: 67.0                  # [N] at 400 W (Helga team)
+    max_rate_deg_s: 90.0             # 4 s per 360 deg (Helga team). NOT yet used by the simulator.
     deadband: 0.5
     allocation:
       weight: 1.0
