@@ -82,6 +82,8 @@ thrusters:
     position: [-0.55, -0.29, 0.177]   # y from the Microampere team sketch (F2)
     direction_deg: 0.0               # pushes forward
     max_force: 67.0                  # [N] at 400 W (Microampere team)
+    reverse_ratio: 0.8               # reverse thrust = 80 % of forward (typical T200-type propeller)
+    time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
     deadband: 0.5
     allocation:
       weight: 1.0
@@ -92,6 +94,8 @@ thrusters:
     position: [-0.55, 0.29, 0.177]    # y from the Microampere team sketch (F3)
     direction_deg: 0.0
     max_force: 67.0
+    reverse_ratio: 0.8
+    time_constant: 0.1
     deadband: 0.5
     allocation:
       weight: 1.0
@@ -101,7 +105,8 @@ thrusters:
     frame: bow_azimuth_thruster_link
     position: [0.37, 0.0, 0.248]     # [m] Microampere team sketch (F1): 370 mm ahead of CO, 248 mm deep
     max_force: 67.0                  # [N] at 400 W (Microampere team)
-    max_rate_deg_s: 90.0             # 4 s per 360 deg (Microampere team). NOT yet used by the simulator.
+    max_rate_deg_s: 90.0             # 4 s per 360 deg (Microampere team)
+    time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
     deadband: 0.5
     allocation:
       weight: 1.0

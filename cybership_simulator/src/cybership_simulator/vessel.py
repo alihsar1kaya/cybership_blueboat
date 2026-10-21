@@ -22,6 +22,7 @@ import skadipy
 
 from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
+from cybership_utilities.marine_craft.actuators import make_thruster
 
 
 class ConfigurableSimulator(BaseSimulator):
@@ -104,11 +105,16 @@ class ConfigurableSimulator(BaseSimulator):
         ]
         return skadipy.allocator.PseudoInverse(actuators=actuators, force_torque_components=dofs)
 
+    STATE_EVERY = 5  # publish thruster/<name>/state every 5th sim step (20 Hz)
+
     def setup_thrusters(self):
         self.u = np.zeros((self._n_inputs, 1))
         self._issued_pubs = {}
+        self._actuators = {}  # name -> actuator model (thruster dynamics, see marine_craft/actuators.py)
+        self._step_count = 0
         for t in self.config["thrusters"]:
             name = t["name"]
+            self._actuators[name] = make_thruster(t)
             self._issued_pubs[name] = self.create_publisher(
                 geometry_msgs.msg.WrenchStamped, f"thruster/{name}/issued", 1
             )
@@ -118,28 +124,13 @@ class ConfigurableSimulator(BaseSimulator):
             )
 
     # ------------------------------------------------------------------------
-    # Thruster command handling (same clipping/deadband as the old per-vessel callbacks)
+    # Actuators: command -> (saturation, deadband) -> thruster dynamics -> actual thrust -> tau = B u
     # ------------------------------------------------------------------------
 
     def _on_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
+        """Store the command; the actuator model turns it into actual thrust in iterate()."""
         name = t["name"]
-        idx = self._thruster_index[name]
-        max_f = float(t.get("max_force", np.inf))
-        deadband = float(t.get("deadband", 0.0))
-
-        if t["type"] == "fixed":
-            fx = float(np.clip(msg.force.x, -max_f, max_f))
-            if abs(fx) < deadband:
-                fx = 0.0
-            fy = 0.0
-            self.u[idx, 0] = fx
-        else:  # azimuth
-            fx = float(np.clip(msg.force.x, -max_f, max_f))
-            fy = float(np.clip(msg.force.y, -max_f, max_f))
-            if np.hypot(fx, fy) < deadband:
-                fx, fy = 0.0, 0.0
-            self.u[idx, 0] = fx
-            self.u[idx + 1, 0] = fy
+        fx, fy = self._actuators[name].set_command(msg.force.x, msg.force.y)
 
         issued = geometry_msgs.msg.WrenchStamped()
         issued.header.frame_id = self._frame(t["frame"])
@@ -148,7 +139,23 @@ class ConfigurableSimulator(BaseSimulator):
         issued.wrench.force.y = fy
         self._issued_pubs[name].publish(issued)
 
-        self.publish_thruster_state(name, t["frame"], fx, fy, azimuth=(t["type"] == "azimuth"))
+    def iterate(self):
+        """Step the thruster dynamics, then the vessel (BaseSimulator.iterate computes tau = B u)."""
+        self._step_count += 1
+        publish_state = self._step_count % self.STATE_EVERY == 0
+        for t in self.config["thrusters"]:
+            act = self._actuators[t["name"]]
+            act.step(self.dt)
+            fx, fy, angle = act.output()
+            idx = self._thruster_index[t["name"]]
+            self.u[idx, 0] = fx
+            if t["type"] == "azimuth":
+                self.u[idx + 1, 0] = fy
+            if publish_state:
+                self.publish_thruster_state(
+                    t["name"], t["frame"], fx, fy, azimuth=(t["type"] == "azimuth"),
+                    angle=angle, angle_rate=getattr(act, "angle_rate", 0.0))
+        super().iterate()
 
 
 def main(args=None):

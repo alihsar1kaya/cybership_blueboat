@@ -228,11 +228,13 @@ class BaseSimulator(Node, ABC):
         msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z = (float(v) for v in tau[3:6])
         self.publisher_applied_force.publish(msg)
 
-    def publish_thruster_state(self, name: str, frame_link: str, fx: float, fy: float = 0.0, azimuth: bool = False):
+    def publish_thruster_state(self, name: str, frame_link: str, fx: float, fy: float = 0.0, azimuth: bool = False,
+                               angle: float = None, angle_rate: float = None):
         """
         Publish the actual state of one thruster on thruster/<name>/state.
         fx, fy: force actually applied in the sim (after clipping/deadband), in the thruster's mounting frame.
-        For azimuth thrusters the angle is atan2(fy, fx); fixed thrusters report angle 0.
+        angle/angle_rate: the actuator's actual azimuth angle and rate, if the sim models it; otherwise
+        the angle is atan2(fy, fx) for azimuth thrusters (0 for fixed) and the rate a finite difference.
         The sim has no propeller model yet, so rpm is NaN.
         """
         if not hasattr(self, "_thruster_state_pubs"):
@@ -245,15 +247,17 @@ class BaseSimulator(Node, ABC):
         now_s = now.nanoseconds * 1e-9
         last_angle, last_t = self._thruster_last.get(name, (0.0, None))
 
-        if azimuth and np.hypot(fx, fy) > 0.0:
-            angle = float(np.arctan2(fy, fx))
-        else:
-            angle = last_angle if azimuth else 0.0
+        if angle is None:
+            if azimuth and np.hypot(fx, fy) > 0.0:
+                angle = float(np.arctan2(fy, fx))
+            else:
+                angle = last_angle if azimuth else 0.0
 
-        angle_rate = 0.0
-        if last_t is not None and now_s > last_t:
-            d_angle = (angle - last_angle + np.pi) % (2 * np.pi) - np.pi
-            angle_rate = d_angle / (now_s - last_t)
+        if angle_rate is None:
+            angle_rate = 0.0
+            if last_t is not None and now_s > last_t:
+                d_angle = (angle - last_angle + np.pi) % (2 * np.pi) - np.pi
+                angle_rate = d_angle / (now_s - last_t)
         self._thruster_last[name] = (angle, now_s)
 
         msg = ThrusterState()
