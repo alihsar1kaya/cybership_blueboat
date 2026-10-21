@@ -8,6 +8,8 @@ simulator builds the hull and thrusters from a YAML file:
 
     cybership_config/config/<vessel_model>/vessel.yaml
 
+The marine craft (kinematics + dynamics) is Fossen's model in cybership_utilities.marine_craft.
+
 Run:
     ros2 run cybership_simulator vessel.py --ros-args -r __ns:=/voyager \
         -p vessel_model:=voyager -p tf_prefix:=voyager
@@ -16,7 +18,6 @@ Run:
 import numpy as np
 import rclpy
 import geometry_msgs.msg
-import shoeboxpy.model6dof
 import skadipy
 
 from cybership_simulator.base import BaseSimulator
@@ -28,6 +29,9 @@ class ConfigurableSimulator(BaseSimulator):
 
     def __init__(self):
         super().__init__(node_name="vessel_simulator")
+        if not self._thruster_roll_pitch:
+            # Thrusters give only X, Y, N (as in Fossen's Otter): drop the roll/pitch rows of tau = B u
+            self.allocator._b_matrix[3:5, :] = 0.0
 
     # ------------------------------------------------------------------------
     # Configuration
@@ -53,20 +57,18 @@ class ConfigurableSimulator(BaseSimulator):
 
     def _create_vessel(self):
         self._load_config()
-        hull = self.config["hull"]
-        shoebox = shoeboxpy.model6dof.Shoebox(
-            L=hull["length"], B=hull["beam"], T=hull["draft"],
-            GM_phi=hull.get("GM_phi", 0.0), GM_theta=hull.get("GM_theta", 0.0),
-            eta0=self.eta0.flatten(),
-        )
-        # Mass, added mass and damping from vessel.yaml ('model' section, else from 'hull')
+        # Mass, added mass, damping and restoring from vessel.yaml ('model' section, else from 'hull')
         params = vessel_model.model_parameters(self.config)
-        vessel_model.apply_to_shoebox(shoebox, params)
+        nl = params["nonlinear"]
         self.get_logger().info(
             f"Model from '{params['source']}': mass {params['mass']:.2f} kg, "
-            f"MA {np.round(params['MA'], 2).tolist()}, D {np.round(params['D'], 2).tolist()}"
+            f"MA {np.round(params['MA'], 2).tolist()}, D {np.round(params['D'], 2).tolist()}, "
+            f"G {np.round(params['G'], 1).tolist()}, X_uu {nl['surge_quadratic']}, "
+            f"N_rr {nl['yaw_quadratic']:.1f}, cross-flow {'on' if nl['cross_flow'] else 'off'}, "
+            f"cancel Munk {nl['cancel_munk']}, thruster roll/pitch moments {nl['thruster_roll_pitch_moments']}"
         )
-        return shoebox
+        self._thruster_roll_pitch = nl["thruster_roll_pitch_moments"]
+        return vessel_model.make_marine_craft(params, eta0=self.eta0)
 
     def _init_allocator(self):
         """Build skadipy actuators from the thruster list. The simulator only uses the B matrix."""

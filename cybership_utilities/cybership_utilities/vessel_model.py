@@ -10,10 +10,24 @@ If vessel.yaml has a 'model' section, its values are used directly:
       mass: 16.9                       # [kg]
       inertia: [Ix, Iy, Iz]            # [kg m^2] about CO, diagonal
       added_mass: [Xu, Yv, Zw, Kp, Mq, Nr]      # positive values, diagonal
+      heave_stiffness: 2581            # [N/m] rho*g*A_wp (optional, default 0)
+      # either explicit linear damping ...
       damping_linear: [Xu, Yv, Zw, Kp, Mq, Nr]  # positive values, diagonal
+      # ... or Fossen's method (as in his Otter USV model), which also adds the nonlinear terms:
+      damping:
+        surge_linear: 2.0              # X_u [N s/m]
+        surge_quadratic: 13.5          # X_|u|u [N s^2/m^2]
+        sway_time_constant: 1.0        # Y_v = M22 / T_sway
+        yaw_time_constant: 1.0         # N_r = M66 / T_yaw
+        yaw_quadratic_factor: 10.0     # N_|r|r = factor * N_r
+        zeta: [0.3, 0.2, 0.4]          # heave, roll, pitch: d = 2 zeta omega_n M
+        cross_flow: {length: 1.056, beam: 0.161, draft: 0.274}   # one hull, Hoerner Cd
+      cancel_munk: [yaw]               # cancel destabilising Munk moments (roll/pitch/yaw), default none
+      thruster_roll_pitch_moments: true  # false: thrusters only give X, Y, N (as in Fossen's Otter)
 
 Otherwise the values are computed from the 'hull' section like shoeboxpy's 6DOF box
 (mass = rho*L*B*T, uniform-box inertia, default added mass and damping factors).
+Roll/pitch restoring always comes from hull.GM_phi / hull.GM_theta.
 """
 
 import os
@@ -40,43 +54,83 @@ def load_vessel_config(vessel_model="voyager", path=""):
         return yaml.safe_load(f), path
 
 
-def model_parameters(config, rho=1000.0):
+def model_parameters(config, rho=1000.0, g=9.81):
     """
-    Return the 6DOF model as diagonal vectors:
-    {'mass', 'inertia' (3), 'MRB' (6), 'MA' (6), 'D' (6), 'source'}.
+    Return the 6DOF model as diagonal vectors plus the nonlinear terms:
+    {'mass', 'inertia' (3), 'MRB', 'MA', 'D' (linear), 'G' (6), 'nonlinear' (dict), 'source'}.
     """
     model = config.get("model")
+    hull = config["hull"]
+    nonlinear = {"surge_quadratic": 0.0, "yaw_quadratic": 0.0, "cross_flow": None, "cancel_munk": [],
+                 "thruster_roll_pitch_moments": True}
     if model:
         mass = float(model["mass"])
         inertia = np.asarray(model["inertia"], dtype=float)
         MA = np.asarray(model["added_mass"], dtype=float)
-        D = np.asarray(model["damping_linear"], dtype=float)
+        heave_stiffness = float(model.get("heave_stiffness", 0.0))
+        nonlinear["cancel_munk"] = list(model.get("cancel_munk", []))
+        nonlinear["thruster_roll_pitch_moments"] = bool(model.get("thruster_roll_pitch_moments", True))
         source = "model"
     else:
-        hull = config["hull"]
         L, B, T = hull["length"], hull["beam"], hull["draft"]
         mass = rho * L * B * T
         inertia = mass / 12.0 * np.array([B**2 + T**2, L**2 + T**2, L**2 + B**2])
-        base = np.concatenate([[mass] * 3, inertia])
-        MA = _SHOEBOX_ALPHA * base
-        D = _SHOEBOX_BETA * base
+        MA = _SHOEBOX_ALPHA * np.concatenate([[mass] * 3, inertia])
+        heave_stiffness = 0.0
         source = "hull"
+    MRB = np.concatenate([[mass] * 3, inertia])
+    G = np.array([0.0, 0.0, heave_stiffness,
+                  mass * g * hull.get("GM_phi", 0.0), mass * g * hull.get("GM_theta", 0.0), 0.0])
+
+    if model and "damping" in model:
+        D, extra = _fossen_damping(model["damping"], MRB + MA, G)
+        nonlinear.update(extra)
+        source += ", Fossen damping"
+    elif model:
+        D = np.asarray(model["damping_linear"], dtype=float)
+    else:
+        D = _SHOEBOX_BETA * MRB
+
     for name, vec, n in (("inertia", inertia, 3), ("added_mass", MA, 6), ("damping_linear", D, 6)):
         if vec.shape != (n,):
             raise ValueError(f"vessel.yaml model.{name} must have {n} values, got {vec.tolist()}")
-    MRB = np.concatenate([[mass] * 3, inertia])
-    return {"mass": mass, "inertia": inertia, "MRB": MRB, "MA": MA, "D": D, "source": source}
+    return {"mass": mass, "inertia": inertia, "MRB": MRB, "MA": MA, "D": D, "G": G,
+            "nonlinear": nonlinear, "source": source}
 
 
-def apply_to_shoebox(shoebox, params):
-    """Overwrite a shoeboxpy.model6dof.Shoebox's mass, added mass and damping."""
-    shoebox.m = params["mass"]
-    shoebox.MRB = np.diag(params["MRB"])
-    shoebox.MA = np.diag(params["MA"])
-    shoebox.D = np.diag(params["D"])
-    shoebox.M_eff = shoebox.MRB + shoebox.MA
-    shoebox.invM_eff = np.linalg.inv(shoebox.M_eff)
-    return shoebox
+def _fossen_damping(d, M, G):
+    """
+    Damping as in Fossen's Otter USV model (PythonVehicleSimulator, Fossen 2021):
+    linear terms from time constants (sway, yaw) and relative damping (heave, roll, pitch),
+    plus quadratic surge resistance, nonlinear yaw damping and cross-flow drag.
+    M and G are diagonal vectors.
+    """
+    zeta = np.asarray(d.get("zeta", [0.3, 0.2, 0.4]), dtype=float)
+    omega = np.sqrt(G[2:5] / M[2:5])  # natural frequencies in heave, roll, pitch
+    Nr = M[5] / d["yaw_time_constant"]
+    D = np.array([
+        d["surge_linear"],
+        M[1] / d["sway_time_constant"],
+        *(2.0 * zeta * omega * M[2:5]),
+        Nr,
+    ])
+    extra = {
+        "surge_quadratic": float(d.get("surge_quadratic", 0.0)),
+        "yaw_quadratic": float(d.get("yaw_quadratic_factor", 0.0)) * Nr,
+        "cross_flow": d.get("cross_flow"),
+    }
+    return D, extra
+
+
+def make_marine_craft(params, eta0=None, nu0=None, rho=1000.0):
+    """Build the Fossen marine craft model (cybership_utilities.marine_craft) from model_parameters()."""
+    from cybership_utilities.marine_craft import MarineCraft
+    nl = params["nonlinear"]
+    return MarineCraft(
+        np.diag(params["MRB"]), np.diag(params["MA"]), np.diag(params["D"]), np.diag(params["G"]),
+        surge_quadratic=nl["surge_quadratic"], yaw_quadratic=nl["yaw_quadratic"],
+        cross_flow=nl["cross_flow"], cancel_munk=nl["cancel_munk"], rho=rho, eta0=eta0, nu0=nu0,
+    )
 
 
 def M_eff_3dof(params):

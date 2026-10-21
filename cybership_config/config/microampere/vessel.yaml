@@ -45,13 +45,29 @@ model:
   # omega = inf for comparison: [1.33, 75.55, 15.75, 1.78, 0.61, 4.26].
   # Sway is large (4.3 x mass) because the hulls are deep V-shapes with a keel (274 mm draft).
   added_mass: [2.53, 129.80, 35.68, 2.73, 0.90, 6.41]
-  # [N s/m, N m s/rad] Linear damping, tuned for DP speeds (< 1 m/s).
-  # Surge from the stock BlueBoat datasheet (16.9 kg): 80 N -> 3 m/s and ~30 W at 1 m/s give ~10 N per m/s
-  # around 1 m/s. Microampere is heavier and deeper, so the real value is probably higher.
-  # Sway ~4x surge (side area), yaw ~ sway*L^2/12 + surge*y0^2. Heave: shoebox default.
-  # Roll/pitch: damping ratio ~0.2 with the Capytaine GM, d = 2*0.2*sqrt(m*g*GM*(I + A)).
-  # All ESTIMATES until speed tests in water.
-  damping_linear: [10.0, 40.0, 4.2, 18.7, 9.6, 6.0]
+  # [N/m] heave restoring rho*g*A_wp, A_wp = 0.263 m^2 (two hulls), Capytaine on the hull CAD.
+  heave_stiffness: 2581
+  # Damping, Fossen's method as in his Otter USV model (also a catamaran), see
+  # cybership_utilities/vessel_model.py. ALL to be identified on the real boat (speed/step tests).
+  damping:
+    # Surge resistance X = -(d1 u + d2 u|u|). d2 from the hull: ITTC-57 friction on the CAD wetted
+    # area plus wave/form resistance calibrated on the BlueBoat datasheet (~9 N at 1 m/s, 80 N at
+    # 3 m/s for 16.9 kg) and scaled to 30.2 kg -> top speed ~3 m/s with 2-3 thrusters forward.
+    surge_linear: 2.0          # [N s/m] small, for low speed
+    surge_quadratic: 13.5      # [N s^2/m^2]
+    sway_time_constant: 1.0    # [s] Y_v = M22 / T_sway   (Otter value)
+    yaw_time_constant: 1.0     # [s] N_r = M66 / T_yaw    (Otter value)
+    yaw_quadratic_factor: 10.0 # N_|r|r = 10 N_r          (Otter value)
+    zeta: [0.3, 0.2, 0.4]      # heave, roll, pitch relative damping (Otter values)
+    # Cross-flow drag on ONE hull (as Fossen does for the Otter's pontoons): waterline length and
+    # beam of one hull at 274 mm draft (hull CAD), Cd from Hoerner's curve (B/2T = 0.29 -> 1.92).
+    cross_flow: {length: 1.056, beam: 0.161, draft: 0.274}
+  # Stability at speed. The large sway/heave added mass (Capytaine) gives large destabilising Munk
+  # moments; the real boat is held straight by lift on the keels/skegs, which the model lacks.
+  # As Fossen does in his Otter USV model: cancel them, and let the thrusters give only X, Y, N
+  # (the thrust line is ~10-18 cm below the waterline, roughly where the hull resistance acts).
+  cancel_munk: [roll, pitch, yaw]
+  thruster_roll_pitch_moments: false
 
 allocation:
   method: pseudo_inverse
