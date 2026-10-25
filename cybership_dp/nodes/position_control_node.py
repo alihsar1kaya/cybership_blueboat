@@ -103,6 +103,13 @@ class PositionController(Node):
                 ('control.ki_ratio', 0.1),                     # Ki = ki_ratio * omega_n * Kp
                 ('control.max_integral_force', [10.0, 10.0, 5.0]),  # anti-windup [N, N, Nm]
 
+                # Guidance "turn then go" (before the control law): far from the goal, first turn
+                # the bow towards it on the spot, then drive there bow first; DP with the goal
+                # heading only inside approach_radius. false = plain set-point DP (original).
+                ('guidance.turn_then_go', False),
+                ('guidance.approach_radius', 1.5),     # [m]
+                ('guidance.align_angle_deg', 20.0),    # [deg] start driving when the bow is this close
+
                 # Controller limits
                 ('control.max_integral_error.pos', 1.0),
                 ('control.max_integral_error.yaw', 1.4),
@@ -268,6 +275,8 @@ class PositionController(Node):
             params = vessel_model.model_parameters(config)
             self.M_eff = vessel_model.M_eff_3dof(params)
             self.D_eff = vessel_model.D_3dof(params)
+            # Full model, so the feedforward can use the nonlinear damping D(nu_d) nu_d
+            self._craft = vessel_model.make_marine_craft(params)
             self.get_logger().info(
                 f"Vessel model from {path}: M_eff diag {np.round(np.diag(self.M_eff), 2).tolist()}, "
                 f"D diag {np.round(np.diag(self.D_eff), 2).tolist()}")
@@ -279,6 +288,7 @@ class PositionController(Node):
             )
             self.M_eff = shoebox.M_eff
             self.D_eff = shoebox.D
+            self._craft = None
 
         # Model-based gains (pole placement per DOF): M*e'' + (D + Kd)*e' + Kp*e = 0
         self.model_based = self.get_parameter('control.model_based').value
@@ -582,7 +592,7 @@ class PositionController(Node):
 
         # Update the reference filter with the latest target pose.
         # This "command" is smoothed by the filter.
-        ref = np.array([self.target_x, self.target_y, self.target_yaw])
+        ref = self._guidance_reference(current_x, current_y, current_yaw)
         self.ref_filter.set_eta_r(ref)
         self.ref_filter.update()
 
@@ -684,7 +694,9 @@ class PositionController(Node):
         """
         Model-based DP law (Fossen), everything in the body frame:
 
-            tau = M nu_d_dot + D nu_d + Kp R^T e + Kd (nu_d - nu) + Ki R^T int(e) dt
+            tau = M nu_d_dot + D(nu_d) nu_d + Kp R^T e + Kd (nu_d - nu) + Ki R^T int(e) dt
+
+        D(nu_d) nu_d is the full (linear + nonlinear) damping of the vessel model, if available.
 
         error_world = eta_d - eta (yaw wrapped), eta_d_dot/eta_d_ddot from the reference filter
         (world frame), nu = [u, v, r] from odometry (body frame).
@@ -702,9 +714,45 @@ class PositionController(Node):
             tau_i = np.clip(self.Ki_mb * (R.T @ self.integral_mb),
                             -self.max_integral_force, self.max_integral_force)
 
-        tau = (self.M_eff @ nu_d_dot + self.D_eff @ nu_d
+        if self._craft is not None:
+            damping_ff = -self._craft.damping(np.array([nu_d[0], nu_d[1], 0, 0, 0, nu_d[2]]))[[0, 1, 5]]
+        else:
+            damping_ff = self.D_eff @ nu_d
+        tau = (self.M_eff @ nu_d_dot + damping_ff
                + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
         return float(tau[0]), float(tau[1]), float(tau[2])
+
+    def _guidance_reference(self, x, y, yaw):
+        """Reference eta_r = [x, y, psi] for the reference filter (guidance block)."""
+        goal = np.array([self.target_x, self.target_y, self.target_yaw])
+        if not self.get_parameter('guidance.turn_then_go').value:
+            return goal
+        radius = self.get_parameter('guidance.approach_radius').value
+        align = np.radians(self.get_parameter('guidance.align_angle_deg').value)
+        dx, dy = self.target_x - x, self.target_y - y
+        distance = np.hypot(dx, dy)
+        bearing = np.arctan2(dy, dx)
+        heading_error = abs(wrap_to_pi(bearing - yaw))
+        phase = getattr(self, '_guidance_phase', None)
+
+        if phase is None:
+            phase = 'turn' if distance > radius else 'station'
+            self._guidance_hold = (x, y)
+        if phase != 'station' and distance < radius:
+            phase = 'station'
+        elif phase == 'turn' and heading_error < align:
+            phase = 'transit'
+        elif phase == 'transit' and heading_error > 2 * align:
+            phase, self._guidance_hold = 'turn', (x, y)   # pushed off course: turn again
+
+        if phase != getattr(self, '_guidance_phase', None):
+            self.get_logger().info(f"Guidance: {phase} (distance {distance:.1f} m)")
+        self._guidance_phase = phase
+        if phase == 'turn':
+            return np.array([*self._guidance_hold, bearing])
+        if phase == 'transit':
+            return np.array([self.target_x, self.target_y, bearing])
+        return goal
 
     def _publish_wrench(self, fx, fy, mz):
         wrench_msg = Wrench()
@@ -779,6 +827,7 @@ class PositionController(Node):
 
         self.target_x = target_in_odom.pose.position.x
         self.target_y = target_in_odom.pose.position.y
+        self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
 
         self.get_logger().info(
             f"Target position: ({self.target_x}, {self.target_y})")

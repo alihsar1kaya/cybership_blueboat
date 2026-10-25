@@ -10,6 +10,10 @@ simulator builds the hull and thrusters from a YAML file:
 
 The marine craft (kinematics + dynamics) is Fossen's model in cybership_utilities.marine_craft.
 
+Environment (Fossen Ch. 10.3): ocean current, set with parameters, also while running, e.g.
+    ros2 param set /microampere/sim environment.current.speed 0.2
+    ros2 param set /microampere/sim environment.current.direction_deg 90.0   # flows towards east
+
 Run:
     ros2 run cybership_simulator vessel.py --ros-args -r __ns:=/voyager \
         -p vessel_model:=voyager -p tf_prefix:=voyager
@@ -18,11 +22,14 @@ Run:
 import numpy as np
 import rclpy
 import geometry_msgs.msg
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+from visualization_msgs.msg import Marker
 import skadipy
 
 from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster
+from cybership_utilities.marine_craft.environment import OceanCurrent
 
 
 class ConfigurableSimulator(BaseSimulator):
@@ -33,6 +40,76 @@ class ConfigurableSimulator(BaseSimulator):
         if not self._thruster_roll_pitch:
             # Thrusters give only X, Y, N (as in Fossen's Otter): drop the roll/pitch rows of tau = B u
             self.allocator._b_matrix[3:5, :] = 0.0
+        self._setup_environment()
+
+    # ------------------------------------------------------------------------
+    # Environment (Fossen Ch. 10.3): ocean current
+    # ------------------------------------------------------------------------
+
+    def _setup_environment(self):
+        p = {
+            "environment.current.speed": 0.0,          # [m/s] mean speed
+            "environment.current.direction_deg": 0.0,  # [deg] flows towards, 0 = north, 90 = east
+            "environment.current.mu": 0.0,             # Gauss-Markov: mean reversion [1/s], 0 = off
+            "environment.current.sigma": 0.0,          # Gauss-Markov: noise [m/s/sqrt(s)], 0 = off
+            "environment.current.speed_min": 0.0,
+            "environment.current.speed_max": 1.0,
+            "environment.current.seed": -1,            # -1: random
+        }
+        for name, default in p.items():
+            # dynamic typing: 'ros2 param set ... 90' (an integer) must work as well as 90.0
+            self.declare_parameter(name, default, ParameterDescriptor(dynamic_typing=True))
+        g = lambda n: self.get_parameter(f"environment.current.{n}").value
+        seed = g("seed")
+        self._current = OceanCurrent(
+            speed=float(g("speed")), direction_deg=float(g("direction_deg")), mu=float(g("mu")),
+            sigma=float(g("sigma")), speed_min=float(g("speed_min")), speed_max=float(g("speed_max")),
+            seed=None if int(seed) < 0 else int(seed))
+        self.add_on_set_parameters_callback(self._on_environment_change)
+        self._pub_current = self.create_publisher(
+            geometry_msgs.msg.Vector3Stamped, "sim/environment/current", 1)
+        self._pub_current_marker = self.create_publisher(Marker, "sim/environment/current_marker", 1)
+        self.get_logger().info(
+            f"Ocean current: {g('speed')} m/s towards {g('direction_deg')} deg "
+            f"(mu {g('mu')}, sigma {g('sigma')})")
+
+    def _on_environment_change(self, params):
+        for param in params:
+            if param.name == "environment.current.speed":
+                self._current.set(speed=float(param.value))
+            elif param.name == "environment.current.direction_deg":
+                self._current.set(direction_deg=float(param.value))
+            elif param.name == "environment.current.mu":
+                self._current.mu = float(param.value)
+            elif param.name == "environment.current.sigma":
+                self._current.sigma = float(param.value)
+            else:
+                continue
+            self.get_logger().info(f"{param.name} = {param.value}")
+        return SetParametersResult(successful=True)
+
+    def _publish_environment(self):
+        v = self._current.velocity_ned()
+        stamp = self.get_clock().now().to_msg()
+        msg = geometry_msgs.msg.Vector3Stamped()
+        msg.header.frame_id = self.world_frame_id
+        msg.header.stamp = stamp
+        msg.vector.x, msg.vector.y, msg.vector.z = (float(x) for x in v)
+        self._pub_current.publish(msg)
+
+        # Arrow at the vessel, 5 m per m/s, in the world (NED) frame
+        eta = self.vessel.eta
+        m = Marker()
+        m.header.frame_id = self.world_frame_id
+        m.header.stamp = stamp
+        m.ns, m.id, m.type = "current", 0, Marker.ARROW
+        start = geometry_msgs.msg.Point(x=float(eta[0]), y=float(eta[1]), z=0.0)
+        end = geometry_msgs.msg.Point(x=float(eta[0] + 5.0 * v[0]), y=float(eta[1] + 5.0 * v[1]), z=0.0)
+        m.points = [start, end]
+        m.scale.x, m.scale.y, m.scale.z = 0.05, 0.12, 0.15
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 0.8, 1.0, 0.9
+        m.action = Marker.ADD if np.linalg.norm(v) > 1e-6 else Marker.DELETE
+        self._pub_current_marker.publish(m)
 
     # ------------------------------------------------------------------------
     # Configuration
@@ -110,6 +187,7 @@ class ConfigurableSimulator(BaseSimulator):
     def setup_thrusters(self):
         self.u = np.zeros((self._n_inputs, 1))
         self._issued_pubs = {}
+        self._force_pubs = {}
         self._actuators = {}  # name -> actuator model (thruster dynamics, see marine_craft/actuators.py)
         self._step_count = 0
         for t in self.config["thrusters"]:
@@ -117,6 +195,10 @@ class ConfigurableSimulator(BaseSimulator):
             self._actuators[name] = make_thruster(t)
             self._issued_pubs[name] = self.create_publisher(
                 geometry_msgs.msg.WrenchStamped, f"thruster/{name}/issued", 1
+            )
+            # Actual thrust as WrenchStamped, so RViz can draw it (thruster/<name>/state is not drawable)
+            self._force_pubs[name] = self.create_publisher(
+                geometry_msgs.msg.WrenchStamped, f"thruster/{name}/force", 1
             )
             self.create_subscription(
                 geometry_msgs.msg.Wrench, f"thruster/{name}/command",
@@ -140,9 +222,13 @@ class ConfigurableSimulator(BaseSimulator):
         self._issued_pubs[name].publish(issued)
 
     def iterate(self):
-        """Step the thruster dynamics, then the vessel (BaseSimulator.iterate computes tau = B u)."""
+        """Step environment and thruster dynamics, then the vessel (BaseSimulator.iterate: tau = B u)."""
         self._step_count += 1
         publish_state = self._step_count % self.STATE_EVERY == 0
+        self._current.step(self.dt)
+        self.vessel.current_ned = self._current.velocity_ned()
+        if publish_state:
+            self._publish_environment()
         for t in self.config["thrusters"]:
             act = self._actuators[t["name"]]
             act.step(self.dt)
@@ -155,6 +241,11 @@ class ConfigurableSimulator(BaseSimulator):
                 self.publish_thruster_state(
                     t["name"], t["frame"], fx, fy, azimuth=(t["type"] == "azimuth"),
                     angle=angle, angle_rate=getattr(act, "angle_rate", 0.0))
+                force = geometry_msgs.msg.WrenchStamped()
+                force.header.frame_id = self._frame(t["frame"])
+                force.header.stamp = self.get_clock().now().to_msg()
+                force.wrench.force.x, force.wrench.force.y = float(fx), float(fy)
+                self._force_pubs[t["name"]].publish(force)
         super().iterate()
 
 

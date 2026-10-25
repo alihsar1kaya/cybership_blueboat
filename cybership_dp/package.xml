@@ -12,6 +12,7 @@
 
   <depend>rclpy</depend>
   <exec_depend>cybership_utilities</exec_depend>
+  <depend>cybership_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>

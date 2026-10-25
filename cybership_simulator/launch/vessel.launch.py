@@ -78,6 +78,12 @@ def _launch_setup(context, *args, **kwargs):
     if use_dp:
         actions += _dp_actions(vessel, vessel_name)
     if use_gui:
+        # Desired force tau_d as WrenchStamped, so RViz can draw it (green arrow)
+        actions.append(launch_ros.actions.Node(
+            package="cybership_viz",
+            executable="desired_force_stamped.py",
+            namespace=vessel_name,
+        ))
         actions.append(launch_ros.actions.Node(
             package="rviz2",
             executable="rviz2",

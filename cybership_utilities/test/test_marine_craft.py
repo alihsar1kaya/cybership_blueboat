@@ -146,3 +146,19 @@ def test_microampere_is_stable_at_top_speed():
     assert np.all(np.isfinite(model.nu))
     assert abs(model.eta[3]) < math.radians(1) and abs(model.eta[4]) < math.radians(1)
     assert model.nu[0] == pytest.approx(3.79, abs=0.05)
+
+
+# --- Ocean current (Fossen 2021, Ch. 10.3) ----------------------------------------------------
+
+def test_vessel_drifts_with_the_current_without_turning():
+    """
+    No thrust in a constant current: the vessel must end up moving with the current (nu_r -> 0)
+    and its heading must not change (an irrotational current gives no yaw moment, Property 10.1).
+    """
+    model = vessel_model.make_marine_craft(vessel_model.model_parameters(config("microampere")),
+                                           eta0=np.radians([0, 0, 0, 0, 0, 30]) * [0, 0, 0, 0, 0, 1])
+    model.current_ned = np.array([0.2, 0.0, 0.0])    # 0.2 m/s towards north
+    run(model, np.zeros(6), 120.0)
+    velocity_ned = J(model.eta)[0:3, 0:3] @ model.nu[0:3]
+    assert velocity_ned[0:2] == pytest.approx([0.2, 0.0], abs=0.005)
+    assert math.degrees(model.eta[5]) == pytest.approx(30.0, abs=0.1)

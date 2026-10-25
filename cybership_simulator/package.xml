@@ -9,6 +9,8 @@
 
   <depend>cybership_interfaces</depend>
   <exec_depend>cybership_utilities</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>

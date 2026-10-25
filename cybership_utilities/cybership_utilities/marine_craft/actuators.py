@@ -72,12 +72,17 @@ class AzimuthThruster:
         self.command = (0.0, 0.0)                  # (F_d, alpha_d)
 
     def set_command(self, fx, fy):
-        """Extended thrust (fx, fy) -> magnitude and angle (Fossen eq. 11.24); magnitude saturated."""
+        """
+        Extended thrust (fx, fy) -> magnitude and angle (Fossen eq. 11.24); magnitude saturated.
+        The direction of (fx, fy) is the angle set-point even when the magnitude is below the
+        deadband (the steering servo is independent of the throttle), so an allocation can turn
+        the azimuth without thrust by sending a tiny vector.
+        """
         magnitude = math.hypot(fx, fy)
+        alpha_d = math.atan2(fy, fx) if magnitude > 0.0 else self.command[1]
         if magnitude < self.deadband:
-            self.command = (0.0, self.command[1])  # stop, keep the last direction
+            self.command = (0.0, alpha_d)
             return 0.0, 0.0
-        alpha_d = math.atan2(fy, fx)
         magnitude = min(magnitude, self.max_force)
         self.command = (magnitude, alpha_d)
         return magnitude * math.cos(alpha_d), magnitude * math.sin(alpha_d)

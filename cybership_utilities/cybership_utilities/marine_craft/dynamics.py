@@ -1,10 +1,11 @@
 """
 Dynamics (Fossen 2021, Ch. 3-7), structured like Fossen's Otter USV model (PythonVehicleSimulator):
 
-    M nu_r_dot + C(nu, nu_r) nu_r + D(nu_r) nu_r + g(eta) = tau + tau_ext
+    M nu_r_dot + C(nu_r) nu_r + D(nu_r) nu_r + g(eta) = tau + tau_ext        (eq. 10.141)
 
     M      = M_RB + M_A                         rigid body + added mass (constant)
-    C      = C_RB(nu) + C_A(nu_r)               Coriolis/centripetal, from M via m2c
+    C      = C_RB(nu_r) + C_A(nu_r)             Coriolis/centripetal: C_RB independent of linear
+                                                velocity (eq. 3.63, Property 10.1), C_A via m2c
     D(nu_r) nu_r = D_L nu_r                     linear damping
                  + X_uu |u_r| u_r               quadratic surge resistance
                  + N_rr |r| r                   nonlinear yaw damping
@@ -37,6 +38,26 @@ def m2c(M, nu):
     C[0:3, 3:6] = -Smtrx(a)
     C[3:6, 0:3] = -Smtrx(a)
     C[3:6, 3:6] = -Smtrx(b)
+    return C
+
+
+def crb_linear_velocity_independent(M_RB, nu):
+    """
+    Rigid-body Coriolis/centripetal matrix parametrized independent of linear velocity
+    (Fossen 2021, eq. 3.63), CG in CO:
+
+        C_RB(nu) = [ m S(w)      0     ]
+                   [   0     -S(I_g w) ]
+
+    Gives the same C_RB(nu) nu as m2c(M_RB, nu), but only this form satisfies Property 10.1,
+    M_RB nu_dot + C_RB(nu) nu = M_RB nu_r_dot + C_RB(nu_r) nu_r, which the equations of relative
+    motion in a current (eq. 10.141) need.
+    """
+    m = M_RB[0, 0]
+    w = nu[3:6]
+    C = np.zeros((6, 6))
+    C[0:3, 0:3] = m * Smtrx(w)
+    C[3:6, 3:6] = -Smtrx(M_RB[3:6, 3:6] @ w)
     return C
 
 
@@ -113,7 +134,7 @@ class MarineCraft:
         for dof in self.cancel_munk:
             for i, j in self._MUNK[dof]:
                 C_A[i, j] = C_A[j, i] = 0.0
-        return m2c(self.M_RB, nu) + C_A
+        return crb_linear_velocity_independent(self.M_RB, nu) + C_A
 
     def damping(self, nu_r):
         """Damping force D(nu_r) nu_r with the sign of a force on the vessel (i.e. negative)."""

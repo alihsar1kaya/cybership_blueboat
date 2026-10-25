@@ -14,10 +14,12 @@
       # so surge, sway and yaw get the same closed-loop behaviour although sway is ~5x heavier.
       # The fixed p_gain/i_gain/d_gain below are then NOT used.
       model_based: true
-      omega_n: [0.3, 0.3, 0.6]      # [rad/s] surge, sway, yaw
+      omega_n: [0.3, 0.3, 1.0]      # [rad/s] surge, sway, yaw (yaw 1.0: follows the faster turn reference)
       zeta: [0.9, 0.9, 0.9]
       ki_ratio: 0.1
-      max_integral_force: [10.0, 10.0, 5.0]   # [N, N, Nm] anti-windup
+      # Anti-windup limit on the integral force. The integral must be able to cancel slowly varying
+      # forces (ocean current, wave drift; Fossen L7/L8), so allow up to what the thrusters can give.
+      max_integral_force: [100.0, 60.0, 30.0]   # [N, N, Nm]
       # Position control gains
       p_gain:
         pos: 1.6     # Proportional gain for position
@@ -53,9 +55,16 @@
         pos: 0.25    # Position reaching tolerance (m)
         yaw: 0.1     # Yaw angle reaching tolerance (rad)
 
+    # Guidance "turn then go": far from the goal, turn the bow towards it, then drive bow first
+    # (the stern thrusters are made for that); DP with the goal heading only near the goal.
+    guidance:
+      turn_then_go: true
+      approach_radius: 1.5      # [m]
+      align_angle_deg: 20.0     # [deg]
+
     # Reference filter parameters
     filter:
-      omega: [0.25, 0.25, 0.60]  # Natural frequency for reference filter
+      omega: [0.25, 0.25, 0.80]  # Natural frequency for reference filter (yaw 0.8: peak ~36 deg/s, model max ~43)
       delta: [1.00, 1.00, 1.00]     # Damping ratio for reference filter
 
     # Performance metrics configuration

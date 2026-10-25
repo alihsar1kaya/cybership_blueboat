@@ -80,3 +80,12 @@ def test_defaults_are_instant_and_unlimited():
     f = make_thruster({"type": "fixed"})
     f.set_command(-5.0); f.step(DT)
     assert f.output()[0] == -5.0
+
+
+def test_azimuth_turns_without_thrust_on_a_tiny_command():
+    """A command below the deadband still sets the angle (servo), but gives no thrust."""
+    a = AzimuthThruster(max_force=67, deadband=0.5, max_rate=math.radians(90))
+    a.set_command(0, 1e-3)
+    run(a, 1.0)
+    assert math.degrees(a.angle) == pytest.approx(90, abs=0.1)
+    assert a.output()[1] == 0.0

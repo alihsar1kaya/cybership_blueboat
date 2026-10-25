@@ -70,8 +70,12 @@ model:
   thruster_roll_pitch_moments: false
 
 allocation:
-  method: pseudo_inverse
+  # Fossen 11.2.3: min f'Wf + s'Qs  s.t.  T(alpha) f = tau + s,  -0.8*67 <= F2,F3 <= 67,  0 <= F1 <= 67
+  # (cybership_dp/constrained_allocation.py). W = thruster 'weight' (effort), Q = slack weights per
+  # DOF [X, Y, N]: Q >> W, highest for yaw so heading is kept and sway is given up first.
+  method: constrained_qp
   dofs: [X, Y, N]
+  slack_weights: [1.0e4, 1.0e4, 1.0e5]
 
 thrusters:
   - name: port

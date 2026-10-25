@@ -51,6 +51,114 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
+    - Accept NaN Values: false
+      Alpha: 1
+      Arrow Width: 0.04
+      Class: rviz_default_plugins/Wrench
+      Enabled: true
+      Force Arrow Scale: 0.02
+      Force Color: 239; 41; 41
+      History Length: 1
+      Name: Total kraft (control/force/applied)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/control/force/applied
+      Torque Arrow Scale: 0.0
+      Torque Color: 204; 204; 204
+      Value: true
+    - Accept NaN Values: false
+      Alpha: 1
+      Arrow Width: 0.04
+      Class: rviz_default_plugins/Wrench
+      Enabled: true
+      Force Arrow Scale: 0.02
+      Force Color: 252; 233; 79
+      History Length: 1
+      Name: Thruster babord (faktisk)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/thruster/port/force
+      Torque Arrow Scale: 0.0
+      Torque Color: 204; 204; 204
+      Value: true
+    - Accept NaN Values: false
+      Alpha: 1
+      Arrow Width: 0.04
+      Class: rviz_default_plugins/Wrench
+      Enabled: true
+      Force Arrow Scale: 0.02
+      Force Color: 252; 233; 79
+      History Length: 1
+      Name: Thruster styrbord (faktisk)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/thruster/starboard/force
+      Torque Arrow Scale: 0.0
+      Torque Color: 204; 204; 204
+      Value: true
+    - Accept NaN Values: false
+      Alpha: 1
+      Arrow Width: 0.04
+      Class: rviz_default_plugins/Wrench
+      Enabled: true
+      Force Arrow Scale: 0.02
+      Force Color: 114; 159; 207
+      History Length: 1
+      Name: Azimut (faktisk)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/thruster/bow_azimuth/force
+      Torque Arrow Scale: 0.0
+      Torque Color: 204; 204; 204
+      Value: true
+    - Accept NaN Values: false
+      Alpha: 1
+      Arrow Width: 0.04
+      Class: rviz_default_plugins/Wrench
+      Enabled: true
+      Force Arrow Scale: 0.02
+      Force Color: 115; 210; 22
+      History Length: 1
+      Name: Onsket kraft tau_d (regulator)
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/control/force/command/stamped
+      Torque Arrow Scale: 0.0
+      Torque Color: 204; 204; 204
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Havstrom (sim/environment)
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/sim/environment/current_marker
+      Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
       Filter (blacklist): ""
