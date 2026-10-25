@@ -22,8 +22,8 @@ hull:
   # [m] waterline 274 mm above keel at 30.2 kg, freeboard 102 mm (hull CAD). The Microampere team measured
   # ~300 mm, which the CAD hull gives at 36.3 kg: unclear whether measured to the keel or to the thrusters.
   draft: 0.274
-  # GM from Capytaine hydrostatics on the hull CAD, CG on the waterline:
-  # tools/capytaine_from_stl.py. A higher CG lowers these.
+  # GM from Capytaine hydrostatics on the hull CAD for a CG ON THE WATERLINE (tools/capytaine_from_stl.py).
+  # The model lowers them by the CG height above the waterline (model.cg).
   GM_phi: 1.07       # [m]
   GM_theta: 0.535    # [m]
 
@@ -36,14 +36,34 @@ model:
   #   I = m*R^2 with R44 = 0.4*B, R55 = R66 = 0.25*L   (L = 1.2 m, B = 0.93 m)
   # Alternative estimate with all mass in the hulls (y0 = 0.365 m) gives Iz ~ 7.7, so Iz is uncertain
   # by a factor ~3 until it is measured (bifilar pendulum).
-  inertia: [4.18, 2.72, 2.72]
-  # [kg, kg m^2] Capytaine on the Blue Robotics hull CAD (BR-101652, hull centres at +-0.374 m with the
-  # vertical sides facing inward, 570 mm apart, as in drawing BR-101447),
-  # omega = 0 (slow DP motion), 1518 panels:
-  #   python3 cybership_config/tools/capytaine_from_stl.py ~/ros_ws/cad/hull/PUB-BR-101381-001.STL \
-  #       --mass 30.2 --hull-offset 0.374 --swap-sides
-  # omega = inf for comparison: [1.33, 75.55, 15.75, 1.78, 0.61, 4.26].
-  # Sway is large (4.3 x mass) because the hulls are deep V-shapes with a keel (274 mm draft).
+  inertia: [4.18, 2.72, 2.72]   # about the CG
+  # [m] CG from CO (waterline, midships, centerline) in BODY axes, z down. ESTIMATE, MEASURE IT
+  # (hang/tilt test, or weigh each part with its position). Batteries and thrusters sit low in the
+  # hulls, the electronics box, frame and azimuth mount above the deck -> CG near the waterline,
+  # taken 5 cm above it; x and y on the centre (thrusters aft balance the azimuth forward).
+  # Fossen's Otter: r_bG = [0.2, 0, -0.2] m (2 m long, with payload on deck).
+  # M_RB = H(r_g)' diag(m I, I_g) H(r_g) (MSS rbody.m); GM_phi/GM_theta drop by 0.05 m.
+  cg: [0.0, 0.0, -0.05]
+  # Added mass M_A (full 6x6, about CO) by Fossen's power-based averaging (Fossen 2025; MSS
+  # computeManeuveringModel.m; L3a/L3b) of the frequency-dependent A(w) from Capytaine on the Blue
+  # Robotics hull CAD (BR-101652, hull centres at +-0.374 m with the vertical sides facing inward,
+  # 570 mm apart, as in drawing BR-101447), 1794 panels + lid, 0-12 rad/s:
+  #   python3 cybership_config/tools/capytaine_hydro.py ~/ros_ws/cad/hull/PUB-BR-101381-001.STL \
+  #       --mass 30.2 --hull-offset 0.374 --swap-sides --omega-max 12 --n-omega 48 \
+  #       --out cybership_config/config/microampere/hydro_capytaine.npz
+  # Plot: python3 ~/ros_ws/tools/plot_hydro.py <npz>  (results/hydro_microampere.png).
+  hydro:
+    file: hydro_capytaine.npz
+    # [rad/s] PM weighting spectrum (spectral peak 0.88 w_p = 2.2 rad/s, T_p ~ 2.9 s): fetch-limited
+    # wind sea in sheltered water (JONSWAP peak 2.2-3.2 rad/s for U10 6-10 m/s over 5-10 km fetch).
+    # Surge/sway/yaw change < 10 % for w_p = 0.8-3 (A(0) is fine for DP, as Fossen says); heave and
+    # the couplings depend on w_p. Gap resonance between the hulls at ~7.8 rad/s (potential theory
+    # overpredicts it) changes A_eq < 1 % for w_p <= 3.
+    wave_peak_frequency: 2.5
+    # [rad/s] leave out the gap resonance between the hulls (~7.8 rad/s): potential theory has no
+    # viscosity and overpredicts it (B22 up to 8000 N s/m); with it, half of B_eq,22 came from it.
+    max_frequency: 6.5
+  # Diagonal fallback (and the old value, A(0) from capytaine_from_stl.py), used without 'hydro':
   added_mass: [2.53, 129.80, 35.68, 2.73, 0.90, 6.41]
   # [N/m] heave restoring rho*g*A_wp, A_wp = 0.263 m^2 (two hulls), Capytaine on the hull CAD.
   heave_stiffness: 2581
@@ -64,7 +84,17 @@ model:
     sway_time_constant: 1.0    # [s] Y_v = M22 / T_sway   (Otter value)
     yaw_time_constant: 1.0     # [s] N_r = M66 / T_yaw    (Otter value)
     yaw_quadratic_factor: 10.0 # N_|r|r = 10 N_r          (Otter value)
-    zeta: [0.3, 0.2, 0.4]      # heave, roll, pitch relative damping (Otter values)
+    # Amplitude-dependent roll damping K = D44 (1 + kappa |p|) p (L3b p. 30, Ex6). Sources differ:
+    # Ex6 slide 0.1-0.2, Fossen's farSpica_v4.m 3 ("typically 1 to 10"), Otter none. 1.0 gives +50 %
+    # at p = 0.5 rad/s (5 deg roll at the 1 s period). IDENTIFY from a roll decay test (zeta and kappa).
+    roll_quadratic_factor: 1.0
+    # Heave, roll, pitch: total relative damping (Otter values).
+    # D = B_eq + Bv (Fossen's computeManeuveringModel): the time constants and zeta are TOTALS, the
+    # viscous Bv fills up what the potential damping B_eq lacks. (MSS adds delta_zeta [0, 0.1, 0] on
+    # top of B_eq instead, made for ships whose heave/roll/pitch resonances lie inside the wave
+    # spectrum. Microampere's lie at 6-7 rad/s, above it, so B_eq gives zeta 0.05/0.01/0.003 only and
+    # pitch would be undamped.)
+    zeta: [0.3, 0.2, 0.4]
     # Cross-flow drag on ONE hull (as Fossen does for the Otter's pontoons): waterline length and
     # beam of one hull at 274 mm draft (hull CAD), Cd from Hoerner's curve (B/2T = 0.29 -> 1.92).
     cross_flow: {length: 1.056, beam: 0.161, draft: 0.274}

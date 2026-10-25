@@ -21,6 +21,13 @@ def Smtrx(a):
     ])
 
 
+def Hmtrx(r):
+    """System transformation matrix H(r) from point r to CO: nu_r = H(r) nu (Fossen 2021, eq. 3.29)."""
+    H = np.eye(6)
+    H[0:3, 3:6] = Smtrx(r).T
+    return H
+
+
 def Rzyx(phi, theta, psi):
     """Rotation matrix from BODY to NED, zyx Euler angles."""
     cphi, sphi = math.cos(phi), math.sin(phi)

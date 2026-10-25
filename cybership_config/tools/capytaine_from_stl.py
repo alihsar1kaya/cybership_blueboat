@@ -103,8 +103,12 @@ class OffsetTable:
         return 0.5 * (lo + hi)
 
 
-def panel_mesh(stations, x0, y0, z0, y_shift, n_contour, mirror=False):
-    """Quad panels from the offset table, translated so CO = (x0, y0, z0) maps to (0, y_shift, 0)."""
+def panel_mesh(stations, x0, y0, z0, y_shift, n_contour, mirror=False, cap_rings=1):
+    """
+    Quad panels from the offset table, translated so CO = (x0, y0, z0) maps to (0, y_shift, 0).
+    The end caps are rings shrinking towards the section centre: cap_rings = 1 is a single fan of
+    triangles, more rings give smaller panels (needed for short waves, Capytaine's lambda/8 rule).
+    """
     contours = []
     for x, rows in stations:
         r = np.array(rows)
@@ -126,14 +130,24 @@ def panel_mesh(stations, x0, y0, z0, y_shift, n_contour, mirror=False):
         for k in range(n - 1):
             a, b = i * n + k, i * n + k + 1
             faces.append([a, b, b + n, a + n])
-    # end caps (transom / bow): fan from the contour's centroid
+    # end caps (transom / bow): rings shrinking to the contour's centroid, a fan in the middle
     for i in (0, len(contours) - 1):
         c = contours[i]
         centre = np.array([c[:, 0].mean(), c[:, 1].mean(), 0.0])
+        outer = [i * n + k for k in range(n)]
+        for r in range(1, cap_rings):
+            ring = centre + (1.0 - r / cap_rings) * (c - centre)
+            start = len(vertices)
+            vertices.extend(ring)
+            inner = [start + k for k in range(n)]
+            for k in range(n - 1):
+                a, b, bi, ai = outer[k], outer[k + 1], inner[k + 1], inner[k]
+                faces.append([b, a, ai, bi] if i == 0 else [a, b, bi, ai])
+            outer = inner
         ci = len(vertices)
         vertices.append(centre)
         for k in range(n - 1):
-            a, b = i * n + k, i * n + k + 1
+            a, b = outer[k], outer[k + 1]
             faces.append([ci, b, a, a] if i == 0 else [ci, a, b, b])
     v = np.array(vertices)
     if mirror:

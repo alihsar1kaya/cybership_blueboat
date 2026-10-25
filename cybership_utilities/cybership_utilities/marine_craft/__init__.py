@@ -9,7 +9,8 @@ Marine craft model after Fossen (2021), Handbook of Marine Craft Hydrodynamics a
 Plain Python (no ROS), so the same code can be used by the simulator, an observer and unit tests.
 """
 
-from cybership_utilities.marine_craft.kinematics import Smtrx, Rzyx, Tzyx, J, eta_dot
-from cybership_utilities.marine_craft.dynamics import m2c, hoerner, cross_flow_drag, MarineCraft
+from cybership_utilities.marine_craft.kinematics import Hmtrx, Smtrx, Rzyx, Tzyx, J, eta_dot
+from cybership_utilities.marine_craft.dynamics import (
+    m2c, crb_linear_velocity_independent, hoerner, cross_flow_drag, MarineCraft)
 from cybership_utilities.marine_craft.actuators import FixedThruster, AzimuthThruster, make_thruster
 from cybership_utilities.marine_craft.environment import OceanCurrent

@@ -10,6 +10,7 @@ Dynamics (Fossen 2021, Ch. 3-7), structured like Fossen's Otter USV model (Pytho
                                                 X_u e^(-k|u_r|) u_r (k = surge_linear_decay)
                  + X_uu |u_r| u_r               quadratic surge resistance
                  + N_rr |r| r                   nonlinear yaw damping
+                 + kappa_phi K_p |p| p          amplitude-dependent roll damping (L3b, Ex6)
                  - tau_crossflow(nu_r)          cross-flow drag (strip theory, Hoerner)
     g(eta) = G eta                              linear restoring (heave, roll, pitch)
 
@@ -18,7 +19,7 @@ nu_r = nu - nu_c is the velocity relative to a current nu_c (zero until an envir
 
 import numpy as np
 
-from cybership_utilities.marine_craft.kinematics import Smtrx, Rzyx, J
+from cybership_utilities.marine_craft.kinematics import Hmtrx, Smtrx, Rzyx, J
 
 # Hoerner's 2D cross-flow drag coefficient, digitised as in Fossen's MSS / PythonVehicleSimulator
 _HOERNER_B_2T = np.array([
@@ -45,21 +46,26 @@ def m2c(M, nu):
 def crb_linear_velocity_independent(M_RB, nu):
     """
     Rigid-body Coriolis/centripetal matrix parametrized independent of linear velocity
-    (Fossen 2021, eq. 3.63), CG in CO:
+    (Fossen 2021, eq. 3.63; MSS rbody.m), for a CG at r_g from CO:
 
-        C_RB(nu) = [ m S(w)      0     ]
-                   [   0     -S(I_g w) ]
+        C_RB(nu) = H(r_g)' [ m S(w)      0      ] H(r_g),     w = [p, q, r]
+                           [   0    -S(I_g w)   ]
 
+    r_g and the inertia about the CG, I_g, are taken from M_RB = H' diag(m I, I_g) H.
     Gives the same C_RB(nu) nu as m2c(M_RB, nu), but only this form satisfies Property 10.1,
     M_RB nu_dot + C_RB(nu) nu = M_RB nu_r_dot + C_RB(nu_r) nu_r, which the equations of relative
     motion in a current (eq. 10.141) need.
     """
     m = M_RB[0, 0]
+    S_rg = -M_RB[0:3, 3:6] / m                     # M_RB12 = -m S(r_g)
+    r_g = np.array([S_rg[2, 1], S_rg[0, 2], S_rg[1, 0]])
+    I_g = M_RB[3:6, 3:6] + m * S_rg @ S_rg          # M_RB22 = I_g - m S(r_g)^2
     w = nu[3:6]
-    C = np.zeros((6, 6))
-    C[0:3, 0:3] = m * Smtrx(w)
-    C[3:6, 3:6] = -Smtrx(M_RB[3:6, 3:6] @ w)
-    return C
+    C_cg = np.zeros((6, 6))
+    C_cg[0:3, 0:3] = m * Smtrx(w)
+    C_cg[3:6, 3:6] = -Smtrx(I_g @ w)
+    H = Hmtrx(r_g)
+    return H.T @ C_cg @ H
 
 
 def hoerner(B, T):
@@ -93,7 +99,7 @@ class MarineCraft:
 
     def __init__(self, M_RB, M_A, D_L, G, *, surge_quadratic=0.0, yaw_quadratic=0.0,
                  cross_flow=None, cancel_munk=(), rho=1000.0, eta0=None, nu0=None,
-                 surge_linear_decay=0.0):
+                 surge_linear_decay=0.0, roll_quadratic_factor=0.0):
         self.M_RB = np.asarray(M_RB, dtype=float)
         self.M_A = np.asarray(M_A, dtype=float)
         self.M = self.M_RB + self.M_A
@@ -106,6 +112,7 @@ class MarineCraft:
         # two are not counted twice at high speed. 0 = linear damping at all speeds.
         self.surge_linear_decay = float(surge_linear_decay)
         self.yaw_quadratic = float(yaw_quadratic)
+        self.roll_quadratic_factor = float(roll_quadratic_factor)  # kappa_phi: K = D44 (1 + kappa |p|) p
         self.cross_flow = cross_flow  # dict(length, beam, draft) or None
         self.cancel_munk = tuple(cancel_munk)  # e.g. ("yaw",) as in Fossen's Otter model
         self.rho = rho
@@ -149,6 +156,7 @@ class MarineCraft:
             tau[0] += self.D_L[0, 0] * (1.0 - np.exp(-self.surge_linear_decay * abs(nu_r[0]))) * nu_r[0]
         tau[0] -= self.surge_quadratic * abs(nu_r[0]) * nu_r[0]
         tau[5] -= self.yaw_quadratic * abs(nu_r[5]) * nu_r[5]
+        tau[3] -= self.roll_quadratic_factor * self.D_L[3, 3] * abs(nu_r[3]) * nu_r[3]
         if self.cross_flow:
             cf = self.cross_flow
             tau += cross_flow_drag(cf["length"], cf["beam"], cf["draft"], nu_r, self.rho)

@@ -9,17 +9,17 @@ import os
 
 import numpy as np
 import pytest
-import yaml
 
 from cybership_utilities import vessel_model
-from cybership_utilities.marine_craft import Rzyx, J, m2c, cross_flow_drag, MarineCraft
+from cybership_utilities.marine_craft import (
+    Hmtrx, Rzyx, J, m2c, crb_linear_velocity_independent, cross_flow_drag, MarineCraft)
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def config(name):
-    with open(os.path.join(REPO, "cybership_config", "config", name, "vessel.yaml")) as f:
-        return yaml.safe_load(f)
+    path = os.path.join(REPO, "cybership_config", "config", name, "vessel.yaml")
+    return vessel_model.load_vessel_config(path=path)[0]
 
 
 def craft(name):
@@ -83,6 +83,22 @@ def test_rigid_body_coriolis_matches_fossen_3dof():
     u, v, r = 0.5, 0.2, 0.3
     f = m2c(M_RB, np.array([u, v, 0, 0, 0, r])) @ np.array([u, v, 0, 0, 0, r])
     assert f[0] == pytest.approx(-m * v * r) and f[1] == pytest.approx(m * u * r)
+
+
+def test_rigid_body_coriolis_with_cg_offset():
+    """
+    CG away from CO (MSS rbody.m): C_RB(nu) from eq. 3.63 must give the same force as m2c(M_RB, nu)
+    (same physics, other parametrization), be skew-symmetric and not depend on u, v, w.
+    """
+    m, I_g, r_g = 30.2, np.diag([4.18, 2.72, 2.72]), np.array([0.05, 0.01, -0.08])
+    H = Hmtrx(r_g)
+    M_RB = H.T @ np.block([[m * np.eye(3), np.zeros((3, 3))], [np.zeros((3, 3)), I_g]]) @ H
+    rng = np.random.default_rng(3)
+    for nu in rng.normal(size=(10, 6)):
+        C = crb_linear_velocity_independent(M_RB, nu)
+        assert C @ nu == pytest.approx(m2c(M_RB, nu) @ nu, abs=1e-12)
+        assert np.allclose(C + C.T, 0.0, atol=1e-12)
+        assert np.allclose(C, crb_linear_velocity_independent(M_RB, np.r_[rng.normal(size=3), nu[3:]]))
 
 
 def test_hull_model_matches_shoeboxpy_in_straight_line():
@@ -161,9 +177,9 @@ def test_microampere_roll_period():
     """Free roll decay: period 2 pi / omega_d with omega_n = sqrt(G44 / (Ix + A44))."""
     params = vessel_model.model_parameters(config("microampere"))
     model = vessel_model.make_marine_craft(params, eta0=np.radians([0, 0, 0, 5, 0, 0]))
-    m44 = params["MRB"][3] + params["MA"][3]
+    m44 = params["MRB"][3, 3] + params["MA"][3, 3]
     wn = math.sqrt(params["G"][3] / m44)
-    zeta = params["D"][3] / (2 * m44 * wn)
+    zeta = params["D"][3, 3] / (2 * m44 * wn)
     expected = 2 * math.pi / (wn * math.sqrt(1 - zeta**2))
     phi, t = [], []
     for k in range(400):
@@ -172,6 +188,23 @@ def test_microampere_roll_period():
     crossings = [t[i] for i in range(1, len(phi)) if phi[i - 1] > 0 >= phi[i]]
     assert len(crossings) >= 2
     assert crossings[1] - crossings[0] == pytest.approx(expected, rel=0.05)
+
+
+def test_roll_damping_grows_with_amplitude():
+    """K = D44 (1 + kappa |p|) p: a large roll decays relatively faster than a small one."""
+    params = vessel_model.model_parameters(config("microampere"))
+    assert params["nonlinear"]["roll_quadratic_factor"] > 0
+
+    def ratio(phi0):
+        model = vessel_model.make_marine_craft(params, eta0=np.radians([0, 0, 0, phi0, 0, 0]))
+        run(model, np.zeros(6), 1.0)          # ~ one roll period
+        return abs(model.eta[3]) / math.radians(phi0)
+
+    assert ratio(15.0) < ratio(1.0)
+    model = craft("microampere")
+    p = 0.5
+    K = model.damping(np.array([0, 0, 0, p, 0, 0]))[3]
+    assert K == pytest.approx(-model.D_L[3, 3] * (1 + params["nonlinear"]["roll_quadratic_factor"] * p) * p)
 
 
 def test_microampere_is_stable_at_top_speed():
@@ -190,13 +223,36 @@ def test_microampere_is_stable_at_top_speed():
 
 def test_vessel_drifts_with_the_current_without_turning():
     """
-    No thrust in a constant current: the vessel must end up moving with the current (nu_r -> 0)
-    and its heading must not change (an irrotational current gives no yaw moment, Property 10.1).
+    No thrust in a constant current, starting with the current (nu_r = 0): the vessel must keep
+    moving with the current and its heading must not change (Property 10.1).
     """
-    model = vessel_model.make_marine_craft(vessel_model.model_parameters(config("microampere")),
-                                           eta0=np.radians([0, 0, 0, 0, 0, 30]) * [0, 0, 0, 0, 0, 1])
-    model.current_ned = np.array([0.2, 0.0, 0.0])    # 0.2 m/s towards north
+    params = vessel_model.model_parameters(config("microampere"))
+    psi0 = math.radians(30)
+    v_c = np.array([0.2, 0.0, 0.0])                  # 0.2 m/s towards north
+    model = vessel_model.make_marine_craft(params, eta0=np.array([0, 0, 0, 0, 0, psi0]),
+                                           nu0=np.r_[Rzyx(0, 0, psi0).T @ v_c, 0, 0, 0])
+    model.current_ned = v_c
     run(model, np.zeros(6), 120.0)
     velocity_ned = J(model.eta)[0:3, 0:3] @ model.nu[0:3]
-    assert velocity_ned[0:2] == pytest.approx([0.2, 0.0], abs=0.005)
-    assert math.degrees(model.eta[5]) == pytest.approx(30.0, abs=0.1)
+    assert velocity_ned[0:2] == pytest.approx([0.2, 0.0], abs=1e-6)
+    assert math.degrees(model.eta[5]) == pytest.approx(30.0, abs=1e-6)
+
+
+def test_current_is_still_water_seen_from_the_water():
+    """
+    Property 10.1 (eq. 10.141): a vessel starting at rest in a current moves relative to the water
+    exactly as a vessel in still water with the opposite initial velocity, so the two runs differ
+    only by the current drift v_c t. Holds with the full coupled added mass (here the sway/yaw
+    coupling A26 makes both runs turn the same amount while the relative sway is damped out).
+    """
+    params = vessel_model.model_parameters(config("microampere"))
+    psi0, T = math.radians(30), 20.0
+    v_c = np.array([0.2, 0.0, 0.0])
+    in_current = vessel_model.make_marine_craft(params, eta0=np.array([0, 0, 0, 0, 0, psi0]))
+    in_current.current_ned = v_c
+    still = vessel_model.make_marine_craft(params, eta0=np.array([0, 0, 0, 0, 0, psi0]),
+                                           nu0=np.r_[Rzyx(0, 0, psi0).T @ -v_c, 0, 0, 0])
+    run(in_current, np.zeros(6), T)
+    run(still, np.zeros(6), T)
+    assert in_current.eta[0:3] == pytest.approx(still.eta[0:3] + v_c * T, abs=1e-6)
+    assert in_current.eta[3:6] == pytest.approx(still.eta[3:6], abs=1e-9)
