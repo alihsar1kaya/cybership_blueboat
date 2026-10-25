@@ -6,7 +6,8 @@ Dynamics (Fossen 2021, Ch. 3-7), structured like Fossen's Otter USV model (Pytho
     M      = M_RB + M_A                         rigid body + added mass (constant)
     C      = C_RB(nu_r) + C_A(nu_r)             Coriolis/centripetal: C_RB independent of linear
                                                 velocity (eq. 3.63, Property 10.1), C_A via m2c
-    D(nu_r) nu_r = D_L nu_r                     linear damping
+    D(nu_r) nu_r = D_L nu_r                     linear damping, in surge faded out with speed:
+                                                X_u e^(-k|u_r|) u_r (k = surge_linear_decay)
                  + X_uu |u_r| u_r               quadratic surge resistance
                  + N_rr |r| r                   nonlinear yaw damping
                  - tau_crossflow(nu_r)          cross-flow drag (strip theory, Hoerner)
@@ -91,7 +92,8 @@ class MarineCraft:
     _MUNK = {"roll": [(3, 1), (3, 2)], "pitch": [(4, 0), (4, 2)], "yaw": [(5, 0), (5, 1)]}
 
     def __init__(self, M_RB, M_A, D_L, G, *, surge_quadratic=0.0, yaw_quadratic=0.0,
-                 cross_flow=None, cancel_munk=(), rho=1000.0, eta0=None, nu0=None):
+                 cross_flow=None, cancel_munk=(), rho=1000.0, eta0=None, nu0=None,
+                 surge_linear_decay=0.0):
         self.M_RB = np.asarray(M_RB, dtype=float)
         self.M_A = np.asarray(M_A, dtype=float)
         self.M = self.M_RB + self.M_A
@@ -99,6 +101,10 @@ class MarineCraft:
         self.D_L = np.asarray(D_L, dtype=float)
         self.G = np.asarray(G, dtype=float)
         self.surge_quadratic = float(surge_quadratic)
+        # Blending as in Fossen's Otter model (MSS otter.m, 2026-10-14): the linear surge damping
+        # dominates at low (DP) speed and fades out as the quadratic resistance takes over, so the
+        # two are not counted twice at high speed. 0 = linear damping at all speeds.
+        self.surge_linear_decay = float(surge_linear_decay)
         self.yaw_quadratic = float(yaw_quadratic)
         self.cross_flow = cross_flow  # dict(length, beam, draft) or None
         self.cancel_munk = tuple(cancel_munk)  # e.g. ("yaw",) as in Fossen's Otter model
@@ -139,6 +145,8 @@ class MarineCraft:
     def damping(self, nu_r):
         """Damping force D(nu_r) nu_r with the sign of a force on the vessel (i.e. negative)."""
         tau = -self.D_L @ nu_r
+        if self.surge_linear_decay:
+            tau[0] += self.D_L[0, 0] * (1.0 - np.exp(-self.surge_linear_decay * abs(nu_r[0]))) * nu_r[0]
         tau[0] -= self.surge_quadratic * abs(nu_r[0]) * nu_r[0]
         tau[5] -= self.yaw_quadratic * abs(nu_r[5]) * nu_r[5]
         if self.cross_flow:

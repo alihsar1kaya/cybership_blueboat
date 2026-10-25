@@ -50,11 +50,17 @@ model:
   # Damping, Fossen's method as in his Otter USV model (also a catamaran), see
   # cybership_utilities/vessel_model.py. ALL to be identified on the real boat (speed/step tests).
   damping:
-    # Surge resistance X = -(d1 u + d2 u|u|). d2 from the hull: ITTC-57 friction on the CAD wetted
+    # Surge as Fossen calibrates his Otter USV on experiments (MSS otter.m, 2026-10-14):
+    #   X = -(X_u e^(-3|u|) u + X_|u|u |u| u),  X_u = M11 / T_surge,  X_|u|u = max_thrust / max_speed^2
+    # The linear term gives the DP (low-speed) response and fades out with speed, the quadratic term
+    # the top speed, so the two are not counted twice (L3b p. 26, 30).
+    surge_time_constant: 5.0   # [s] Otter value (experiments). MEASURE: step in thrust at low speed
+    # Top speed with the two stern thrusters (134 N). Estimate: ITTC-57 friction on the CAD wetted
     # area plus wave/form resistance calibrated on the BlueBoat datasheet (~9 N at 1 m/s, 80 N at
-    # 3 m/s for 16.9 kg) and scaled to 30.2 kg -> top speed ~3 m/s with 2-3 thrusters forward.
-    surge_linear: 2.0          # [N s/m] small, for low speed
-    surge_quadratic: 13.5      # [N s^2/m^2]
+    # 3 m/s for 16.9 kg), scaled to 30.2 kg -> X_|u|u = 13.5. MEASURE: top speed, stern thrusters only.
+    max_speed: 3.15            # [m/s]
+    max_thrust: 134.0          # [N] 2 x 67 N
+    surge_linear_decay: 3.0    # [s/m] Otter value
     sway_time_constant: 1.0    # [s] Y_v = M22 / T_sway   (Otter value)
     yaw_time_constant: 1.0     # [s] N_r = M66 / T_yaw    (Otter value)
     yaw_quadratic_factor: 10.0 # N_|r|r = 10 N_r          (Otter value)

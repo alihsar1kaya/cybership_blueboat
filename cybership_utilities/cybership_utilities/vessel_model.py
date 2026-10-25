@@ -15,8 +15,14 @@ If vessel.yaml has a 'model' section, its values are used directly:
       damping_linear: [Xu, Yv, Zw, Kp, Mq, Nr]  # positive values, diagonal
       # ... or Fossen's method (as in his Otter USV model), which also adds the nonlinear terms:
       damping:
-        surge_linear: 2.0              # X_u [N s/m]
-        surge_quadratic: 13.5          # X_|u|u [N s^2/m^2]
+        # surge as in Fossen's Otter model (MSS otter.m, 2026-10-14):
+        surge_time_constant: 5.0       # X_u = M11 / T_surge (low-speed, DP)
+        max_speed: 3.15                # X_|u|u = max_thrust / max_speed^2
+        max_thrust: 134.0
+        surge_linear_decay: 3.0        # X_u fades as e^(-3|u|), default 3
+        # ... or the coefficients directly (no fading unless surge_linear_decay is given):
+        # surge_linear: 2.0            # X_u [N s/m]
+        # surge_quadratic: 13.5        # X_|u|u [N s^2/m^2]
         sway_time_constant: 1.0        # Y_v = M22 / T_sway
         yaw_time_constant: 1.0         # N_r = M66 / T_yaw
         yaw_quadratic_factor: 10.0     # N_|r|r = factor * N_r
@@ -61,7 +67,8 @@ def model_parameters(config, rho=1000.0, g=9.81):
     """
     model = config.get("model")
     hull = config["hull"]
-    nonlinear = {"surge_quadratic": 0.0, "yaw_quadratic": 0.0, "cross_flow": None, "cancel_munk": [],
+    nonlinear = {"surge_quadratic": 0.0, "surge_linear_decay": 0.0, "yaw_quadratic": 0.0,
+                 "cross_flow": None, "cancel_munk": [],
                  "thruster_roll_pitch_moments": True}
     if model:
         mass = float(model["mass"])
@@ -100,22 +107,36 @@ def model_parameters(config, rho=1000.0, g=9.81):
 
 def _fossen_damping(d, M, G):
     """
-    Damping as in Fossen's Otter USV model (PythonVehicleSimulator, Fossen 2021):
-    linear terms from time constants (sway, yaw) and relative damping (heave, roll, pitch),
+    Damping as in Fossen's Otter USV model (MSS otter.m, 2026-10-14, Fossen 2021):
+    linear terms from time constants (surge, sway, yaw) and relative damping (heave, roll, pitch),
     plus quadratic surge resistance, nonlinear yaw damping and cross-flow drag.
+
+    Surge, as Fossen calibrates the Otter:
+        X_u    = M11 / T_surge                    linear, dominates at low speed
+        X_|u|u = max_thrust / max_speed^2         quadratic, gives the top speed
+        X = -(X_u e^(-k|u|) u + X_|u|u |u| u)     blending, k = surge_linear_decay (3)
     M and G are diagonal vectors.
     """
     zeta = np.asarray(d.get("zeta", [0.3, 0.2, 0.4]), dtype=float)
     omega = np.sqrt(G[2:5] / M[2:5])  # natural frequencies in heave, roll, pitch
     Nr = M[5] / d["yaw_time_constant"]
+    if "surge_time_constant" in d:
+        Xu = M[0] / d["surge_time_constant"]
+        Xuu = float(d["max_thrust"]) / float(d["max_speed"]) ** 2
+        decay = float(d.get("surge_linear_decay", 3.0))
+    else:
+        Xu = d["surge_linear"]
+        Xuu = float(d.get("surge_quadratic", 0.0))
+        decay = float(d.get("surge_linear_decay", 0.0))
     D = np.array([
-        d["surge_linear"],
+        Xu,
         M[1] / d["sway_time_constant"],
         *(2.0 * zeta * omega * M[2:5]),
         Nr,
     ])
     extra = {
-        "surge_quadratic": float(d.get("surge_quadratic", 0.0)),
+        "surge_quadratic": Xuu,
+        "surge_linear_decay": decay,
         "yaw_quadratic": float(d.get("yaw_quadratic_factor", 0.0)) * Nr,
         "cross_flow": d.get("cross_flow"),
     }
@@ -130,6 +151,7 @@ def make_marine_craft(params, eta0=None, nu0=None, rho=1000.0):
         np.diag(params["MRB"]), np.diag(params["MA"]), np.diag(params["D"]), np.diag(params["G"]),
         surge_quadratic=nl["surge_quadratic"], yaw_quadratic=nl["yaw_quadratic"],
         cross_flow=nl["cross_flow"], cancel_munk=nl["cancel_munk"], rho=rho, eta0=eta0, nu0=nu0,
+        surge_linear_decay=nl["surge_linear_decay"],
     )
 
 

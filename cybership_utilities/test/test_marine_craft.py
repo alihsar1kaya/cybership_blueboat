@@ -107,11 +107,47 @@ def test_hull_model_matches_shoeboxpy_in_straight_line():
 # --- Microampere: physically reasonable -------------------------------------------------------
 
 def test_microampere_top_speed_from_surge_resistance():
-    """Two stern thrusters at 67 N: steady speed where 2.0 u + 13.5 u^2 = 134 N."""
-    model = run(craft("microampere"), [134, 0, 0, 0, 0, 0], 60.0)
-    expected = (-2.0 + math.sqrt(2.0**2 + 4 * 13.5 * 134)) / (2 * 13.5)
-    assert model.nu[0] == pytest.approx(expected, rel=0.01)
+    """Two stern thrusters at 67 N give max_speed (X_|u|u = max_thrust / max_speed^2, Fossen's Otter)."""
+    d = config("microampere")["model"]["damping"]
+    model = run(craft("microampere"), [d["max_thrust"], 0, 0, 0, 0, 0], 60.0)
+    # the linear term has faded to e^(-3 * 3.15) ~ 1e-4 of X_u at top speed
+    assert model.nu[0] == pytest.approx(d["max_speed"], rel=0.005)
     assert 2.5 < model.nu[0] < 3.5
+
+
+def test_surge_damping_blends_linear_into_quadratic():
+    """
+    X = -(X_u e^(-3|u|) u + X_|u|u |u| u) (MSS otter.m): the linear term X_u = M11 / T_surge at low
+    speed, only the quadratic term at high speed, so the damping is not counted twice.
+    """
+    model = craft("microampere")
+    d = config("microampere")["model"]["damping"]
+    Xu = model.M[0, 0] / d["surge_time_constant"]
+    Xuu = d["max_thrust"] / d["max_speed"] ** 2
+    for u in (0.01, 0.2, 1.0, 3.0, -0.5):
+        X = model.damping(np.array([u, 0, 0, 0, 0, 0]))[0]
+        assert X == pytest.approx(-(Xu * math.exp(-3 * abs(u)) * u + Xuu * abs(u) * u), rel=1e-9)
+    # low speed: linear dominates, high speed: linear part below 0.1 % of the total
+    slow = model.damping(np.array([0.02, 0, 0, 0, 0, 0]))[0]
+    assert slow == pytest.approx(-Xu * 0.02, rel=0.1)
+    fast = model.damping(np.array([3.0, 0, 0, 0, 0, 0]))[0]
+    assert fast == pytest.approx(-Xuu * 9.0, rel=1e-3)
+
+
+def test_surge_time_constant_at_low_speed():
+    """Small thrust step: the response near u = 0 has time constant M11 / X_u = T_surge."""
+    model = craft("microampere")
+    T = config("microampere")["model"]["damping"]["surge_time_constant"]
+    Xu = model.M[0, 0] / T
+    F = 0.05 * Xu          # u_ss ~ 0.05 m/s, where e^(-3u) ~ 0.86 and the quadratic term is small
+    dt, t, u63 = 0.01, 0.0, None
+    u_ss = run(craft("microampere"), [F, 0, 0, 0, 0, 0], 60.0).nu[0]
+    while u63 is None:
+        model.step(tau=np.array([F, 0, 0, 0, 0, 0]), dt=dt)
+        t += dt
+        if model.nu[0] >= 0.632 * u_ss:
+            u63 = t
+    assert u63 == pytest.approx(T, rel=0.25)
 
 
 def test_microampere_sideways_and_turning_are_slow():
@@ -145,7 +181,9 @@ def test_microampere_is_stable_at_top_speed():
     run(model, [201, 0, 0, 0, 0, 0], 30.0)
     assert np.all(np.isfinite(model.nu))
     assert abs(model.eta[3]) < math.radians(1) and abs(model.eta[4]) < math.radians(1)
-    assert model.nu[0] == pytest.approx(3.79, abs=0.05)
+    d = config("microampere")["model"]["damping"]
+    Xuu = d["max_thrust"] / d["max_speed"] ** 2
+    assert model.nu[0] == pytest.approx(math.sqrt(201 / Xuu), abs=0.05)  # all three thrusters forward
 
 
 # --- Ocean current (Fossen 2021, Ch. 10.3) ----------------------------------------------------
