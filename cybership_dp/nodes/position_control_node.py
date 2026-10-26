@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
-from geometry_msgs.msg import Wrench, Pose2D, PoseStamped, TwistStamped
+from geometry_msgs.msg import Wrench, Pose2D, PoseStamped, TwistStamped, Vector3Stamped
 from nav_msgs.msg import Odometry
 import math
 import numpy as np
@@ -101,6 +101,9 @@ class PositionController(Node):
                 ('control.omega_n', [0.3, 0.3, 0.6]),          # closed-loop natural frequency [rad/s]
                 ('control.zeta', [0.9, 0.9, 0.9]),             # closed-loop relative damping
                 ('control.ki_ratio', 0.1),                     # Ki = ki_ratio * omega_n * Kp
+                # Fossen's DP law with an observer: tau = ... - R^T b_hat (navigation/bias) instead of the
+                # integral action; the observer's bias already holds the slowly varying forces
+                ('control.bias_feedforward', False),
                 ('control.max_integral_force', [10.0, 10.0, 5.0]),  # anti-windup [N, N, Nm]
 
                 # Guidance "turn then go" (before the control law): far from the goal, first turn
@@ -211,6 +214,8 @@ class PositionController(Node):
         self.integral_error_pos = np.zeros(2)
         self.integral_error_yaw = 0.0
         self.integral_mb = np.zeros(3)  # model-based law: integral of [x, y, yaw] error
+        self.bias_hat = None            # observer bias b_hat in NED [N, N, N m] (navigation/bias)
+        self.create_subscription(Vector3Stamped, 'navigation/bias', self._on_bias, 10)
 
         self.error_pos = np.zeros(2)
         self.error_yaw = 0.0
@@ -690,12 +695,17 @@ class PositionController(Node):
             f"Control: ({control_x:.2f}, {control_y:.2f}, {control_yaw:.2f})"
         )
 
+    def _on_bias(self, msg):
+        self.bias_hat = np.array([msg.vector.x, msg.vector.y, msg.vector.z])
+
     def _model_based_tau(self, psi, error_world, eta_d_dot, eta_d_ddot, nu):
         """
         Model-based DP law (Fossen), everything in the body frame:
 
             tau = M nu_d_dot + D(nu_d) nu_d + Kp R^T e + Kd (nu_d - nu) + Ki R^T int(e) dt
 
+        With control.bias_feedforward (observer running) the integral term is replaced by -R^T b_hat,
+        the observer's estimate of the slowly varying forces (Fossen 13.4.6).
         D(nu_d) nu_d is the full (linear + nonlinear) damping of the vessel model, if available.
 
         error_world = eta_d - eta (yaw wrapped), eta_d_dot/eta_d_ddot from the reference filter
@@ -706,14 +716,11 @@ class PositionController(Node):
         nu_d = R.T @ eta_d_dot
         nu_d_dot = R.T @ eta_d_ddot
 
-        # Integral in the world frame (does not rotate with the boat), with conditional integration
-        self.integral_mb += error_world * self.dt
-        tau_i = self.Ki_mb * (R.T @ self.integral_mb)
-        if np.any(np.abs(tau_i) > self.max_integral_force):
-            self.integral_mb -= error_world * self.dt
-            tau_i = np.clip(self.Ki_mb * (R.T @ self.integral_mb),
-                            -self.max_integral_force, self.max_integral_force)
-
+        if self.get_parameter('control.bias_feedforward').value and self.bias_hat is not None:
+            # Fossen (13.4.6 + Ch. 15): cancel the estimated slowly varying forces, no integral action
+            tau_i = -R.T @ self.bias_hat
+        else:
+            tau_i = self._integral_action(R, error_world)
         if self._craft is not None:
             damping_ff = -self._craft.damping(np.array([nu_d[0], nu_d[1], 0, 0, 0, nu_d[2]]))[[0, 1, 5]]
         else:
@@ -721,6 +728,16 @@ class PositionController(Node):
         tau = (self.M_eff @ nu_d_dot + damping_ff
                + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
         return float(tau[0]), float(tau[1]), float(tau[2])
+
+    def _integral_action(self, R, error_world):
+        """Integral in the world frame (does not rotate with the boat), with conditional integration."""
+        self.integral_mb += error_world * self.dt
+        tau_i = self.Ki_mb * (R.T @ self.integral_mb)
+        if np.any(np.abs(tau_i) > self.max_integral_force):
+            self.integral_mb -= error_world * self.dt
+            tau_i = np.clip(self.Ki_mb * (R.T @ self.integral_mb),
+                            -self.max_integral_force, self.max_integral_force)
+        return tau_i
 
     def _guidance_reference(self, x, y, yaw):
         """Reference eta_r = [x, y, psi] for the reference filter (guidance block)."""

@@ -30,6 +30,7 @@ def _launch_setup(context, *args, **kwargs):
     noisy_odom = launch.substitutions.LaunchConfiguration("noisy_odom").perform(context).lower() == "true"
     use_observer = launch.substitutions.LaunchConfiguration("observer").perform(context).lower() == "true"
     wave_filter_w0 = float(launch.substitutions.LaunchConfiguration("wave_filter_omega0").perform(context))
+    gnss = launch.substitutions.LaunchConfiguration("gnss").perform(context)
 
     # URDF: vessel-specific if it exists, else the generic 'any' model
     description_dir = get_package_share_directory("cybership_description")
@@ -57,7 +58,8 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
             parameters=[
                 sim_config,
-                {"vessel_model": vessel, "tf_prefix": vessel_name, "sensors.noisy_odom": noisy_odom},
+                {"vessel_model": vessel, "tf_prefix": vessel_name, "sensors.noisy_odom": noisy_odom,
+                 "sensors.gnss_profile": gnss},
             ],
         ),
         launch_ros.actions.Node(
@@ -79,7 +81,7 @@ def _launch_setup(context, *args, **kwargs):
         ),
     ]
     if use_dp:
-        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0)
+        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss)
     if use_gui:
         # Desired force tau_d as WrenchStamped, so RViz can draw it (green arrow)
         actions.append(launch_ros.actions.Node(
@@ -98,7 +100,7 @@ def _launch_setup(context, *args, **kwargs):
     return actions
 
 
-def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0):
+def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard"):
     """Allocation, force mux, position controller and goal client (the DP stack), optionally the observer."""
     config_dir = os.path.join(get_package_share_directory("cybership_config"), "config")
     controller_params = os.path.join(config_dir, vessel, "controller_position.yaml")
@@ -149,7 +151,8 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0):
             name="position_controller",
             output="screen",
             # vessel_model: mass/added mass from vessel.yaml, the same model the simulator uses
-            parameters=[controller_params, {"vessel_model": vessel}],
+            parameters=[controller_params, {"vessel_model": vessel,
+                                            "control.bias_feedforward": use_observer}],
             remappings=[("control/force/command", "control/force/command/position")]
             # with the observer the controller sees the estimate (Fossen 13.4.6), not the true state
             + ([("measurement/odom", "navigation/odom")] if use_observer else []),
@@ -168,7 +171,7 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0):
             namespace=vessel_name,
             name="dp_observer",
             output="screen",
-            parameters=[{"vessel_model": vessel, "wave_filter.omega0": wave_filter_w0}],
+            parameters=[{"vessel_model": vessel, "wave_filter.omega0": wave_filter_w0, "gnss_profile": gnss}],
         ))
     return actions
 
@@ -192,6 +195,9 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument(
             "observer", default_value="false",
             description="DP Kalman filter on the simulated sensors; the controller uses its estimate"),
+        launch.actions.DeclareLaunchArgument(
+            "gnss", default_value="standard",
+            description="GNSS receiver: 'standard' (~0.2 m + slow wander) or 'rtk' (~2 cm), vessel.yaml sensors"),
         launch.actions.DeclareLaunchArgument(
             "wave_filter_omega0", default_value="0.0",
             description="Observer wave filter peak frequency [rad/s] (2 pi / Tp of the waves), 0 = off"),

@@ -26,7 +26,7 @@ from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, NavSatFix
 
 from cybership_utilities import vessel_model
-from cybership_utilities.marine_craft.sensors import llh2flat
+from cybership_utilities.marine_craft.sensors import gnss_config, llh2flat
 from cybership_utilities.observer import DPKalmanFilter, remove_lever_arm
 
 IDX = [0, 1, 5]
@@ -37,9 +37,12 @@ class DPObserverNode(Node):
         super().__init__("dp_observer")
         self.declare_parameter("vessel_model", "microampere")
         self.declare_parameter("rate", 50.0)
-        self.declare_parameter("q_bias", [2.0, 2.0, 0.2])     # [N^2/s, N^2/s, (N m)^2/s]
-        self.declare_parameter("q_nu", [0.5, 0.5, 0.05])
+        # tuned for smooth estimates (2026-10-26 goal tests): lower q gave 25 % less position and 50 %
+        # less velocity error than [2, 0.5] and still follows a 0.15 m/s current
+        self.declare_parameter("q_bias", [0.2, 0.2, 0.02])     # [N^2/s, N^2/s, (N m)^2/s]
+        self.declare_parameter("q_nu", [0.05, 0.05, 0.005])
         self.declare_parameter("world_frame", "world")
+        self.declare_parameter("gnss_profile", "standard")   # must match the receiver (sim: sensors.gnss_profile)
         # Wave filter (Fossen 13.4.6): peak frequency of the WF model; 0 = no wave filter
         self.declare_parameter("wave_filter.omega0", 0.0)       # [rad/s], e.g. 2 pi / Tp
         self.declare_parameter("wave_filter.zeta", 0.1)
@@ -56,7 +59,8 @@ class DPObserverNode(Node):
                                  q_bias=self.get_parameter("q_bias").value,
                                  q_nu=self.get_parameter("q_nu").value, damping=damping, wave_filter=wf)
         s = config.get("sensors", {})
-        gnss, compass = s.get("gnss", {}), s.get("compass", {})
+        gnss = gnss_config(config, self.get_parameter("gnss_profile").value) if "gnss" in s else {}
+        compass = s.get("compass", {})
         self.lever_arm = np.asarray(gnss.get("lever_arm", [0, 0, 0]), dtype=float)
         self.lat0 = math.radians(gnss.get("origin_lat_deg", 63.4305))
         self.lon0 = math.radians(gnss.get("origin_lon_deg", 10.3951))

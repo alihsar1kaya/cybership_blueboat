@@ -36,7 +36,7 @@ import os
 import numpy as np
 import rclpy
 import geometry_msgs.msg
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, NavSatFix, NavSatStatus
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
@@ -293,19 +293,37 @@ class ConfigurableSimulator(BaseSimulator):
     def _setup_sensors(self):
         self.declare_parameter("sensors.noisy_odom", False)
         self.declare_parameter("sensors.seed", -1)
+        self.declare_parameter("sensors.gnss_profile", "standard")   # 'standard' or 'rtk' (vessel.yaml)
         seed = self.get_parameter("sensors.seed").value
-        self._sensors = make_sensors(self.config, seed=None if seed < 0 else seed)
+        self._sensors = make_sensors(self.config, seed=None if seed < 0 else seed,
+                                     gnss_profile=self.get_parameter("sensors.gnss_profile").value)
         self._noise_rng = np.random.default_rng(None if seed < 0 else seed + 1)
         self._pub_gnss = self.create_publisher(NavSatFix, "sensor/gnss", 10)
         self._pub_gnss_ned = self.create_publisher(geometry_msgs.msg.PointStamped, "sensor/gnss/ned", 10)
         self._pub_imu = self.create_publisher(Imu, "sensor/imu", 10)
         self._pub_odom_true = self.create_publisher(Odometry, "sim/odom_true", 1)
+        # LF track (without the wave motion) for RViz, 2 Hz, last 5 minutes
+        self._pub_path = self.create_publisher(Path, "sim/path_lf", 1)
+        self._path = Path()
         self._last_psi = None
-        self.get_logger().info(f"Sensors: {sorted(self._sensors)}, noisy odom "
+        self.get_logger().info(f"Sensors: {sorted(self._sensors)}, GNSS "
+                               f"{self.get_parameter('sensors.gnss_profile').value}, noisy odom "
                                f"{self.get_parameter('sensors.noisy_odom').value}")
+
+    def _publish_path(self):
+        pose = geometry_msgs.msg.PoseStamped()
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.frame_id = self.world_frame_id
+        pose.pose.position.x, pose.pose.position.y = float(self.vessel.eta[0]), float(self.vessel.eta[1])
+        self._path.header = pose.header
+        self._path.poses.append(pose)
+        self._path.poses = self._path.poses[-600:]
+        self._pub_path.publish(self._path)
 
     def _publish_sensors(self):
         t = self._step_count * self.dt
+        if self._step_count % 50 == 0:
+            self._publish_path()
         eta, nu = self.vessel.get_states()
         stamp = self.get_clock().now().to_msg()
         if "gnss" in self._sensors:

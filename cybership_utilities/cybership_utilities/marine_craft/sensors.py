@@ -131,13 +131,22 @@ class Gyro(_Sensor):
         return {"r": nu[5] + self.error.sample(dt)[0], "p": nu[3], "q": nu[4]}
 
 
-def make_sensors(config, seed=None):
+def gnss_config(config, profile="standard"):
+    """GNSS section of vessel.yaml: 'gnss' (standard) or 'gnss_<profile>' (e.g. gnss_rtk)."""
+    s = config.get("sensors") or {}
+    key = "gnss" if profile in ("", "standard") else f"gnss_{profile}"
+    if key not in s:
+        raise KeyError(f"vessel.yaml has no sensors.{key}")
+    return s[key]
+
+
+def make_sensors(config, seed=None, gnss_profile="standard"):
     """Sensors from a vessel.yaml 'sensors' section; missing sensors are left out."""
     rng = np.random.default_rng(seed)
     s = config.get("sensors") or {}
     out = {}
     if "gnss" in s:
-        out["gnss"] = Gnss(rng=rng, **s["gnss"])
+        out["gnss"] = Gnss(rng=rng, **gnss_config(config, gnss_profile))
     if "compass" in s:
         out["compass"] = Compass(rng=rng, **s["compass"])
     if "gyro" in s:

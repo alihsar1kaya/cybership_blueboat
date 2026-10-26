@@ -71,3 +71,17 @@ def test_make_sensors_from_config():
                                   "compass": {"rate": 50.0}}}, seed=0)
     assert set(s) == {"gnss", "compass"}
     assert make_sensors({}) == {}
+
+
+def test_gnss_profiles_from_vessel_yaml():
+    """gnss:=rtk picks sensors.gnss_rtk (cm-level, no wander) instead of the standard receiver."""
+    import os
+    from cybership_utilities import vessel_model
+    from cybership_utilities.marine_craft.sensors import gnss_config
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    c = vessel_model.load_vessel_config(path=os.path.join(repo, "cybership_config", "config", "microampere",
+                                                          "vessel.yaml"))[0]
+    assert gnss_config(c, "rtk")["sigma"] < 0.05 and gnss_config(c, "rtk")["bias_sigma"] == 0
+    assert gnss_config(c, "standard")["bias_sigma"] > 0
+    with pytest.raises(KeyError):
+        gnss_config(c, "nope")

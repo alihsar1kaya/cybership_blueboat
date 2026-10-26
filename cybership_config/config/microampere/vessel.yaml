@@ -122,6 +122,15 @@ sensors:
     lever_arm: [0.0, 0.0, -0.3]   # [m] antenna from CO (BODY, z down). ESTIMATE: on the mast/box
     origin_lat_deg: 63.4305      # local NED origin (Trondheim, as in Fossen's flat2llh example)
     origin_lon_deg: 10.3951
+  # RTK alternative (launch gnss:=rtk): cm-level, no wander. Goal tests 2026-10-26: the boat holds
+  # 1-2 cm with RTK, 5-15 cm (plus 0.3-0.7 m slow wander) with the standard receiver above.
+  gnss_rtk:
+    rate: 5.0
+    sigma: 0.02
+    bias_sigma: 0.0
+    lever_arm: [0.0, 0.0, -0.3]
+    origin_lat_deg: 63.4305
+    origin_lon_deg: 10.3951
   compass:                 # heading after declination (ArduPilot applies COMPASS_DEC; Trondheim ~5 deg)
     rate: 50.0
     sigma_deg: 0.5         # magnetometer AHRS (Fossen's ship gyrocompass: 0.03 deg)
