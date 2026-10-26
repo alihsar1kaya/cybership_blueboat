@@ -3,7 +3,10 @@
   Microampere: NTNU's customized BlueBoat (catamaran).
   2 fixed thrusters at the stern (one under each hull) + 1 azimuth thruster at the bow on the centerline.
 
-  Overall size from the BlueBoat datasheet (120 x 93 cm deployed); hull width and other details are estimates.
+  Visual: the Microampere CAD (cad/BLUEBOAT_HULL_SET_BR-101652/micro_ampere (2).stl, decimated from 754k to
+  107k triangles for RViz: meshes/microampere/microampere.stl). The STL has x forward (keel rising at +x),
+  z up and z = 0 at the deck, keel at z = -0.376; it is lifted by hull_height - draft = 0.102 m so the
+  waterline is at the CO. The bow azimuth is not in the CAD and is drawn separately.
   Visual geometry is drawn in base_link (x forward, y left, z up, origin at CO on the waterline).
   Thruster/sensor frames are in base_link_ned (x forward, y starboard, z down), like the other vessels,
   and must match the positions in cybership_config/config/microampere/vessel.yaml.
@@ -25,41 +28,13 @@
     <material name="thruster_yellow"><color rgba="0.95 0.80 0.10 1.0" /></material>
     <material name="dark"><color rgba="0.15 0.15 0.15 1.0" /></material>
 
-    <!-- Hull macro: one pontoon with a pointed bow -->
-    <xacro:macro name="hull" params="side y">
-        <visual name="hull_${side}">
-            <origin xyz="-0.05 ${y} ${hull_height/2 - draft}" rpy="0 0 0" />
-            <geometry><box size="${hull_length - 0.1} ${hull_width} ${hull_height}" /></geometry>
-            <material name="hull_blue" />
-        </visual>
-        <visual name="hull_${side}_bow">
-            <origin xyz="${hull_length/2 - 0.1} ${y} ${hull_height/2 - draft}" rpy="0 0 0.785398" />
-            <geometry><box size="${hull_width*0.7071} ${hull_width*0.7071} ${hull_height}" /></geometry>
-            <material name="hull_blue" />
-        </visual>
-    </xacro:macro>
+    <material name="hull_white"><color rgba="0.88 0.89 0.90 1.0" /></material>
 
     <link name="base_link">
-        <xacro:hull side="port" y="${hull_offset}" />
-        <xacro:hull side="starboard" y="${-hull_offset}" />
-
-        <!-- Deck / electronics box between the hulls -->
-        <visual name="deck">
-            <origin xyz="-0.05 0 ${hull_height - draft + 0.02}" rpy="0 0 0" />
-            <geometry><box size="0.7 ${2*hull_offset} 0.04" /></geometry>
-            <material name="deck_grey" />
-        </visual>
-        <visual name="electronics_box">
-            <origin xyz="-0.05 0 ${hull_height - draft + 0.10}" rpy="0 0 0" />
-            <geometry><box size="0.4 0.3 0.12" /></geometry>
-            <material name="dark" />
-        </visual>
-
-        <!-- Front crossbeam carrying the bow azimuth -->
-        <visual name="front_beam">
-            <origin xyz="${azimuth_x} 0 ${hull_height - draft}" rpy="0 0 0" />
-            <geometry><box size="0.08 ${2*hull_offset} 0.04" /></geometry>
-            <material name="deck_grey" />
+        <visual name="microampere_cad">
+            <origin xyz="0 0 ${hull_height - draft}" rpy="0 0 0" />
+            <geometry><mesh filename="package://cybership_description/meshes/microampere/microampere.stl" /></geometry>
+            <material name="hull_white" />
         </visual>
 
         <!-- Bow azimuth: vertical shaft + thruster pod -->
@@ -86,17 +61,6 @@
             <material name="thruster_yellow" />
         </visual>
 
-        <!-- GNSS antenna mast -->
-        <visual name="gnss_mast">
-            <origin xyz="-0.2 0 ${hull_height - draft + 0.25}" rpy="0 0 0" />
-            <geometry><cylinder radius="0.01" length="0.3" /></geometry>
-            <material name="dark" />
-        </visual>
-        <visual name="gnss_antenna">
-            <origin xyz="-0.2 0 ${hull_height - draft + 0.42}" rpy="0 0 0" />
-            <geometry><cylinder radius="0.05" length="0.03" /></geometry>
-            <material name="deck_grey" />
-        </visual>
     </link>
 
     <link name="base_link_ned"/>

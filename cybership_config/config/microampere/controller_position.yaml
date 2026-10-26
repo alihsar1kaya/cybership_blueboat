@@ -59,7 +59,10 @@
     # (the stern thrusters are made for that); DP with the goal heading only near the goal.
     guidance:
       turn_then_go: true
-      approach_radius: 1.5      # [m]
+      # [m] below this distance plain DP (crab sideways with the azimuth): a 2 m sideways move with
+      # turn-then-go turned 90 deg there and back (looked like a large heading overshoot, 33 s);
+      # turn-then-go only for longer transits, where crabbing at 0.27 m/s max sway is slow
+      approach_radius: 5.0
       align_angle_deg: 20.0     # [deg]
 
     # Reference filter parameters

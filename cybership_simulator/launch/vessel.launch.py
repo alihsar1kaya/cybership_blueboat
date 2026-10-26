@@ -3,12 +3,14 @@ Generic launch file for the configurable simulator.
 
     ros2 launch cybership_simulator vessel.launch.py vessel:=voyager
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere use_gui:=false
+    ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.1
 
 Loads cybership_config/config/<vessel>/vessel.yaml. Unlike <vessel>.launch.py, the
 vessel name is not restricted to a fixed list. If a vessel has no URDF or RViz config
 yet, the generic 'any' model/config is used instead.
 """
 
+import math
 import os
 
 import launch
@@ -30,6 +32,11 @@ def _launch_setup(context, *args, **kwargs):
     noisy_odom = launch.substitutions.LaunchConfiguration("noisy_odom").perform(context).lower() == "true"
     use_observer = launch.substitutions.LaunchConfiguration("observer").perform(context).lower() == "true"
     wave_filter_w0 = float(launch.substitutions.LaunchConfiguration("wave_filter_omega0").perform(context))
+    lc = lambda name: launch.substitutions.LaunchConfiguration(name).perform(context)
+    use_waves = lc("waves").lower() == "true"
+    wave_hs, wave_tp, wave_dir = float(lc("wave_hs")), float(lc("wave_tp")), float(lc("wave_dir"))
+    if use_waves and wave_filter_w0 <= 0.0:
+        wave_filter_w0 = 2 * math.pi / wave_tp     # observer wave filter at the wave peak frequency
     gnss = launch.substitutions.LaunchConfiguration("gnss").perform(context)
 
     # URDF: vessel-specific if it exists, else the generic 'any' model
@@ -59,7 +66,9 @@ def _launch_setup(context, *args, **kwargs):
             parameters=[
                 sim_config,
                 {"vessel_model": vessel, "tf_prefix": vessel_name, "sensors.noisy_odom": noisy_odom,
-                 "sensors.gnss_profile": gnss},
+                 "sensors.gnss_profile": gnss,
+                 "environment.waves.Hs": wave_hs if use_waves else 0.0,
+                 "environment.waves.Tp": wave_tp, "environment.waves.direction_deg": wave_dir},
             ],
         ),
         launch_ros.actions.Node(
@@ -195,6 +204,14 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument(
             "observer", default_value="false",
             description="DP Kalman filter on the simulated sensors; the controller uses its estimate"),
+        launch.actions.DeclareLaunchArgument(
+            "waves", default_value="false",
+            description="Irregular waves (JONSWAP, Capytaine RAOs); also turns on the observer's wave filter. "
+                        "Can be changed while running: ros2 param set /<ns>/sim environment.waves.Hs <m>"),
+        launch.actions.DeclareLaunchArgument("wave_hs", default_value="0.1", description="Significant wave height [m]"),
+        launch.actions.DeclareLaunchArgument("wave_tp", default_value="2.3", description="Peak period [s]"),
+        launch.actions.DeclareLaunchArgument("wave_dir", default_value="0.0",
+                                             description="Direction the waves travel towards [deg], 0 = north"),
         launch.actions.DeclareLaunchArgument(
             "gnss", default_value="standard",
             description="GNSS receiver: 'standard' (~0.2 m + slow wander) or 'rtk' (~2 cm), vessel.yaml sensors"),
