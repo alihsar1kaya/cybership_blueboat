@@ -23,7 +23,9 @@ hull:
   # ~300 mm, which the CAD hull gives at 36.3 kg: unclear whether measured to the keel or to the thrusters.
   draft: 0.274
   # GM from Capytaine hydrostatics on the hull CAD for a CG ON THE WATERLINE (tools/capytaine_from_stl.py).
-  # The model lowers them by the CG height above the waterline (model.cg).
+  # The model lowers them by the CG height above the waterline (model.cg). Used only without
+  # model.hydro: with it, the restoring is the heave/roll/pitch block of Capytaine's hydrostatic
+  # stiffness in the hydro file (same values, plus the heave-pitch coupling C35 = -21 N, LCF 8 mm aft).
   GM_phi: 1.07       # [m]
   GM_theta: 0.535    # [m]
 
@@ -98,12 +100,36 @@ model:
     # Cross-flow drag on ONE hull (as Fossen does for the Otter's pontoons): waterline length and
     # beam of one hull at 274 mm draft (hull CAD), Cd from Hoerner's curve (B/2T = 0.29 -> 1.92).
     cross_flow: {length: 1.056, beam: 0.161, draft: 0.274}
-  # Stability at speed. The large sway/heave added mass (Capytaine) gives large destabilising Munk
-  # moments; the real boat is held straight by lift on the keels/skegs, which the model lacks.
-  # As Fossen does in his Otter USV model: cancel them, and let the thrusters give only X, Y, N
-  # (the thrust line is ~10-18 cm below the waterline, roughly where the hull resistance acts).
-  cancel_munk: [roll, pitch, yaw]
+  # Stability at speed (tested 1h, 2026-10-25, all combinations at 134 N and 201 N with a small
+  # roll/pitch/yaw disturbance): without cancellation the boat pitches ~50 deg and spins ~65 deg/s;
+  # pitch AND yaw must be cancelled, roll makes no difference. Fossen's newest Otter (MSS otter.m) needs
+  # none, but its sway added mass is 1.5 m; Microampere's deep V-hulls give 4.6 m (Capytaine), and the
+  # Munk moments grow with (A22 - A11) u v. The real boat is held straight by lift on the keels/skegs,
+  # which the model lacks; the cancellation stands in for it. Thrusters give only X, Y, N (the thrust
+  # line is ~10-18 cm below the waterline, roughly where the hull resistance acts).
+  cancel_munk: [pitch, yaw]
   thruster_roll_pitch_moments: false
+
+# Sensors (Fossen 2021, Ch. 13.1/14.1; cybership_utilities/marine_craft/sensors.py). Error = white noise
+# + first-order Gauss-Markov bias. ESTIMATES until the real sensors are logged at rest (ask the
+# Microampere team which GNSS: RTK gives ~cm, a standard receiver ~0.5-2 m with slow wander).
+sensors:
+  gnss:
+    rate: 5.0              # [Hz] Fossen & Fossen 2021 USV EKF example: 5 Hz GNSS
+    sigma: 0.17            # [m] white, Fossen's shipSim: +-0.5 m at 3 sigma
+    bias_sigma: 0.3        # [m] slow wander of a non-RTK receiver
+    bias_tau: 120.0        # [s]
+    lever_arm: [0.0, 0.0, -0.3]   # [m] antenna from CO (BODY, z down). ESTIMATE: on the mast/box
+    origin_lat_deg: 63.4305      # local NED origin (Trondheim, as in Fossen's flat2llh example)
+    origin_lon_deg: 10.3951
+  compass:                 # heading after declination (ArduPilot applies COMPASS_DEC; Trondheim ~5 deg)
+    rate: 50.0
+    sigma_deg: 0.5         # magnetometer AHRS (Fossen's ship gyrocompass: 0.03 deg)
+  gyro:
+    rate: 50.0
+    sigma_deg_s: 0.1       # MEMS
+    bias_sigma_deg_s: 0.05
+    bias_tau: 300.0
 
 allocation:
   # Fossen 11.2.3: min f'Wf + s'Qs  s.t.  T(alpha) f = tau + s,  -0.8*67 <= F2,F3 <= 67,  0 <= F1 <= 67
@@ -113,6 +139,11 @@ allocation:
   dofs: [X, Y, N]
   slack_weights: [1.0e4, 1.0e4, 1.0e5]
 
+# ESC/PWM model (cybership_utilities/marine_craft/actuators.py, PwmThrusterCurve): Blue Robotics T200
+# with Basic ESC, 1100-1900 us, neutral 1500 us, deadzone +-25 us, thrust ~ quadratic in the pulse
+# outside the deadzone (T = K |n| n, Fossen 9.1). The driver maps force -> whole-us pulse and skips the
+# deadzone, as the real boat's must. (Before: a 0.5 N force deadband, which has a jump the real thruster
+# does not have and made DP creep the last 10 cm for ~40 s.) MEASURE: thrust vs PWM (bollard test).
 thrusters:
   - name: port
     type: fixed
@@ -124,7 +155,7 @@ thrusters:
     max_force: 67.0                  # [N] at 400 W (Microampere team)
     reverse_ratio: 0.8               # reverse thrust = 80 % of forward (typical T200-type propeller)
     time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
-    deadband: 0.5
+    pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
       weight: 1.0
 
@@ -136,7 +167,7 @@ thrusters:
     max_force: 67.0
     reverse_ratio: 0.8
     time_constant: 0.1
-    deadband: 0.5
+    pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
       weight: 1.0
 
@@ -147,7 +178,7 @@ thrusters:
     max_force: 67.0                  # [N] at 400 W (Microampere team)
     max_rate_deg_s: 90.0             # 4 s per 360 deg (Microampere team)
     time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
-    deadband: 0.5
+    pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
       weight: 1.0
       bias_force: [0.0, 0.0]

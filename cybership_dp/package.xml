@@ -14,6 +14,8 @@
   <exec_depend>cybership_utilities</exec_depend>
   <depend>cybership_interfaces</depend>
   <depend>geometry_msgs</depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
 

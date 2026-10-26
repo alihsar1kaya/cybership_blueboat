@@ -6,6 +6,12 @@ for ShipX/WAMIT/MSS-Capytaine vessels (vessel.A, vessel.B, vessel.C, vessel.freq
     A(omega)   6x6 added mass                    [kg, kg m, kg m^2]
     B(omega)   6x6 potential (radiation) damping [N s/m, ...]
     C          6x6 hydrostatic restoring about CO
+    force_rao  6 x n_w x n_beta complex first-order wave excitation (Froude-Krylov + diffraction) per
+               metre wave amplitude, MSS convention: elevation zeta = A cos(w t + eps) at CO gives
+               tau = A Re(H e^{i(w t + eps)}) (Capytaine uses e^{-i w t}, so H = conj(F_capytaine)).
+               Headings beta = wave propagation direction relative to the bow, clockwise (0 following
+               sea, 90 waves travelling towards starboard, 180 head sea), 0-350 deg in 10 deg steps,
+               computed for 0-180 deg and mirrored (port-starboard symmetric hull), as MSS-Capytaine.
 
 Used by Fossen's power-based averaging (MSS computeManeuveringModel.m, Fossen 2025) to get the
 constant M_A and B_eq for the simulator; see cybership_utilities/hydro.py.
@@ -79,6 +85,9 @@ def main():
     p.add_argument("--omega-max", type=float, default=15.0, help="[rad/s]")
     p.add_argument("--n-omega", type=int, default=60)
     p.add_argument("--no-lid", action="store_true", help="no irregular-frequency removal (for comparison)")
+    p.add_argument("--rao-omega-max", type=float, default=7.0, help="[rad/s] highest force-RAO frequency")
+    p.add_argument("--rao-n-omega", type=int, default=28)
+    p.add_argument("--no-rao", action="store_true", help="skip the diffraction (force RAO) problems")
     p.add_argument("--out", required=True, help="output .npz")
     a = p.parse_args()
 
@@ -123,7 +132,26 @@ def main():
         "influenced_dof", "radiating_dof").sel(influenced_dof=DOFS, radiating_dof=DOFS).values
     A, B, C = to_body(A), to_body(B), to_body(C_cpt)
 
-    np.savez(a.out, freqs=omegas, A=A, B=B, C=C, mass=a.mass, rho=RHO, g=G,
+    rao = {}
+    if not a.no_rao:
+        w_rao = np.linspace(a.rao_omega_max / a.rao_n_omega, a.rao_omega_max, a.rao_n_omega)
+        beta_half = np.radians(np.arange(0, 181, 10))
+        # BODY heading beta (clockwise, towards starboard) = Capytaine wave_direction -beta (z up, y port)
+        problems = [cpt.DiffractionProblem(body=body, wave_direction=-b, omega=w, rho=RHO)
+                    for w in w_rao for b in beta_half]
+        t0 = time.time()
+        dsd = cpt.assemble_dataset(cpt.BEMSolver().solve_all(problems, progress_bar=False))
+        print(f"Solved {len(problems)} diffraction problems in {time.time() - t0:.0f} s")
+        F = (dsd["diffraction_force"] + dsd["Froude_Krylov_force"]).transpose(
+            "influenced_dof", "omega", "wave_direction").sel(influenced_dof=DOFS)
+        F = F.sel(omega=w_rao, wave_direction=-beta_half).values      # 6 x n_w x n_half, Capytaine axes
+        F = np.conj(np.einsum("ij,jkl->ikl", T_BODY, F))                # BODY axes, MSS phase convention
+        # mirror 190-350 deg from 170-10 deg: port-starboard symmetry flips sway, roll and yaw
+        mirror = np.array([1, -1, 1, -1, 1, -1])[:, None, None]
+        F_full = np.concatenate([F, mirror * F[:, :, -2:0:-1]], axis=2)
+        rao = {"rao_freqs": w_rao, "rao_headings": np.radians(np.arange(0, 360, 10)), "force_rao": F_full}
+
+    np.savez(a.out, freqs=omegas, A=A, B=B, C=C, mass=a.mass, rho=RHO, g=G, **rao,
              draft=z_wl - hull.z_keel, waterplane_area=awp, lid=not a.no_lid,
              source=f"capytaine {cpt.__version__}: {a.stl} hull_offset {a.hull_offset} swap_sides {a.swap_sides}")
     np.set_printoptions(precision=2, suppress=True, linewidth=140)

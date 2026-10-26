@@ -85,3 +85,23 @@ def viscous_damping(M, G_mat, B_eq, T_126, delta_zeta_345=None, zeta_345=None):
         else:
             Bv[i, i] = delta_zeta_345[k] * critical
     return Bv
+
+
+def motion_raos(freqs, A, B, F, w_rao, M_RB, Bv, G):
+    """
+    First-order motion RAOs (Fossen 2021, Ch. 10.2.4; MSS waveMotionRAO) from the force RAOs F
+    (6 x n_w x n_beta, MSS convention) and the frequency-dependent A(w), B(w):
+
+        X(w, beta) = [-w^2 (M_RB + A(w)) + i w (B(w) + Bv) + G]^-1 F(w, beta)
+
+    Bv: viscous damping on top of the potential damping (limits the roll/pitch resonances).
+    Returns 6 x n_w x n_beta complex: displacement [m] and angle [rad] per metre wave amplitude.
+    """
+    keep = np.isfinite(freqs)
+    Ai = PchipInterpolator(freqs[keep], A[:, :, keep], axis=2)(w_rao)
+    Bi = PchipInterpolator(freqs[keep], B[:, :, keep], axis=2)(w_rao)
+    X = np.empty_like(F)
+    for k, w in enumerate(w_rao):
+        H = -w**2 * (M_RB + Ai[:, :, k]) + 1j * w * (Bi[:, :, k] + Bv) + G
+        X[:, k, :] = np.linalg.solve(H, F[:, k, :])
+    return X

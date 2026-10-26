@@ -14,14 +14,31 @@ Environment (Fossen Ch. 10.3): ocean current, set with parameters, also while ru
     ros2 param set /microampere/sim environment.current.speed 0.2
     ros2 param set /microampere/sim environment.current.direction_deg 90.0   # flows towards east
 
+Waves (Fossen Ch. 10.2, MSS waveForceRAO): JONSWAP irregular sea with spreading and first-order loads
+from the Capytaine force RAOs in the hydro file, e.g.
+    ros2 param set /microampere/sim environment.waves.Hs 0.3
+    ros2 param set /microampere/sim environment.waves.direction_deg 180.0   # travelling towards south
+
+Sensors (Fossen Ch. 13.1, vessel.yaml 'sensors'): GNSS (sensor/gnss NavSatFix, sensor/gnss/ned), compass +
+gyro (sensor/imu, Imu). The true state is always on sim/odom_true. measurement/odom (what the controller
+uses) is the true state, or with parameter sensors.noisy_odom:=true the state plus white noise as in
+Fossen's shipSim examples, until an observer (Fossen Ch. 13.4) takes over.
+
 Run:
     ros2 run cybership_simulator vessel.py --ros-args -r __ns:=/voyager \
         -p vessel_model:=voyager -p tf_prefix:=voyager
 """
 
+import copy
+import math
+import os
+
 import numpy as np
 import rclpy
 import geometry_msgs.msg
+from nav_msgs.msg import Odometry
+from scipy.spatial.transform import Rotation
+from sensor_msgs.msg import Imu, NavSatFix, NavSatStatus
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from visualization_msgs.msg import Marker
 import skadipy
@@ -30,6 +47,10 @@ from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster
 from cybership_utilities.marine_craft.environment import OceanCurrent
+from cybership_utilities.marine_craft.sensors import make_sensors
+from cybership_utilities.marine_craft.waves import make_waves
+from cybership_utilities import hydro
+from std_msgs.msg import Float64
 
 
 class ConfigurableSimulator(BaseSimulator):
@@ -41,6 +62,7 @@ class ConfigurableSimulator(BaseSimulator):
             # Thrusters give only X, Y, N (as in Fossen's Otter): drop the roll/pitch rows of tau = B u
             self.allocator._b_matrix[3:5, :] = 0.0
         self._setup_environment()
+        self._setup_sensors()
 
     # ------------------------------------------------------------------------
     # Environment (Fossen Ch. 10.3): ocean current
@@ -55,6 +77,12 @@ class ConfigurableSimulator(BaseSimulator):
             "environment.current.speed_min": 0.0,
             "environment.current.speed_max": 1.0,
             "environment.current.seed": -1,            # -1: random
+            "environment.waves.Hs": 0.0,               # [m] significant wave height, 0 = no waves
+            "environment.waves.Tp": 2.3,               # [s] peak period (w0 = 2 pi / Tp)
+            "environment.waves.direction_deg": 0.0,    # [deg] travel towards, 0 = north
+            "environment.waves.gamma": 3.3,            # JONSWAP peakedness
+            "environment.waves.spreading": 1,          # 1: short-crested (cos^2), 0: long-crested
+            "environment.waves.seed": -1,
         }
         for name, default in p.items():
             # dynamic typing: 'ros2 param set ... 90' (an integer) must work as well as 90.0
@@ -72,6 +100,22 @@ class ConfigurableSimulator(BaseSimulator):
         self.get_logger().info(
             f"Ocean current: {g('speed')} m/s towards {g('direction_deg')} deg "
             f"(mu {g('mu')}, sigma {g('sigma')})")
+        # Waves: force RAOs from the hydro file of vessel.yaml (model.hydro.file)
+        self._hydro = None
+        h = (self.config.get("model") or {}).get("hydro")
+        if h:
+            path = h["file"] if os.path.isabs(h["file"]) else os.path.join(
+                os.path.dirname(self.config["_path"]), h["file"])
+            data = hydro.load_hydro(path)
+            if "force_rao" in data:
+                # motion RAOs from the same model: X = [-w^2 (M_RB + A) + i w (B + Bv) + G]^-1 F
+                params = vessel_model.model_parameters(self.config)
+                Bv = params["D"] - params["B_eq"]
+                data["motion_rao"] = hydro.motion_raos(data["freqs"], data["A"], data["B"], data["force_rao"],
+                                                       data["rao_freqs"], params["MRB"], Bv, params["G"])
+                self._hydro = data
+        self._waves, self._waves_dirty = None, True
+        self._pub_wave = self.create_publisher(Float64, "sim/environment/wave_elevation", 10)
 
     def _on_environment_change(self, params):
         for param in params:
@@ -83,10 +127,31 @@ class ConfigurableSimulator(BaseSimulator):
                 self._current.mu = float(param.value)
             elif param.name == "environment.current.sigma":
                 self._current.sigma = float(param.value)
+            elif param.name.startswith("environment.waves."):
+                self._waves_dirty = True        # rebuilt in iterate(), after the new value is set
             else:
                 continue
             self.get_logger().info(f"{param.name} = {param.value}")
         return SetParametersResult(successful=True)
+
+    def _update_waves(self):
+        self._waves_dirty = False
+        g = lambda n: self.get_parameter(f"environment.waves.{n}").value
+        if float(g("Hs")) <= 0.0:
+            self._waves = None
+            self.vessel.eta_wf, self.vessel.nu_wf = np.zeros(6), np.zeros(6)
+            return
+        if self._hydro is None:
+            self.get_logger().warn("Waves need force RAOs (model.hydro file with force_rao); no waves")
+            self._waves = None
+            return
+        env = {"Hs": float(g("Hs")), "Tp": float(g("Tp")), "direction_deg": float(g("direction_deg")),
+               "gamma": float(g("gamma")), "spreading": bool(int(g("spreading")))}
+        seed = int(g("seed"))
+        self._waves = make_waves(env, self._hydro, seed=None if seed < 0 else seed)
+        self._wave_t0 = self._step_count * self.dt
+        self.get_logger().info(f"Waves: Hs {env['Hs']} m, Tp {env['Tp']} s, towards {env['direction_deg']} deg, "
+                               f"{'short' if env['spreading'] else 'long'}-crested (JONSWAP gamma {env['gamma']})")
 
     def _publish_environment(self):
         v = self._current.velocity_ned()
@@ -206,7 +271,7 @@ class ConfigurableSimulator(BaseSimulator):
             )
 
     # ------------------------------------------------------------------------
-    # Actuators: command -> (saturation, deadband) -> thruster dynamics -> actual thrust -> tau = B u
+    # Actuators: command -> (saturation, deadband or ESC/PWM driver + curve) -> thruster dynamics -> tau = B u
     # ------------------------------------------------------------------------
 
     def _on_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
@@ -221,14 +286,111 @@ class ConfigurableSimulator(BaseSimulator):
         issued.wrench.force.y = fy
         self._issued_pubs[name].publish(issued)
 
+    # ------------------------------------------------------------------------
+    # Sensors (Fossen Ch. 13.1): GNSS, compass, gyro at their own rates
+    # ------------------------------------------------------------------------
+
+    def _setup_sensors(self):
+        self.declare_parameter("sensors.noisy_odom", False)
+        self.declare_parameter("sensors.seed", -1)
+        seed = self.get_parameter("sensors.seed").value
+        self._sensors = make_sensors(self.config, seed=None if seed < 0 else seed)
+        self._noise_rng = np.random.default_rng(None if seed < 0 else seed + 1)
+        self._pub_gnss = self.create_publisher(NavSatFix, "sensor/gnss", 10)
+        self._pub_gnss_ned = self.create_publisher(geometry_msgs.msg.PointStamped, "sensor/gnss/ned", 10)
+        self._pub_imu = self.create_publisher(Imu, "sensor/imu", 10)
+        self._pub_odom_true = self.create_publisher(Odometry, "sim/odom_true", 1)
+        self._last_psi = None
+        self.get_logger().info(f"Sensors: {sorted(self._sensors)}, noisy odom "
+                               f"{self.get_parameter('sensors.noisy_odom').value}")
+
+    def _publish_sensors(self):
+        t = self._step_count * self.dt
+        eta, nu = self.vessel.get_states()
+        stamp = self.get_clock().now().to_msg()
+        if "gnss" in self._sensors:
+            m = self._sensors["gnss"].update(t, eta, nu)
+            if m is not None:
+                fix = NavSatFix()
+                fix.header.stamp, fix.header.frame_id = stamp, self._frame("gnss_link")
+                fix.status.status, fix.status.service = NavSatStatus.STATUS_FIX, NavSatStatus.SERVICE_GPS
+                fix.latitude, fix.longitude, fix.altitude = m["lat"], m["lon"], m["alt"]
+                fix.position_covariance = [m["sigma"] ** 2, 0.0, 0.0, 0.0, m["sigma"] ** 2, 0.0, 0.0, 0.0, 1.0]
+                fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
+                self._pub_gnss.publish(fix)
+                ned = geometry_msgs.msg.PointStamped()
+                ned.header.stamp, ned.header.frame_id = stamp, self.world_frame_id
+                ned.point.x, ned.point.y, ned.point.z = (float(v) for v in m["ned"])
+                self._pub_gnss_ned.publish(ned)
+        if "compass" in self._sensors:
+            m = self._sensors["compass"].update(t, eta, nu)
+            if m is not None:
+                self._last_psi = m["psi"]
+        if "gyro" in self._sensors:
+            m = self._sensors["gyro"].update(t, eta, nu)
+            if m is not None:
+                imu = Imu()
+                imu.header.stamp, imu.header.frame_id = stamp, self._frame(self.body_frame_id)
+                psi = eta[5] if self._last_psi is None else self._last_psi
+                q = Rotation.from_euler("xyz", [eta[3], eta[4], psi]).as_quat()
+                imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w = (float(v) for v in q)
+                imu.angular_velocity.x, imu.angular_velocity.y = float(m["p"]), float(m["q"])
+                imu.angular_velocity.z = float(m["r"])
+                imu.linear_acceleration_covariance[0] = -1.0  # no accelerometer data
+                self._pub_imu.publish(imu)
+
+    def publish_odom(self):
+        """True state on sim/odom_true; measurement/odom is the true state or, if noisy, state + noise."""
+        if not hasattr(self, "_pub_odom_true"):     # before _setup_sensors
+            return super().publish_odom()
+        noisy = self.get_parameter("sensors.noisy_odom").value
+        real_pub = self.publisher_odom
+        self.publisher_odom = self._pub_odom_true
+        super().publish_odom()                      # fills self.odom (used for TF) with the true state
+        self.publisher_odom = real_pub
+        if not noisy:
+            real_pub.publish(self.odom)
+            return
+        # White noise as in Fossen's shipSim_v2-v4: +-0.5 m, +-0.1 deg, +-0.05 m/s at 3 sigma, or the
+        # sensor sigmas from vessel.yaml
+        rng = self._noise_rng
+        s_pos = getattr(self._sensors.get("gnss"), "error", None)
+        s_pos = 0.5 / 3 if s_pos is None else float(s_pos.sigma[0])
+        s_psi = getattr(self._sensors.get("compass"), "error", None)
+        s_psi = math.radians(0.1) / 3 if s_psi is None else float(s_psi.sigma[0])
+        s_r = getattr(self._sensors.get("gyro"), "error", None)
+        s_r = math.radians(0.1) / 3 if s_r is None else float(s_r.sigma[0])
+        msg = copy.deepcopy(self.odom)
+        msg.pose.pose.position.x += s_pos * rng.standard_normal()
+        msg.pose.pose.position.y += s_pos * rng.standard_normal()
+        eta, _ = self.vessel.get_states()
+        q = Rotation.from_euler("xyz", [eta[3], eta[4], eta[5] + s_psi * rng.standard_normal()]).as_quat()
+        o = msg.pose.pose.orientation
+        o.x, o.y, o.z, o.w = (float(v) for v in q)
+        msg.twist.twist.linear.x += 0.05 / 3 * rng.standard_normal()
+        msg.twist.twist.linear.y += 0.05 / 3 * rng.standard_normal()
+        msg.twist.twist.angular.z += s_r * rng.standard_normal()
+        real_pub.publish(msg)
+
     def iterate(self):
         """Step environment and thruster dynamics, then the vessel (BaseSimulator.iterate: tau = B u)."""
         self._step_count += 1
         publish_state = self._step_count % self.STATE_EVERY == 0
         self._current.step(self.dt)
         self.vessel.current_ned = self._current.velocity_ned()
+        if self._waves_dirty:
+            self._update_waves()
+        if self._waves is not None:
+            # total motion = LF + WF (Fossen 10.2.4, 13.2): the WF motion from the motion RAOs is added to
+            # what the sensors and RViz see; the LF model gets no first-order wave forces
+            t = self._step_count * self.dt - self._wave_t0
+            psi, u = self.vessel.eta[5], self.vessel.nu[0]
+            self.vessel.eta_wf, self.vessel.nu_wf = self._waves.motion(t, psi, U=u)
+            if publish_state:
+                self._pub_wave.publish(Float64(data=self._waves.loads(t, psi, U=u)[1]))
         if publish_state:
             self._publish_environment()
+        self._publish_sensors()
         for t in self.config["thrusters"]:
             act = self._actuators[t["name"]]
             act.step(self.dt)

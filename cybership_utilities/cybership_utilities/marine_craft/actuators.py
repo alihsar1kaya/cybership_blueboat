@@ -8,7 +8,10 @@ thrusters actually produce. In Fossen's block diagram this sits between control 
 
 Both have:
   - saturation:   -reverse_ratio * max_force <= f <= max_force (propellers push less in reverse)
-  - deadband:     commands below 'deadband' give no thrust
+  - deadband:     commands below 'deadband' give no thrust (simple force model), or
+  - ESC/PWM:      PwmThrusterCurve (e.g. Blue Robotics T200 + ESC): the driver turns the force into a
+                  PWM pulse in whole microseconds and skips the ESC deadzone, the ESC/propeller turn
+                  the pulse back into thrust T = K |n| n (Fossen 2021, Ch. 9.1)
   - first-order thrust dynamics:  T_f f_dot = f_cmd - f  (time_constant T_f, 0 = instant)
 
 The azimuth follows the commanded direction alpha_d = atan2(f_y, f_x) by the shortest way at most
@@ -23,6 +26,45 @@ import math
 import numpy as np
 
 
+class PwmThrusterCurve:
+    """
+    Thrust from an ESC pulse width, as for a Blue Robotics T200 with Basic ESC (1100-1900 us, neutral
+    1500 us, deadzone +-25 us). Outside the deadzone the shaft speed is roughly proportional to the
+    pulse, so the thrust T = K |n| n is quadratic in it (Fossen 2021, eq. 9.7, J_a ~ 0 for DP):
+
+        f = max_force (s / s_max)^2                     s = pwm - (neutral + deadzone) > 0
+        f = -reverse_ratio max_force (s / s_max)^2      s = (neutral - deadzone) - pwm > 0
+
+    to_pwm() is the thruster driver: the inverse, which skips the deadzone (so small forces are not
+    lost) and rounds to whole microseconds like a real PWM output.
+    """
+
+    def __init__(self, max_force, reverse_ratio=1.0, neutral=1500, deadzone=25, half_range=400):
+        self.max_force = float(max_force)
+        self.reverse_ratio = float(reverse_ratio)
+        self.neutral = int(neutral)
+        self.deadzone = int(deadzone)
+        self.s_max = float(half_range - deadzone)
+
+    def force(self, pwm):
+        fwd = pwm - (self.neutral + self.deadzone)
+        rev = (self.neutral - self.deadzone) - pwm
+        if fwd > 0:
+            return self.max_force * min(fwd / self.s_max, 1.0) ** 2
+        if rev > 0:
+            return -self.reverse_ratio * self.max_force * min(rev / self.s_max, 1.0) ** 2
+        return 0.0
+
+    def to_pwm(self, f):
+        if f > 0:
+            s = self.s_max * math.sqrt(min(f / self.max_force, 1.0))
+            return self.neutral + self.deadzone + int(round(s))
+        if f < 0:
+            s = self.s_max * math.sqrt(min(-f / (self.reverse_ratio * self.max_force), 1.0))
+            return self.neutral - self.deadzone - int(round(s))
+        return self.neutral
+
+
 def _first_order(f, target, time_constant, dt):
     if time_constant <= 0.0:
         return target
@@ -34,16 +76,21 @@ def _wrap(angle):
 
 
 class FixedThruster:
-    def __init__(self, max_force=np.inf, reverse_ratio=1.0, deadband=0.0, time_constant=0.0):
+    def __init__(self, max_force=np.inf, reverse_ratio=1.0, deadband=0.0, time_constant=0.0, pwm=None):
         self.max_force = float(max_force)
         self.reverse_ratio = float(reverse_ratio)
         self.deadband = float(deadband)
         self.time_constant = float(time_constant)
-        self.force = 0.0      # actual thrust [N]
-        self.command = 0.0    # last command [N]
+        self.pwm_curve = pwm   # PwmThrusterCurve or None
+        self.pwm = None        # last pulse width [us] (with a PWM curve)
+        self.force = 0.0       # actual thrust [N]
+        self.command = 0.0     # last command [N]
 
     def saturate(self, f):
         f = float(np.clip(f, -self.reverse_ratio * self.max_force, self.max_force))
+        if self.pwm_curve is not None:
+            self.pwm = self.pwm_curve.to_pwm(f)
+            return self.pwm_curve.force(self.pwm)
         return 0.0 if abs(f) < self.deadband else f
 
     def set_command(self, fx, fy=0.0):
@@ -60,7 +107,7 @@ class FixedThruster:
 
 class AzimuthThruster:
     def __init__(self, max_force=np.inf, reverse_ratio=1.0, deadband=0.0, time_constant=0.0,
-                 max_rate=np.inf, angle=0.0):
+                 max_rate=np.inf, angle=0.0, pwm=None):
         self.max_force = float(max_force)
         self.reverse_ratio = float(reverse_ratio)  # kept for completeness; alpha covers all directions
         self.deadband = float(deadband)
@@ -70,6 +117,8 @@ class AzimuthThruster:
         self.angle_rate = 0.0
         self.force = 0.0                           # actual thrust magnitude [N]
         self.command = (0.0, 0.0)                  # (F_d, alpha_d)
+        self.pwm_curve = pwm                       # PwmThrusterCurve or None (thrust magnitude)
+        self.pwm = None
 
     def set_command(self, fx, fy):
         """
@@ -80,7 +129,10 @@ class AzimuthThruster:
         """
         magnitude = math.hypot(fx, fy)
         alpha_d = math.atan2(fy, fx) if magnitude > 0.0 else self.command[1]
-        if magnitude < self.deadband:
+        if self.pwm_curve is not None:
+            self.pwm = self.pwm_curve.to_pwm(min(magnitude, self.max_force))
+            magnitude = self.pwm_curve.force(self.pwm)
+        elif magnitude < self.deadband:
             self.command = (0.0, alpha_d)
             return 0.0, 0.0
         magnitude = min(magnitude, self.max_force)
@@ -109,6 +161,8 @@ def make_thruster(t):
         deadband=float(t.get("deadband", 0.0)),
         time_constant=float(t.get("time_constant", 0.0)),
     )
+    if "pwm" in t:  # ESC model: {neutral, deadzone, half_range} [us]
+        common["pwm"] = PwmThrusterCurve(common["max_force"], common["reverse_ratio"], **t["pwm"])
     if t["type"] == "fixed":
         return FixedThruster(**common)
     rate = t.get("max_rate_deg_s")

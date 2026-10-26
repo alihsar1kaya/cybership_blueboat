@@ -178,7 +178,7 @@ def test_microampere_roll_period():
     params = vessel_model.model_parameters(config("microampere"))
     model = vessel_model.make_marine_craft(params, eta0=np.radians([0, 0, 0, 5, 0, 0]))
     m44 = params["MRB"][3, 3] + params["MA"][3, 3]
-    wn = math.sqrt(params["G"][3] / m44)
+    wn = math.sqrt(params["G"][3, 3] / m44)
     zeta = params["D"][3, 3] / (2 * m44 * wn)
     expected = 2 * math.pi / (wn * math.sqrt(1 - zeta**2))
     phi, t = [], []
@@ -188,6 +188,20 @@ def test_microampere_roll_period():
     crossings = [t[i] for i in range(1, len(phi)) if phi[i - 1] > 0 >= phi[i]]
     assert len(crossings) >= 2
     assert crossings[1] - crossings[0] == pytest.approx(expected, rel=0.05)
+
+
+def test_restoring_from_capytaine_matches_the_hull_gm():
+    """G from the hydrostatic block of the hydro file: symmetric, same GM as hull.GM_* (both CG on the
+    waterline, lowered by the CG height), and the small heave-pitch coupling of the waterplane."""
+    c = config("microampere")
+    params = vessel_model.model_parameters(c)
+    G, m, z_g = params["G"], params["mass"], params["cg"][2]
+    assert np.allclose(G, G.T)
+    assert G[3, 3] == pytest.approx(m * 9.81 * (c["hull"]["GM_phi"] + z_g), rel=0.01)
+    assert G[4, 4] == pytest.approx(m * 9.81 * (c["hull"]["GM_theta"] + z_g), rel=0.01)
+    assert G[2, 2] == pytest.approx(c["model"]["heave_stiffness"], rel=0.01)
+    assert 0 < abs(G[2, 4]) < 0.05 * math.sqrt(G[2, 2] * G[4, 4])
+    assert not np.any(G[[0, 1, 5], :]) and not np.any(G[:, [0, 1, 5]])
 
 
 def test_roll_damping_grows_with_amplitude():
@@ -208,12 +222,17 @@ def test_roll_damping_grows_with_amplitude():
 
 
 def test_microampere_is_stable_at_top_speed():
-    """A small roll/pitch disturbance at full speed must not grow (needs the Munk cancellation)."""
+    """
+    A small roll/pitch/yaw disturbance at full speed must not grow: no capsizing in pitch and a
+    straight course (needs the Munk cancellation in pitch and yaw, see vessel.yaml).
+    """
     model = vessel_model.make_marine_craft(vessel_model.model_parameters(config("microampere")),
-                                           eta0=np.radians([0, 0, 0, 3, 3, 0]))
+                                           eta0=np.radians([0, 0, 0, 3, 3, 0]),
+                                           nu0=np.array([0, 0, 0, 0, 0, 0.05]))
     run(model, [201, 0, 0, 0, 0, 0], 30.0)
     assert np.all(np.isfinite(model.nu))
     assert abs(model.eta[3]) < math.radians(1) and abs(model.eta[4]) < math.radians(1)
+    assert abs(model.nu[5]) < math.radians(1)
     d = config("microampere")["model"]["damping"]
     Xuu = d["max_thrust"] / d["max_speed"] ** 2
     assert model.nu[0] == pytest.approx(math.sqrt(201 / Xuu), abs=0.05)  # all three thrusters forward

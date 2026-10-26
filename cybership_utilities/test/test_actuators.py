@@ -8,7 +8,7 @@ import math
 
 import pytest
 
-from cybership_utilities.marine_craft.actuators import FixedThruster, AzimuthThruster, make_thruster
+from cybership_utilities.marine_craft.actuators import FixedThruster, AzimuthThruster, PwmThrusterCurve, make_thruster
 
 DT = 0.01
 
@@ -89,3 +89,41 @@ def test_azimuth_turns_without_thrust_on_a_tiny_command():
     run(a, 1.0)
     assert math.degrees(a.angle) == pytest.approx(90, abs=0.1)
     assert a.output()[1] == 0.0
+
+
+# --- ESC / PWM model (T200) -------------------------------------------------------------------
+
+def test_pwm_curve_deadzone_and_limits():
+    c = PwmThrusterCurve(67.0, reverse_ratio=0.8)
+    for pwm in (1475, 1490, 1500, 1510, 1525):
+        assert c.force(pwm) == 0.0            # ESC deadzone
+    assert c.force(1900) == pytest.approx(67.0)
+    assert c.force(1100) == pytest.approx(-0.8 * 67.0)
+    assert c.force(1950) == pytest.approx(67.0)   # saturates
+    forces = [c.force(p) for p in range(1100, 1901)]
+    assert all(b >= a for a, b in zip(forces, forces[1:]))   # monotonic
+
+
+def test_pwm_driver_skips_the_deadzone():
+    """Small forces are not lost: the driver jumps over the deadzone, error below one-us resolution."""
+    c = PwmThrusterCurve(67.0, reverse_ratio=0.8)
+    for f in (0.05, 0.3, 0.5, 2.0, 10.0, 67.0, -0.3, -20.0, -53.6):
+        pwm = c.to_pwm(f)
+        assert isinstance(pwm, int)
+        assert c.force(pwm) == pytest.approx(f, abs=0.2, rel=0.01)
+    assert c.to_pwm(0.0) == 1500
+    assert c.to_pwm(0.3) > 1525 and c.to_pwm(-0.3) < 1475
+
+
+def test_thruster_with_pwm_gives_small_forces():
+    """With the ESC model a 0.3 N command gives ~0.3 N (the old 0.5 N force deadband gave 0)."""
+    t = make_thruster({"type": "fixed", "max_force": 67, "reverse_ratio": 0.8, "time_constant": 0.1,
+                       "pwm": {"neutral": 1500, "deadzone": 25, "half_range": 400}})
+    t.set_command(0.3)
+    for _ in range(100):
+        t.step(0.01)
+    assert t.output()[0] == pytest.approx(0.3, abs=0.05)
+    assert t.pwm > 1525
+    a = make_thruster({"type": "azimuth", "max_force": 67, "pwm": {"neutral": 1500, "deadzone": 25}})
+    fx, fy = a.set_command(0.0, 0.3)
+    assert math.hypot(fx, fy) == pytest.approx(0.3, abs=0.05) and a.pwm > 1525

@@ -117,6 +117,11 @@ class MarineCraft:
         self.cancel_munk = tuple(cancel_munk)  # e.g. ("yaw",) as in Fossen's Otter model
         self.rho = rho
         self.current_ned = np.zeros(3)  # [m/s] current velocity in NED (set by an environment model)
+        self.tau_ext = np.zeros(6)      # external loads (set by an environment model), BODY
+        # Wave-frequency motion added to the LF state in get_states() (total = LF + WF, Fossen 13.2);
+        # eta_wf positions along the BODY axes, set by an environment model
+        self.eta_wf = np.zeros(6)
+        self.nu_wf = np.zeros(6)
         self.eta = np.zeros(6) if eta0 is None else eta0
         self.nu = np.zeros(6) if nu0 is None else nu0
 
@@ -138,7 +143,13 @@ class MarineCraft:
         self._nu = np.asarray(value, dtype=float).reshape(6).copy()
 
     def get_states(self):
-        return self.eta.copy(), self.nu.copy()
+        """Total motion: LF state (integrated) + WF motion (from motion RAOs, if waves are on)."""
+        if not (np.any(self.eta_wf) or np.any(self.nu_wf)):
+            return self.eta.copy(), self.nu.copy()
+        eta = self.eta.copy()
+        eta[0:3] += Rzyx(0.0, 0.0, eta[5]) @ self.eta_wf[0:3]
+        eta[3:6] += self.eta_wf[3:6]
+        return eta, self.nu + self.nu_wf
 
     def coriolis(self, nu, nu_r):
         C_A = m2c(self.M_A, nu_r)
@@ -175,7 +186,7 @@ class MarineCraft:
     def step(self, tau=None, dt=0.01, tau_ext=None):
         """Advance (eta, nu) one time step with 4th-order Runge-Kutta."""
         tau = np.zeros(6) if tau is None else np.asarray(tau, dtype=float).reshape(6)
-        tau_ext = np.zeros(6) if tau_ext is None else np.asarray(tau_ext, dtype=float).reshape(6)
+        tau_ext = self.tau_ext if tau_ext is None else np.asarray(tau_ext, dtype=float).reshape(6)
         eta, nu = self.eta, self.nu
         k1e, k1n = self.derivatives(eta, nu, tau, tau_ext)
         k2e, k2n = self.derivatives(eta + 0.5 * dt * k1e, nu + 0.5 * dt * k1n, tau, tau_ext)

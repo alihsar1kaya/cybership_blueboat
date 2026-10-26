@@ -27,6 +27,9 @@ def _launch_setup(context, *args, **kwargs):
     vessel_name = launch.substitutions.LaunchConfiguration("vessel_name").perform(context) or vessel
     use_gui = launch.substitutions.LaunchConfiguration("use_gui").perform(context).lower() == "true"
     use_dp = launch.substitutions.LaunchConfiguration("dp").perform(context).lower() == "true"
+    noisy_odom = launch.substitutions.LaunchConfiguration("noisy_odom").perform(context).lower() == "true"
+    use_observer = launch.substitutions.LaunchConfiguration("observer").perform(context).lower() == "true"
+    wave_filter_w0 = float(launch.substitutions.LaunchConfiguration("wave_filter_omega0").perform(context))
 
     # URDF: vessel-specific if it exists, else the generic 'any' model
     description_dir = get_package_share_directory("cybership_description")
@@ -54,7 +57,7 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
             parameters=[
                 sim_config,
-                {"vessel_model": vessel, "tf_prefix": vessel_name},
+                {"vessel_model": vessel, "tf_prefix": vessel_name, "sensors.noisy_odom": noisy_odom},
             ],
         ),
         launch_ros.actions.Node(
@@ -76,7 +79,7 @@ def _launch_setup(context, *args, **kwargs):
         ),
     ]
     if use_dp:
-        actions += _dp_actions(vessel, vessel_name)
+        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0)
     if use_gui:
         # Desired force tau_d as WrenchStamped, so RViz can draw it (green arrow)
         actions.append(launch_ros.actions.Node(
@@ -95,8 +98,8 @@ def _launch_setup(context, *args, **kwargs):
     return actions
 
 
-def _dp_actions(vessel, vessel_name):
-    """Allocation, force mux, position controller and goal client (the DP stack)."""
+def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0):
+    """Allocation, force mux, position controller and goal client (the DP stack), optionally the observer."""
     config_dir = os.path.join(get_package_share_directory("cybership_config"), "config")
     controller_params = os.path.join(config_dir, vessel, "controller_position.yaml")
     actions = []
@@ -147,7 +150,9 @@ def _dp_actions(vessel, vessel_name):
             output="screen",
             # vessel_model: mass/added mass from vessel.yaml, the same model the simulator uses
             parameters=[controller_params, {"vessel_model": vessel}],
-            remappings=[("control/force/command", "control/force/command/position")],
+            remappings=[("control/force/command", "control/force/command/position")]
+            # with the observer the controller sees the estimate (Fossen 13.4.6), not the true state
+            + ([("measurement/odom", "navigation/odom")] if use_observer else []),
         ),
         launch_ros.actions.Node(
             package="cybership_dp",
@@ -156,6 +161,15 @@ def _dp_actions(vessel, vessel_name):
             name="position_control_client",
         ),
     ]
+    if use_observer:
+        actions.append(launch_ros.actions.Node(
+            package="cybership_dp",
+            executable="dp_observer_node.py",
+            namespace=vessel_name,
+            name="dp_observer",
+            output="screen",
+            parameters=[{"vessel_model": vessel, "wave_filter.omega0": wave_filter_w0}],
+        ))
     return actions
 
 
@@ -172,5 +186,14 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument(
             "dp", default_value="false",
             description="Also start the DP stack (allocation, mux, position controller)"),
+        launch.actions.DeclareLaunchArgument(
+            "noisy_odom", default_value="false",
+            description="Controller sees the state plus sensor noise (until an observer is used)"),
+        launch.actions.DeclareLaunchArgument(
+            "observer", default_value="false",
+            description="DP Kalman filter on the simulated sensors; the controller uses its estimate"),
+        launch.actions.DeclareLaunchArgument(
+            "wave_filter_omega0", default_value="0.0",
+            description="Observer wave filter peak frequency [rad/s] (2 pi / Tp of the waves), 0 = off"),
         launch.actions.OpaqueFunction(function=_launch_setup),
     ])

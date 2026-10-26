@@ -75,12 +75,13 @@ def load_vessel_config(vessel_model="voyager", path=""):
 def added_mass_matrix(model, config_path=""):
     """
     6x6 added mass M_A about CO: power-based A_eq from model.hydro (symmetrized), else diag(added_mass).
-    Also returns B_eq (6x6, zeros without hydro data) and a short description.
+    Also returns B_eq (6x6, zeros without hydro data), the hydrostatic restoring (6x6 for a CG on the
+    waterline, None without hydro data) and a short description.
     """
     h = model.get("hydro")
     if not h:
         MA = np.diag(np.asarray(model["added_mass"], dtype=float))
-        return MA, np.zeros((6, 6)), "diagonal added_mass"
+        return MA, np.zeros((6, 6)), None, "diagonal added_mass"
     from cybership_utilities import hydro
     path = h["file"]
     if not os.path.isabs(path):
@@ -89,7 +90,10 @@ def added_mass_matrix(model, config_path=""):
     w_max = h.get("max_frequency")
     A_eq, B_eq = hydro.power_based_matrices(data["freqs"], data["A"], data["B"], float(h["wave_peak_frequency"]),
                                             w_max=None if w_max is None else float(w_max))
-    return hydro.symmetrize(A_eq), hydro.symmetrize(B_eq), \
+    # Restoring: heave/roll/pitch block of the hydrostatic C (as MSS computeManeuveringModel.m), CG on WL
+    C = np.zeros((6, 6))
+    C[2:5, 2:5] = hydro.symmetrize(data["C"][2:5, 2:5])
+    return hydro.symmetrize(A_eq), hydro.symmetrize(B_eq), C, \
         f"power-based A_eq, B_eq, w_p {h['wave_peak_frequency']} rad/s, w <= {w_max}, {os.path.basename(path)}"
 
 
@@ -97,7 +101,7 @@ def model_parameters(config, rho=1000.0, g=9.81):
     """
     Return the 6DOF model plus the nonlinear terms:
     {'mass', 'inertia' (3), 'cg' (3), 'MRB' (6x6), 'MA' (6x6), 'B_eq' (6x6), 'D' (6x6, linear),
-     'G' (6), 'nonlinear' (dict), 'source'}. G is a diagonal vector, the others full matrices.
+     'G' (6x6), 'nonlinear' (dict), 'source'}.
     """
     model = config.get("model")
     hull = config["hull"]
@@ -108,7 +112,7 @@ def model_parameters(config, rho=1000.0, g=9.81):
         mass = float(model["mass"])
         inertia = np.asarray(model["inertia"], dtype=float)
         cg = np.asarray(model.get("cg", [0.0, 0.0, 0.0]), dtype=float)
-        MA, B_eq, ma_source = added_mass_matrix(model, config.get("_path", ""))
+        MA, B_eq, C_wl, ma_source = added_mass_matrix(model, config.get("_path", ""))
         heave_stiffness = float(model.get("heave_stiffness", 0.0))
         nonlinear["cancel_munk"] = list(model.get("cancel_munk", []))
         nonlinear["thruster_roll_pitch_moments"] = bool(model.get("thruster_roll_pitch_moments", True))
@@ -120,17 +124,23 @@ def model_parameters(config, rho=1000.0, g=9.81):
         cg = np.zeros(3)
         MA = np.diag(_SHOEBOX_ALPHA * np.concatenate([[mass] * 3, inertia]))
         B_eq = np.zeros((6, 6))
+        C_wl = None
         heave_stiffness = 0.0
         source = "hull"
     from cybership_utilities.marine_craft import Hmtrx
     H = Hmtrx(cg)
     MRB = H.T @ np.diag(np.concatenate([[mass] * 3, inertia])) @ H
-    gm_phi = hull.get("GM_phi", 0.0) + cg[2]      # GM for a CG on the waterline, lowered by the CG height
-    gm_theta = hull.get("GM_theta", 0.0) + cg[2]
-    G = np.array([0.0, 0.0, heave_stiffness, mass * g * gm_phi, mass * g * gm_theta, 0.0])
+    if C_wl is None:
+        G = np.diag([0.0, 0.0, heave_stiffness, mass * g * hull.get("GM_phi", 0.0),
+                     mass * g * hull.get("GM_theta", 0.0), 0.0])
+    else:
+        G = C_wl.copy()  # full heave/roll/pitch block from Capytaine (heave-pitch coupling)
+    # Both are for a CG on the waterline; a CG z_g below CO (z down) raises GM by z_g: G44, G55 += m g z_g
+    G[3, 3] += mass * g * cg[2]
+    G[4, 4] += mass * g * cg[2]
 
     if model and "damping" in model:
-        D, extra = _fossen_damping(model["damping"], np.diag(MRB) + np.diag(MA), G, B_eq)
+        D, extra = _fossen_damping(model["damping"], np.diag(MRB) + np.diag(MA), np.diag(G), B_eq)
         nonlinear.update(extra)
         source += ", Fossen damping"
     elif model:
@@ -199,7 +209,7 @@ def make_marine_craft(params, eta0=None, nu0=None, rho=1000.0):
     from cybership_utilities.marine_craft import MarineCraft
     nl = params["nonlinear"]
     return MarineCraft(
-        params["MRB"], params["MA"], params["D"], np.diag(params["G"]),
+        params["MRB"], params["MA"], params["D"], params["G"],
         surge_quadratic=nl["surge_quadratic"], yaw_quadratic=nl["yaw_quadratic"],
         cross_flow=nl["cross_flow"], cancel_munk=nl["cancel_munk"], rho=rho, eta0=eta0, nu0=nu0,
         surge_linear_decay=nl["surge_linear_decay"], roll_quadratic_factor=nl["roll_quadratic_factor"],
