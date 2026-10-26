@@ -82,6 +82,7 @@ class ConfigurableSimulator(BaseSimulator):
             "environment.waves.direction_deg": 0.0,    # [deg] travel towards, 0 = north
             "environment.waves.gamma": 3.3,            # JONSWAP peakedness
             "environment.waves.spreading": 1,          # 1: short-crested (cos^2), 0: long-crested
+            "environment.waves.max_freq": 5.0,         # [rad/s] spectrum cut, MSS default
             "environment.waves.seed": -1,
         }
         for name, default in p.items():
@@ -146,7 +147,8 @@ class ConfigurableSimulator(BaseSimulator):
             self._waves = None
             return
         env = {"Hs": float(g("Hs")), "Tp": float(g("Tp")), "direction_deg": float(g("direction_deg")),
-               "gamma": float(g("gamma")), "spreading": bool(int(g("spreading")))}
+               "gamma": float(g("gamma")), "spreading": bool(int(g("spreading"))),
+               "max_freq": float(g("max_freq"))}
         seed = int(g("seed"))
         self._waves = make_waves(env, self._hydro, seed=None if seed < 0 else seed)
         self._wave_t0 = self._step_count * self.dt

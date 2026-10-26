@@ -137,10 +137,14 @@ def _interp_extrap(x, xp, fp):
 
 
 def make_waves(env, hydro_data, seed=None):
-    """WaveModel from vessel/sim parameters: env = dict(Hs, w0 or Tp, direction_deg, spreading, ...)."""
+    """
+    WaveModel from vessel/sim parameters: env = dict(Hs, w0 or Tp, direction_deg, spreading, max_freq, ...).
+    The spectrum is cut at max_freq (default 5 rad/s, as MSS waveInitialization.m) or the RAO table.
+    """
     w0 = env.get("w0") or 2 * math.pi / env["Tp"]
+    w_max = min(float(env.get("max_freq", 5.0)), float(np.max(hydro_data["rao_freqs"])))
     return WaveModel(env["Hs"], w0, math.radians(env.get("direction_deg", 0.0)),
                      hydro_data["rao_freqs"], hydro_data["rao_headings"], hydro_data["force_rao"],
                      gamma=env.get("gamma", 3.3), n_freq=int(env.get("n_freq", 100)),
                      n_dir=int(env.get("n_dir", 24)), spreading=bool(env.get("spreading", True)),
-                     seed=seed, motion_rao=hydro_data.get("motion_rao"))
+                     seed=seed, motion_rao=hydro_data.get("motion_rao"), omega_max=w_max)
