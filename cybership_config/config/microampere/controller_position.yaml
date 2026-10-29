@@ -59,11 +59,39 @@
     # (the stern thrusters are made for that); DP with the goal heading only near the goal.
     guidance:
       turn_then_go: true
-      # [m] below this distance plain DP (crab sideways with the azimuth): a 2 m sideways move with
-      # turn-then-go turned 90 deg there and back (looked like a large heading overshoot, 33 s);
-      # turn-then-go only for longer transits, where crabbing at 0.27 m/s max sway is slow
-      approach_radius: 5.0
+      # [m] goals closer than this: plain DP (small corrections, crab with the azimuth); farther goals:
+      # turn the bow to the goal and drive. 5 m made the boat crab sideways for normal moves.
+      min_transit_distance: 1.5
+      # [m] in transit, switch to station keeping (and turn to the final heading) this close. Must be
+      # small: with 5 m the boat turned 140 deg while still at transit speed and drifted 1 m past.
+      approach_radius: 1.5
+      # [m] then 'arrive' (stop with the transit heading) and turn to the final heading only this close
+      settle_radius: 0.3
+      # [deg/s] then turn to the final heading at this rate (a 144 deg turn in 4 s pushed it 0.5 m away)
+      final_turn_rate_deg_s: 15.0
+      # Manoeuvre choice per goal (forward / reverse / dp) by estimated time:
+      #   T = (turn to the course + turn to the final heading) / turn rate + distance / speed
+      # e.g. 3 m straight behind, same heading: reverse ~9 s vs forward ~23 s (turn 180 there and back)
+      forward_speed: 0.6         # [m/s] bow first (DP transit with the reference filter)
+      reverse_speed: 0.35        # [m/s] stern first: 80 % reverse thrust, blunt transom
+      turn_rate_deg_s: 20.0      # [deg/s] incl. accelerating (180 deg in ~9 s measured)
+      max_reverse_distance: 6.0  # [m] back up only short distances
       align_angle_deg: 20.0     # [deg]
+      # Transit = path following along the line start -> goal (Fossen Ch. 12.5, TTK4190 L6 slides 59-61):
+      # ALOS heading autopilot + surge speed control, no sway force. ALOS estimates the crab angle from
+      # currents so the boat stays on the line (plain LOS leaves Delta*tan(beta_c) off the line).
+      # Off: test 10 m north in 0.15 m/s cross current (tools/run_goal_motion_test.sh, 29.10):
+      #   DP transit (false): max cross-track 0.14 m, at goal in 30 s
+      #   ALOS (true):        max 0.61 m (crab estimate 8.6 of ~14 deg on a short leg), at goal in 34 s, and
+      #   the boat slid 2.4 m back after arriving (observer bias learned during crabbing, then fed forward).
+      # ALOS is Fossen's law for underactuated craft (Otter); a fully actuated boat on short legs does better
+      # with DP (L6 slide 9). Kept for long transits / waypoints.
+      path_following: false
+      los_lookahead: 2.5        # [m] Delta; Otter (2 m) uses 10 m on 100 m legs, our legs are 2-20 m
+      alos_gamma: 0.02          # [rad/(m s)] ~critically damped cross-track at 0.6 m/s with Delta 2.5
+      alos_max_crab_deg: 30.0
+      transit_accel: 0.1        # [m/s^2] speed ramp
+      arrive_speed: 0.2         # [m/s] at approach_radius, then DP stops the boat
 
     # Reference filter parameters
     filter:

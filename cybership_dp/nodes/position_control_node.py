@@ -32,6 +32,7 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger, Empty
 from cybership_controller.position.reference_filter import ThirdOrderReferenceFilter
+from cybership_dp.los import ALOS
 from rclpy.duration import Duration
 from tf2_ros import Buffer, TransformListener, TransformException
 import tf2_geometry_msgs
@@ -110,8 +111,27 @@ class PositionController(Node):
                 # the bow towards it on the spot, then drive there bow first; DP with the goal
                 # heading only inside approach_radius. false = plain set-point DP (original).
                 ('guidance.turn_then_go', False),
-                ('guidance.approach_radius', 1.5),     # [m]
+                ('guidance.approach_radius', 1.5),     # [m] switch from transit to station (final heading)
+                # [m] only goals farther than this use turn-then-go; closer ones are plain DP (crab)
+                ('guidance.min_transit_distance', 0.0),
+                # [m] after a transit, turn to the final heading only this close to the goal
+                ('guidance.settle_radius', 0.3),
+                ('guidance.final_turn_rate_deg_s', 15.0),   # [deg/s] turn to the final heading at the goal
+                # manoeuvre choice (forward / reverse / dp) by estimated time
+                ('guidance.forward_speed', 0.6),       # [m/s] typical transit speed bow first
+                ('guidance.reverse_speed', 0.35),      # [m/s] stern first (reverse thrust 80 %, blunt stern)
+                ('guidance.turn_rate_deg_s', 20.0),    # [deg/s] typical turning rate incl. accelerating
+                ('guidance.max_reverse_distance', 6.0),  # [m] never back up farther than this
                 ('guidance.align_angle_deg', 20.0),    # [deg] start driving when the bow is this close
+                # Transit as path following along the straight line start -> goal (Fossen Ch. 12.5,
+                # TTK4190 L6): ALOS heading + surge speed control, no sway force (like the Otter USV).
+                # false: the transit is DP towards the goal through the reference filter (as before).
+                ('guidance.path_following', False),
+                ('guidance.los_lookahead', 2.5),       # [m] Delta (K_p = 1/Delta)
+                ('guidance.alos_gamma', 0.02),         # [rad/(m s)] crab-angle adaptation, 0 = plain LOS
+                ('guidance.alos_max_crab_deg', 30.0),  # [deg] limit on the crab-angle estimate
+                ('guidance.transit_accel', 0.1),       # [m/s^2] speed ramp up and down in transit
+                ('guidance.arrive_speed', 0.2),        # [m/s] speed when reaching approach_radius
 
                 # Controller limits
                 ('control.max_integral_error.pos', 1.0),
@@ -598,6 +618,17 @@ class PositionController(Node):
         # Update the reference filter with the latest target pose.
         # This "command" is smoothed by the filter.
         ref = self._guidance_reference(current_x, current_y, current_yaw)
+        if ref is None:
+            # path following (transit): ALOS heading + surge speed, the reference filter follows the
+            # boat so DP takes over smoothly when the transit ends
+            nu = np.array([current_vx, current_vy, current_yaw_rate])
+            eta = np.array([current_x, current_y, current_yaw])
+            self._reset_ref_filter(eta, Rz(current_yaw) @ nu)
+            psi_d, u_d = self._path_command
+            self.process_performance_metrics(eta, np.zeros(3), np.zeros(2), np.zeros(2),
+                                             wrap_to_pi(psi_d - current_yaw))
+            self._publish_wrench(*self._path_following_tau(current_yaw, nu, psi_d, u_d))
+            return
         self.ref_filter.set_eta_r(ref)
         self.ref_filter.update()
 
@@ -729,6 +760,31 @@ class PositionController(Node):
                + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
         return float(tau[0]), float(tau[1]), float(tau[2])
 
+    def _reset_ref_filter(self, eta, eta_dot):
+        f = self.ref_filter
+        f.eta_d, f.eta_d_dot, f.eta_d_ddot = eta.copy(), eta_dot.copy(), np.zeros(3)
+        f._eta_r = eta.copy()
+        f._x = np.concatenate([eta, eta_dot, np.zeros(3)])
+
+    def _path_following_tau(self, psi, nu, psi_d, u_d):
+        """
+        Path following in transit (Fossen Ch. 12.5): a surge speed controller and a heading autopilot,
+        no sway force; ALOS has put the crab angle into psi_d. Same model-based gains as the DP law.
+
+            X = m11 u_ref_dot + d(u_ref) + Kd_u (u_ref - u),   N = Kp_r e_psi - Kd_r r,   Y = 0
+        """
+        a = self.get_parameter('guidance.transit_accel').value
+        step = np.clip(u_d - self._u_ref, -a * self.dt, a * self.dt)
+        self._u_ref += step
+        u_ref_dot = step / self.dt
+        if self._craft is not None:
+            d = -self._craft.damping(np.array([self._u_ref, 0, 0, 0, 0, 0]))[0]
+        else:
+            d = self.D_eff[0, 0] * self._u_ref
+        X = self.M_eff[0, 0] * u_ref_dot + d + self.Kd_mb[0] * (self._u_ref - nu[0])
+        N = self.Kp_mb[2] * wrap_to_pi(psi_d - psi) - self.Kd_mb[2] * nu[2]
+        return float(X), 0.0, float(N)
+
     def _integral_action(self, R, error_world):
         """Integral in the world frame (does not rotate with the boat), with conditional integration."""
         self.integral_mb += error_world * self.dt
@@ -738,6 +794,30 @@ class PositionController(Node):
             tau_i = np.clip(self.Ki_mb * (R.T @ self.integral_mb),
                             -self.max_integral_force, self.max_integral_force)
         return tau_i
+
+    def _choose_manoeuvre(self, distance, bearing, yaw):
+        """
+        How to get to the goal, chosen once per goal by an estimated time (seconds), like a skipper would:
+
+            forward:  turn the bow to the goal, drive, turn to the final heading
+            reverse:  turn the stern to the goal, back up, turn to the final heading (short distances)
+            dp:       move directly (sideways / diagonally with the azimuth), only for small corrections
+
+            T = (|turn to the course| + |turn to the final heading|) / turn rate + distance / speed
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        if distance <= max(g('approach_radius'), g('min_transit_distance')):
+            return 'dp', {}
+        rate = np.radians(g('turn_rate_deg_s'))
+        times = {}
+        for mode, course, speed in (('forward', bearing, g('forward_speed')),
+                                    ('reverse', wrap_to_pi(bearing + np.pi), g('reverse_speed'))):
+            if mode == 'reverse' and distance > g('max_reverse_distance'):
+                continue
+            turns = abs(wrap_to_pi(course - yaw)) + abs(wrap_to_pi(self.target_yaw - course))
+            times[mode] = turns / rate + distance / speed
+        best = min(times, key=times.get)
+        return best, times
 
     def _guidance_reference(self, x, y, yaw):
         """Reference eta_r = [x, y, psi] for the reference filter (guidance block)."""
@@ -749,14 +829,45 @@ class PositionController(Node):
         dx, dy = self.target_x - x, self.target_y - y
         distance = np.hypot(dx, dy)
         bearing = np.arctan2(dy, dx)
-        heading_error = abs(wrap_to_pi(bearing - yaw))
         phase = getattr(self, '_guidance_phase', None)
 
         if phase is None:
-            phase = 'turn' if distance > radius else 'station'
+            self._manoeuvre, times = self._choose_manoeuvre(distance, bearing, yaw)
+            self.get_logger().info(
+                f"Guidance: {self._manoeuvre} to the goal {distance:.1f} m away"
+                + (" (estimated " + ", ".join(f"{k} {v:.0f} s" for k, v in times.items()) + ")" if times else ""))
+            phase = 'station' if self._manoeuvre == 'dp' else 'turn'
             self._guidance_hold = (x, y)
-        if phase != 'station' and distance < radius:
-            phase = 'station'
+            self._alos = ALOS(self.get_parameter('guidance.los_lookahead').value,
+                              self.get_parameter('guidance.alos_gamma').value,
+                              self.get_parameter('guidance.alos_max_crab_deg').value)
+            self._alos.set_path((x, y), (self.target_x, self.target_y))
+            self._max_cross_track = 0.0
+            if self._manoeuvre == 'dp':
+                # small correction: change the heading slowly (rate limited) while moving; turning
+                # 90 deg in 4 s while translating pushed the boat 0.65 m the wrong way
+                self._guidance_heading, self._final_turn = yaw, True
+        # the course the bow (forward) or the stern (reverse) points along
+        reverse = getattr(self, '_manoeuvre', 'forward') == 'reverse'
+        path_following = (self.get_parameter('guidance.path_following').value and self.model_based
+                          and getattr(self, '_alos', None) is not None)
+        if path_following:
+            # along the path (start -> goal), and in transit the ALOS heading (L6 slide 61)
+            course = self._alos.pi_h
+            if phase == 'transit':
+                course = self._alos.update(x, y, self.dt)
+                self._max_cross_track = max(self._max_cross_track, abs(self._alos.errors(x, y)[1]))
+        else:
+            course = bearing
+        course = wrap_to_pi(course + np.pi) if reverse else course
+        heading_error = abs(wrap_to_pi(course - yaw))
+        settle = self.get_parameter('guidance.settle_radius').value
+        if phase in ('turn', 'transit') and distance < radius:
+            # arrive: keep the transit heading while stopping; the final heading comes when settled,
+            # so the boat does not turn ~180 deg while it still has speed (it drifted 1 m past)
+            phase, self._guidance_heading = 'arrive', course if phase == 'transit' else yaw
+        elif phase == 'arrive' and distance < settle:
+            phase, self._final_turn = 'station', True   # turn to the final heading, rate limited
         elif phase == 'turn' and heading_error < align:
             phase = 'transit'
         elif phase == 'transit' and heading_error > 2 * align:
@@ -764,11 +875,38 @@ class PositionController(Node):
 
         if phase != getattr(self, '_guidance_phase', None):
             self.get_logger().info(f"Guidance: {phase} (distance {distance:.1f} m)")
+            if path_following and getattr(self, '_guidance_phase', None) == 'transit':
+                self.get_logger().info(
+                    f"ALOS: crab angle estimate {np.degrees(self._alos.beta_hat):.1f} deg, "
+                    f"max cross-track error {self._max_cross_track:.2f} m")
+            if path_following and phase == 'transit':
+                self._u_ref = float(self.latest_odom.twist.twist.linear.x)
         self._guidance_phase = phase
         if phase == 'turn':
-            return np.array([*self._guidance_hold, bearing])
+            return np.array([*self._guidance_hold, course])
+        if phase == 'transit' and path_following:
+            # speed along the path: ramp down to arrive_speed at approach_radius
+            g = lambda n: self.get_parameter(f'guidance.{n}').value
+            a = g('transit_accel')
+            left = max(self._alos.remaining(x, y) - radius, 0.0)
+            speed = g('reverse_speed') if reverse else g('forward_speed')
+            u_d = min(speed, np.sqrt(g('arrive_speed')**2 + 2 * a * left))
+            self._path_command = (course, -u_d if reverse else u_d)
+            return None
         if phase == 'transit':
-            return np.array([self.target_x, self.target_y, bearing])
+            return np.array([self.target_x, self.target_y, course])
+        if phase == 'arrive':
+            return np.array([self.target_x, self.target_y, self._guidance_heading])
+        if getattr(self, '_final_turn', False):
+            # ramp the heading reference to the final heading: a fast large turn at the goal needs
+            # nearly all the thrust and the allocation gives up sway, so the boat slid ~0.5 m away
+            rate = np.radians(self.get_parameter('guidance.final_turn_rate_deg_s').value)
+            step = wrap_to_pi(self.target_yaw - self._guidance_heading)
+            step_max = rate * self.dt
+            self._guidance_heading = wrap_to_pi(self._guidance_heading + np.clip(step, -step_max, step_max))
+            if abs(step) < 1e-3:
+                self._final_turn = False
+            return np.array([self.target_x, self.target_y, self._guidance_heading])
         return goal
 
     def _publish_wrench(self, fx, fy, mz):
@@ -845,6 +983,7 @@ class PositionController(Node):
         self.target_x = target_in_odom.pose.position.x
         self.target_y = target_in_odom.pose.position.y
         self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
+        self._final_turn = False
 
         self.get_logger().info(
             f"Target position: ({self.target_x}, {self.target_y})")

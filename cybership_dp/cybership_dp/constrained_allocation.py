@@ -2,8 +2,10 @@
 Constrained thrust allocation with slack (Fossen 2021, Sec. 11.2.3), in two stages per time step:
 
   1. Direction:  unconstrained extended-thrust solution u_e = T_e^+ tau gives the direction each
-                 azimuth should point, alpha* = atan2(F_y, F_x) (eq. 11.23-11.24). The azimuth turns
-                 towards it at its own rate (thruster dynamics), so alpha* is only a set-point.
+                 azimuth should point, alpha* = atan2(F_y, F_x) (eq. 11.23-11.24). The propeller turns
+                 both ways, so alpha* + pi with reverse thrust gives the same force: the set-point is
+                 whichever is closer to the actual angle (no half turn when the demand changes sign).
+                 The azimuth turns towards it at its own rate, so alpha* is only a set-point.
 
   2. Forces:     with every azimuth at the angle it ACTUALLY has, solve the convex QP
 
@@ -21,6 +23,10 @@ import math
 
 import numpy as np
 from scipy.optimize import lsq_linear
+
+
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 def _column(direction, x, y):
@@ -56,7 +62,8 @@ class ConstrainedAllocator:
                 self.lb.append(-float(t.get("reverse_ratio", 1.0)) * f_max)
             else:
                 cols_e += [_column(0.0, x, y), _column(math.pi / 2, x, y)]; w_e += [weight, weight]
-                self.lb.append(0.0)  # an azimuth pushes forward along its angle
+                # the azimuth propeller turns both ways: negative = reverse along its angle
+                self.lb.append(-float(t.get("reverse_ratio", 1.0)) * f_max)
                 self.alpha_cmd[t["name"]] = 0.0
             self.ub.append(f_max)
         self.T_e = np.column_stack(cols_e)                    # extended thrust configuration, 3 x n_e
@@ -73,8 +80,11 @@ class ConstrainedAllocator:
             cols.append(_column(d, x, y))
         return np.column_stack(cols)
 
-    def desired_angles(self, tau):
-        """Stage 1: azimuth set-points from the unconstrained extended-thrust solution."""
+    def desired_angles(self, tau, angles=None):
+        """
+        Stage 1: azimuth set-points from the unconstrained extended-thrust solution, alpha* or
+        alpha* + pi (reverse thrust), whichever is closer to the actual angle in 'angles'.
+        """
         u_e = self.T_e_pinv @ tau
         k = 0
         for t in self.thrusters:
@@ -83,7 +93,12 @@ class ConstrainedAllocator:
                 continue
             fx, fy = u_e[k], u_e[k + 1]
             if math.hypot(fx, fy) >= self.angle_threshold:
-                self.alpha_cmd[t["name"]] = math.atan2(fy, fx)
+                a = math.atan2(fy, fx)
+                current = (angles or {}).get(t["name"], self.alpha_cmd[t["name"]])
+                flipped = _wrap(a + math.pi)
+                if abs(_wrap(flipped - current)) < abs(_wrap(a - current)):
+                    a = flipped
+                self.alpha_cmd[t["name"]] = a
             k += 2
         return dict(self.alpha_cmd)
 
@@ -94,7 +109,7 @@ class ConstrainedAllocator:
         Returns (forces f [one per thruster, along its actual direction], alpha set-points, slack s).
         """
         tau = np.asarray(tau, dtype=float).reshape(3)
-        alpha_cmd = self.desired_angles(tau)
+        alpha_cmd = self.desired_angles(tau, angles)
         T = self.T(angles)
         # min |sqrt(Q) (T f - tau)|^2 + |sqrt(W) f|^2  subject to bounds  (= the QP above)
         A = np.vstack([np.sqrt(self.Q)[:, None] * T, np.diag(np.sqrt(self.w))])

@@ -159,9 +159,10 @@ class VesselForceControllerROS(BaseForceControllerROS):
             if t["type"] == "fixed":
                 msg.force.x = float(f_i)
             else:
-                # Direction = angle set-point, length = thrust. A tiny vector turns the azimuth without thrust.
+                # Direction = angle set-point, signed length = thrust (< 0: reverse along the angle).
+                # A tiny vector turns the azimuth without thrust.
                 a = alpha_cmd[t["name"]]
-                mag = max(float(f_i), 1e-3)
+                mag = float(f_i) if abs(f_i) > 1e-3 else 1e-3
                 msg.force.x, msg.force.y = mag * math.cos(a), mag * math.sin(a)
             pub.publish(msg)
         s = Wrench()

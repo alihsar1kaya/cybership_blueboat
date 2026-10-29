@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Microampere DP</title>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --ink:#1d2733; --muted:#6b7785; --line:#dde3ea; --accent:#1f6feb;
+          --goal:#1a9e5a; --target:#e8890c; --stop:#d92d20; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  .app { display:grid; grid-template-columns:1fr 300px; grid-template-rows:1fr auto; gap:12px; height:100vh; padding:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  #mapcard { position:relative; padding:0; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; cursor:crosshair; }
+  .hint { position:absolute; left:12px; top:10px; color:var(--muted); font-size:13px; background:#fffc; padding:2px 6px; border-radius:6px; }
+  .zoom { position:absolute; right:10px; top:10px; display:flex; flex-direction:column; gap:4px; }
+  .zoom button { width:34px; height:34px; font-size:18px; }
+  .side { display:flex; flex-direction:column; gap:12px; grid-row:1 / 3; grid-column:2; overflow:auto; }
+  h2 { margin:0 0 10px; font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  label { display:block; margin:8px 0 4px; color:var(--muted); font-size:13px; }
+  input[type=number] { width:100%; padding:8px; font-size:15px; border:1px solid var(--line); border-radius:6px; }
+  input[type=range] { width:100%; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:8px; padding:9px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); width:100%; margin-top:10px; }
+  button.secondary { width:100%; margin-top:8px; }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; justify-content:space-between; align-items:center; }
+  .switch { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .switch button { border:0; border-radius:0; padding:6px 14px; }
+  .switch button.on { background:var(--accent); color:#fff; }
+  #stop { width:100%; padding:22px; font-size:22px; font-weight:700; letter-spacing:.08em; color:#fff;
+          background:var(--stop); border:0; border-radius:12px; }
+  #stop.resume { background:var(--goal); }
+  .status { display:flex; gap:28px; align-items:center; flex-wrap:wrap; }
+  .big { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .small { color:var(--muted); font-size:13px; }
+  .bars { display:flex; gap:14px; }
+  .bar { width:70px; }
+  .bar .track { height:10px; background:#e9edf2; border-radius:5px; overflow:hidden; }
+  .bar .fill { height:100%; width:0; background:var(--accent); transition:width .1s; }
+  #mode { padding:4px 10px; border-radius:20px; background:#e9edf2; font-weight:600; }
+  #mode.stop { background:var(--stop); color:#fff; }
+  #conn { font-size:12px; }
+  @media (max-width: 760px) {
+    .app { grid-template-columns:1fr; grid-template-rows:55vh auto auto; height:auto; }
+    .side { grid-row:auto; grid-column:auto; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="card" id="mapcard">
+    <canvas id="map"></canvas>
+    <div class="hint">Klikk i kartet for å velge mål</div>
+    <div class="zoom"><button id="zin" title="Zoom inn">+</button><button id="zout" title="Zoom ut">−</button></div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h2>Mål</h2>
+      <div class="small" id="target">Ingen punkt valgt</div>
+      <label for="heading">Kurs ved målet (grader, 0 = nord, 90 = øst)</label>
+      <input id="heading" type="number" step="5" placeholder="behold nåværende kurs">
+      <button class="primary" id="go" disabled>Kjør dit</button>
+      <button class="secondary" id="hold">Hold her</button>
+    </div>
+
+    <div class="card" id="seacard" hidden>
+      <h2>Sjø (bare simulator)</h2>
+      <div class="row"><span>Bølger</span>
+        <div class="switch"><button id="woff" class="on">av</button><button id="won">på</button></div></div>
+      <label>Bølgehøyde <b id="hsv">0.10</b> m</label>
+      <input id="hs" type="range" min="0.05" max="0.3" step="0.05" value="0.1">
+      <label>Bølgene går mot <b id="wdv">0</b>°</label>
+      <input id="wd" type="range" min="0" max="350" step="10" value="0">
+      <label>Strøm <b id="cv">0.00</b> m/s</label>
+      <input id="cur" type="range" min="0" max="0.3" step="0.05" value="0">
+      <label>Strømmen går mot <b id="cdv">0</b>°</label>
+      <input id="cd" type="range" min="0" max="350" step="10" value="0">
+    </div>
+
+    <button id="stop">STOPP</button>
+    <div class="small" id="conn">Kobler til …</div>
+  </div>
+
+  <div class="card status">
+    <div><div class="small">Status</div><span id="mode">–</span></div>
+    <div><div class="small">Avstand til mål</div><div class="big" id="dist">–</div></div>
+    <div><div class="small">Kursfeil</div><div class="big" id="dpsi">–</div></div>
+    <div><div class="small">Thrustere (andel av maks)</div><div class="bars" id="bars"></div></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let ws, S = null, target = null, track = [], span = 12, pending = {};
+const canvas = $("map"), ctx = canvas.getContext("2d");
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => $("conn").textContent = "Tilkoblet";
+  ws.onclose = () => { $("conn").textContent = "Mistet kontakt, prøver igjen …"; setTimeout(connect, 1000); };
+  ws.onmessage = e => { S = JSON.parse(e.data); update(); };
+}
+const send = o => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+// --- map: NED (x north, y east), north up --------------------------------------------------------
+let view = { cx: 0, cy: 0, k: 40 };   // centre (north, east) and pixels per metre
+function fit() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = r.width * devicePixelRatio; canvas.height = r.height * devicePixelRatio;
+  const pts = [];
+  if (S && S.pose) pts.push(S.pose);
+  if (S && S.goal) pts.push(S.goal);
+  if (target) pts.push([target.x, target.y]);
+  if (!pts.length) return;
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const need = Math.max(span, (Math.max(...xs) - Math.min(...xs)) * 1.4, (Math.max(...ys) - Math.min(...ys)) * 1.4);
+  view.cx += (cx - view.cx) * 0.15; view.cy += (cy - view.cy) * 0.15;
+  view.k = Math.min(canvas.width, canvas.height) / need;
+}
+const toPx = (n, e) => [canvas.width / 2 + (e - view.cy) * view.k, canvas.height / 2 - (n - view.cx) * view.k];
+const toNE = (px, py) => [view.cx - (py - canvas.height / 2) / view.k, view.cy + (px - canvas.width / 2) / view.k];
+
+function draw() {
+  fit();
+  const W = canvas.width, H = canvas.height, d = devicePixelRatio;
+  ctx.clearRect(0, 0, W, H);
+  // grid: 1 m, every 5 m darker
+  const step = view.k * 1 < 8 * d ? 5 : 1;
+  const [n0, e0] = toNE(0, H), [n1, e1] = toNE(W, 0);
+  ctx.lineWidth = 1;
+  for (let e = Math.floor(e0 / step) * step; e <= e1; e += step) {
+    ctx.strokeStyle = Math.round(e) % 5 === 0 ? "#d3dae3" : "#eef1f5";
+    const [x] = toPx(0, e); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let n = Math.floor(n0 / step) * step; n <= n1; n += step) {
+    ctx.strokeStyle = Math.round(n) % 5 === 0 ? "#d3dae3" : "#eef1f5";
+    const [, y] = toPx(n, 0); ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  // scale bar and north arrow
+  ctx.fillStyle = "#6b7785"; ctx.font = `${12 * d}px system-ui`;
+  const sb = step * view.k; ctx.fillRect(14 * d, H - 18 * d, sb, 3 * d);
+  ctx.fillText(`${step} m`, 14 * d, H - 24 * d);
+  ctx.fillText("N ↑", W - 40 * d, H - 14 * d);
+  // track
+  if (track.length > 1) {
+    ctx.strokeStyle = "#9db7d8"; ctx.lineWidth = 2 * d; ctx.beginPath();
+    track.forEach((p, i) => { const [x, y] = toPx(p[0], p[1]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke();
+  }
+  if (S && S.goal) marker(S.goal[0], S.goal[1], S.goal[2], "#1a9e5a", false);
+  if (target) marker(target.x, target.y, headingRad(), "#e8890c", true);
+  if (S && S.pose) boat(...S.pose);
+  requestAnimationFrame(draw);
+}
+function marker(n, e, psi, color, dashed) {
+  const [x, y] = toPx(n, e), d = devicePixelRatio, r = Math.max(0.3 * view.k, 7 * d);
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5 * d; ctx.setLineDash(dashed ? [5 * d, 4 * d] : []);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]);
+  if (psi !== null) {
+    const L = r * 2.2; ctx.beginPath(); ctx.moveTo(x, y);
+    ctx.lineTo(x + L * Math.sin(psi), y - L * Math.cos(psi)); ctx.stroke();
+  }
+}
+function boat(n, e, psi) {
+  const [x, y] = toPx(n, e), d = devicePixelRatio, k = Math.max(view.k, 22 * d);  // never smaller than ~1 cm on screen
+  ctx.save(); ctx.translate(x, y); ctx.rotate(psi);
+  ctx.fillStyle = "#1d2733";
+  for (const s of [-1, 1]) {           // two hulls, 1.2 m long, 0.58 m apart
+    ctx.beginPath(); ctx.moveTo(s * 0.29 * k - 0.08 * k, 0.6 * k); ctx.lineTo(s * 0.29 * k + 0.08 * k, 0.6 * k);
+    ctx.lineTo(s * 0.29 * k + 0.08 * k, -0.4 * k); ctx.lineTo(s * 0.29 * k, -0.6 * k);
+    ctx.lineTo(s * 0.29 * k - 0.08 * k, -0.4 * k); ctx.closePath(); ctx.fill();
+  }
+  ctx.fillRect(-0.29 * k, -0.15 * k, 0.58 * k, 0.3 * k);
+  ctx.fillStyle = "#1f6feb"; ctx.beginPath(); ctx.arc(0, -0.15 * k, 0.07 * k, 0, 2 * Math.PI); ctx.fill();
+  ctx.restore();
+}
+canvas.addEventListener("click", ev => {
+  const r = canvas.getBoundingClientRect(), d = devicePixelRatio;
+  const [n, e] = toNE((ev.clientX - r.left) * d, (ev.clientY - r.top) * d);
+  target = { x: n, y: e };
+  $("target").textContent = `Valgt punkt: ${n.toFixed(1)} m nord, ${e.toFixed(1)} m øst`;
+  $("go").disabled = false;
+});
+$("zin").onclick = () => span = Math.max(3, span / 1.5);
+$("zout").onclick = () => span = Math.min(200, span * 1.5);
+canvas.addEventListener("wheel", ev => { ev.preventDefault(); span = Math.min(200, Math.max(3, span * (ev.deltaY > 0 ? 1.2 : 1 / 1.2))); });
+
+const headingDeg = () => $("heading").value === "" ? null : Number($("heading").value);
+const headingRad = () => headingDeg() === null ? (S && S.pose ? S.pose[2] : 0) : headingDeg() * Math.PI / 180;
+$("go").onclick = () => { if (!target) return; send({ cmd: "goal", x: target.x, y: target.y, heading_deg: headingDeg() });
+                          target = null; $("go").disabled = true; $("target").textContent = "Mål sendt"; };
+$("hold").onclick = () => { target = null; send({ cmd: "hold" }); };
+$("stop").onclick = () => send({ cmd: S && S.stopped ? "resume" : "stop" });
+
+// --- sea --------------------------------------------------------------------------------------------
+function sea(values) { Object.assign(pending, values); send({ cmd: "sea", values }); }
+$("won").onclick = () => sea({ Hs: Number($("hs").value) });
+$("woff").onclick = () => sea({ Hs: 0 });
+$("hs").oninput = () => $("hsv").textContent = Number($("hs").value).toFixed(2);
+$("hs").onchange = () => { if (S.sea && S.sea.Hs > 0) sea({ Hs: Number($("hs").value) }); };
+$("wd").oninput = () => $("wdv").textContent = $("wd").value;
+$("wd").onchange = () => sea({ wave_dir: Number($("wd").value) });
+$("cur").oninput = () => $("cv").textContent = Number($("cur").value).toFixed(2);
+$("cur").onchange = () => sea({ current: Number($("cur").value) });
+$("cd").oninput = () => $("cdv").textContent = $("cd").value;
+$("cd").onchange = () => sea({ current_dir: Number($("cd").value) });
+let seaInit = false;
+
+// --- status -----------------------------------------------------------------------------------------
+function update() {
+  if (S.pose) {
+    const last = track[track.length - 1];
+    if (!last || Math.hypot(S.pose[0] - last[0], S.pose[1] - last[1]) > 0.03) track.push([S.pose[0], S.pose[1]]);
+    if (track.length > 3000) track.shift();
+  }
+  const m = $("mode");
+  if (S.stopped) { m.textContent = "STOPPET"; m.className = "stop"; }
+  else if (!S.goal) { m.textContent = "Venter på mål"; m.className = ""; }
+  else if (S.dist > 0.3) { m.textContent = "Kjører til mål"; m.className = ""; }
+  else { m.textContent = "Holder posisjon"; m.className = ""; }
+  $("dist").textContent = S.dist === undefined ? "–" : S.dist < 1 ? `${(S.dist * 100).toFixed(0)} cm` : `${S.dist.toFixed(1)} m`;
+  $("dpsi").textContent = S.dpsi_deg === undefined ? "–" : `${S.dpsi_deg.toFixed(1)}°`;
+  $("stop").textContent = S.stopped ? "FORTSETT" : "STOPP";
+  $("stop").className = S.stopped ? "resume" : "";
+  $("conn").textContent = `Tilkoblet · posisjon fra ${S.source}`;
+  const bars = $("bars");
+  if (bars.children.length !== S.thrusters.length)
+    bars.innerHTML = S.thrusters.map(t => `<div class="bar"><div class="small">${t.label}</div><div class="track"><div class="fill"></div></div></div>`).join("");
+  S.thrusters.forEach((t, i) => {
+    const f = bars.children[i].querySelector(".fill"), p = Math.min(1, Math.abs(t.f) / t.max);
+    f.style.width = `${(p * 100).toFixed(0)}%`; f.style.background = p > 0.9 ? "#d92d20" : "#1f6feb";
+  });
+  if (S.sea) {
+    $("seacard").hidden = false;
+    const on = S.sea.Hs > 0;
+    $("won").className = on ? "on" : ""; $("woff").className = on ? "" : "on";
+    $("hs").disabled = $("wd").disabled = !on;
+    if (!seaInit) {     // show the simulator's values once
+      if (on) { $("hs").value = S.sea.Hs; } $("wd").value = S.sea.wave_dir;
+      $("cur").value = S.sea.current; $("cd").value = S.sea.current_dir;
+      ["hs", "wd", "cur", "cd"].forEach(id => $(id).oninput());
+      seaInit = true;
+    }
+  }
+}
+connect();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

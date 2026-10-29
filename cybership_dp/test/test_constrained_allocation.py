@@ -61,11 +61,13 @@ def test_reverse_is_weaker_than_forward():
     assert f[0] == pytest.approx(-53.6, abs=0.1) and f[1] == pytest.approx(-53.6, abs=0.1)
 
 
-def test_azimuth_pointing_the_wrong_way_gives_no_thrust():
+def test_azimuth_pointing_the_other_way_reverses_instead_of_turning_around():
+    """Wants +Y while pointing -Y: reverse thrust at -90 deg (T200 pushes both ways), no half turn."""
     a = microampere()
-    f, alpha, _ = a.allocate([0, 30, 0], {"bow_azimuth": -math.pi / 2})   # wants +Y, points -Y
-    assert f[2] == pytest.approx(0, abs=1e-6)                             # no thrust the wrong way
-    assert math.degrees(alpha["bow_azimuth"]) == pytest.approx(90)        # but told to turn around
+    f, alpha, _ = a.allocate([0, 30, 0], {"bow_azimuth": -math.pi / 2})
+    assert math.degrees(alpha["bow_azimuth"]) == pytest.approx(-90)       # stays where it points
+    assert f[2] < -1.0                                                    # and pushes in reverse
+    assert f[2] >= -0.8 * 67 - 1e-6                                       # within the reverse limit
 
 
 def test_azimuth_set_point_holds_when_demand_is_tiny():

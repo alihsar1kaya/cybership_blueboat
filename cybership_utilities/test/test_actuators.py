@@ -127,3 +127,35 @@ def test_thruster_with_pwm_gives_small_forces():
     a = make_thruster({"type": "azimuth", "max_force": 67, "pwm": {"neutral": 1500, "deadzone": 25}})
     fx, fy = a.set_command(0.0, 0.3)
     assert math.hypot(fx, fy) == pytest.approx(0.3, abs=0.05) and a.pwm > 1525
+
+
+def test_azimuth_reverses_instead_of_a_half_turn():
+    """
+    A demand opposite to where the azimuth points is met in reverse at the same angle (T200 turns both
+    ways), not by turning 180 deg at 90 deg/s while pushing the wrong way.
+    """
+    a = AzimuthThruster(max_force=67, reverse_ratio=0.8, max_rate=math.radians(90))
+    a.set_command(0.0, 20.0)                  # +Y
+    for _ in range(300):
+        a.step(0.01)
+    assert math.degrees(a.angle) == pytest.approx(90, abs=1)
+    a.set_command(0.0, -20.0)                 # now -Y: reverse at +90 deg
+    for _ in range(50):
+        a.step(0.01)
+    fx, fy, ang = a.output()
+    assert math.degrees(ang) == pytest.approx(90, abs=1)      # did not turn
+    assert fy == pytest.approx(-20.0, rel=0.05)
+    # reverse is limited to 0.8 x 67 N
+    a.set_command(0.0, -100.0)
+    assert a.command[0] == pytest.approx(-0.8 * 67)
+
+
+def test_azimuth_mode_has_hysteresis():
+    """Near 90 deg off, small wiggles in the demand must not flip between forward and reverse."""
+    a = AzimuthThruster(max_force=67, reverse_ratio=0.8, max_rate=math.radians(90))
+    modes = []
+    for k in range(40):
+        ang = math.radians(90 + (5 if k % 2 else -5))     # demand direction wiggles around 90 deg off
+        a.set_command(10 * math.cos(ang), 10 * math.sin(ang))
+        modes.append(a.command[0] > 0)
+    assert len(set(modes)) == 1

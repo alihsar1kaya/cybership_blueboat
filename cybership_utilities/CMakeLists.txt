@@ -21,6 +21,7 @@ install(
 
 install(PROGRAMS
   nodes/web_interface_server.py
+  nodes/dp_web_gui.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

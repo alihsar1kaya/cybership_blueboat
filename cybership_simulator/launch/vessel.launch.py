@@ -4,6 +4,7 @@ Generic launch file for the configurable simulator.
     ros2 launch cybership_simulator vessel.launch.py vessel:=voyager
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere use_gui:=false
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.1
+    then open http://localhost:8080 (web GUI, web:=false to skip)
 
 Loads cybership_config/config/<vessel>/vessel.yaml. Unlike <vessel>.launch.py, the
 vessel name is not restricted to a fixed list. If a vessel has no URDF or RViz config
@@ -35,8 +36,10 @@ def _launch_setup(context, *args, **kwargs):
     lc = lambda name: launch.substitutions.LaunchConfiguration(name).perform(context)
     use_waves = lc("waves").lower() == "true"
     wave_hs, wave_tp, wave_dir = float(lc("wave_hs")), float(lc("wave_tp")), float(lc("wave_dir"))
-    if use_waves and wave_filter_w0 <= 0.0:
-        wave_filter_w0 = 2 * math.pi / wave_tp     # observer wave filter at the wave peak frequency
+    if wave_filter_w0 <= 0.0:
+        # observer wave filter always on at the wave peak frequency: waves can be switched on while running
+        # (web GUI), and the filter costs nothing in calm water (tools/observer_fair_test.py)
+        wave_filter_w0 = 2 * math.pi / wave_tp
     gnss = launch.substitutions.LaunchConfiguration("gnss").perform(context)
 
     # URDF: vessel-specific if it exists, else the generic 'any' model
@@ -90,7 +93,8 @@ def _launch_setup(context, *args, **kwargs):
         ),
     ]
     if use_dp:
-        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss)
+        web_port = int(lc("web_port")) if lc("web").lower() == "true" else 0
+        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss, web_port)
     if use_gui:
         # Desired force tau_d as WrenchStamped, so RViz can draw it (green arrow)
         actions.append(launch_ros.actions.Node(
@@ -109,7 +113,7 @@ def _launch_setup(context, *args, **kwargs):
     return actions
 
 
-def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard"):
+def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard", web_port=0):
     """Allocation, force mux, position controller and goal client (the DP stack), optionally the observer."""
     config_dir = os.path.join(get_package_share_directory("cybership_config"), "config")
     controller_params = os.path.join(config_dir, vessel, "controller_position.yaml")
@@ -173,6 +177,15 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gns
             name="position_control_client",
         ),
     ]
+    if web_port:
+        actions.append(launch_ros.actions.Node(
+            package="cybership_utilities",
+            executable="dp_web_gui.py",
+            namespace=vessel_name,
+            name="dp_web_gui",
+            output="screen",
+            parameters=[{"vessel_model": vessel, "port": web_port}],
+        ))
     if use_observer:
         actions.append(launch_ros.actions.Node(
             package="cybership_dp",
@@ -218,5 +231,9 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument(
             "wave_filter_omega0", default_value="0.0",
             description="Observer wave filter peak frequency [rad/s] (2 pi / Tp of the waves), 0 = off"),
+        launch.actions.DeclareLaunchArgument(
+            "web", default_value="true",
+            description="With dp:=true: simple web GUI (map, goals, STOP, sea state) on http://localhost:<web_port>"),
+        launch.actions.DeclareLaunchArgument("web_port", default_value="8080", description="Port of the web GUI"),
         launch.actions.OpaqueFunction(function=_launch_setup),
     ])

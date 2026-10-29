@@ -16,6 +16,9 @@ Both have:
 
 The azimuth follows the commanded direction alpha_d = atan2(f_y, f_x) by the shortest way at most
 max_rate, and pushes along the angle it actually has while turning (Fossen 2021, eq. 11.24-11.25).
+Its propeller turns both ways (T200): a force can be given at alpha_d forward or at alpha_d + pi in
+reverse, and the azimuth takes the one closer to where it points (no half turn when the demand changes
+sign, which made it push the wrong way for ~2 s at 90 deg/s and overshoot the heading).
 
 Defaults (no limits, instant) reproduce the old simulator, so vessels without actuator data behave
 as before.
@@ -106,38 +109,58 @@ class FixedThruster:
 
 
 class AzimuthThruster:
+    REVERSE_HYSTERESIS = math.radians(15)
+
     def __init__(self, max_force=np.inf, reverse_ratio=1.0, deadband=0.0, time_constant=0.0,
                  max_rate=np.inf, angle=0.0, pwm=None):
         self.max_force = float(max_force)
-        self.reverse_ratio = float(reverse_ratio)  # kept for completeness; alpha covers all directions
+        self.reverse_ratio = float(reverse_ratio)  # reverse thrust / forward thrust (0: forward only)
         self.deadband = float(deadband)
         self.time_constant = float(time_constant)
         self.max_rate = float(max_rate)            # [rad/s]
         self.angle = float(angle)                  # actual angle alpha [rad]
         self.angle_rate = 0.0
-        self.force = 0.0                           # actual thrust magnitude [N]
-        self.command = (0.0, 0.0)                  # (F_d, alpha_d)
-        self.pwm_curve = pwm                       # PwmThrusterCurve or None (thrust magnitude)
+        self.force = 0.0                           # actual thrust along the angle [N], < 0 in reverse
+        self.command = (0.0, 0.0)                  # (signed F_d, alpha_d)
+        self.pwm_curve = pwm                       # PwmThrusterCurve or None
+        self._reverse = False                      # pushing in reverse along the angle
         self.pwm = None
 
     def set_command(self, fx, fy):
         """
-        Extended thrust (fx, fy) -> magnitude and angle (Fossen eq. 11.24); magnitude saturated.
-        The direction of (fx, fy) is the angle set-point even when the magnitude is below the
-        deadband (the steering servo is independent of the throttle), so an allocation can turn
-        the azimuth without thrust by sending a tiny vector.
+        Extended thrust (fx, fy) -> signed thrust and angle (Fossen eq. 11.24), saturated.
+        The force is given forward at alpha_d = atan2(fy, fx) or in reverse at alpha_d + pi, whichever
+        angle is closer to the actual one (with REVERSE_HYSTERESIS so it does not toggle at 90 deg).
+        The direction is the angle set-point even when the magnitude is below the deadband (the
+        steering servo is independent of the throttle), so an allocation can turn the azimuth without
+        thrust by sending a tiny vector.
         """
         magnitude = math.hypot(fx, fy)
-        alpha_d = math.atan2(fy, fx) if magnitude > 0.0 else self.command[1]
+        if magnitude > 0.0:
+            alpha_fwd = math.atan2(fy, fx)
+            alpha_rev = _wrap(alpha_fwd + math.pi)
+            fwd_err = abs(_wrap(alpha_fwd - self.angle))
+            rev_err = abs(_wrap(alpha_rev - self.angle))
+            # switch mode only when the other one is clearly closer (hysteresis)
+            if self.reverse_ratio > 0.0:
+                if self._reverse and fwd_err < rev_err - self.REVERSE_HYSTERESIS:
+                    self._reverse = False
+                elif not self._reverse and rev_err < fwd_err - self.REVERSE_HYSTERESIS:
+                    self._reverse = True
+            if self._reverse:
+                alpha_d, signed = alpha_rev, -magnitude
+            else:
+                alpha_d, signed = alpha_fwd, magnitude
+        else:
+            alpha_d, signed = self.command[1], 0.0
+        signed = float(np.clip(signed, -self.reverse_ratio * self.max_force, self.max_force))
         if self.pwm_curve is not None:
-            self.pwm = self.pwm_curve.to_pwm(min(magnitude, self.max_force))
-            magnitude = self.pwm_curve.force(self.pwm)
-        elif magnitude < self.deadband:
-            self.command = (0.0, alpha_d)
-            return 0.0, 0.0
-        magnitude = min(magnitude, self.max_force)
-        self.command = (magnitude, alpha_d)
-        return magnitude * math.cos(alpha_d), magnitude * math.sin(alpha_d)
+            self.pwm = self.pwm_curve.to_pwm(signed)
+            signed = self.pwm_curve.force(self.pwm)
+        elif abs(signed) < self.deadband:
+            signed = 0.0
+        self.command = (signed, alpha_d)
+        return signed * math.cos(alpha_d), signed * math.sin(alpha_d)
 
     def step(self, dt):
         f_d, alpha_d = self.command
