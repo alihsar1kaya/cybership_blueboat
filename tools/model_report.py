@@ -22,7 +22,8 @@ import numpy as np
 from cybership_utilities.vessel_model import load_vessel_config, make_marine_craft, model_parameters
 
 WS = os.path.expanduser("~/ros_ws")
-DEFAULT_YAML = os.path.join(WS, "src/cybership_software_suite/cybership_config/config/microampere/vessel.yaml")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DEFAULT_YAML = os.path.join(REPO, "cybership_config/config/microampere/vessel.yaml")
 
 
 def modal_from_mdg(M, D, G):

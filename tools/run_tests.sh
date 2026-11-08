@@ -4,7 +4,7 @@
 #   VESSEL=voyager bash ~/ros_ws/tools/run_tests.sh
 VESSEL=${VESSEL:-voyager}
 WS=~/ros_ws
-REPO=$WS/src/cybership_software_suite
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 
 source /opt/ros/jazzy/setup.bash
 source $WS/venv/bin/activate

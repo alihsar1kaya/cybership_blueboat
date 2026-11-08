@@ -1,161 +1,244 @@
-[![DOI](https://zenodo.org/badge/811773554.svg)](https://doi.org/10.5281/zenodo.17233653)
+<div align="center">
 
-# cybership_common
+# Cybership BlueBoat — Dynamic Positioning Simulator
 
-This repository is the home of the CyberShip Software Suite - a collection of ROS 2 packages that together provide the tools to simulate, visualize, and control autonomous maritime vessels. The suite covers everything from the digital twin (URDF models and visualization) to real-time sensor integration (IMU, motion capture, etc.) and advanced control (dynamic positioning and thrust allocation).
+**A ROS 2 simulator and DP control stack for the BlueBoat catamaran *Microampere*,<br>built on Fossen's marine craft models.**
 
-## What's Included
+![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-E95420?logo=ubuntu&logoColor=white)
+![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-22314E?logo=ros&logoColor=white)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![License GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue)
 
-- **cybership_bringup**: Launch files to initialize all the necessary nodes for bringing up a vessel in a ROS 2 environment. This includes hardware drivers, localization, and sensor integration.
-- **cybership_simulator**: Simple Python scripts for vessel simulation using basic physics. Use these scripts to test vessel behavior in simulation.
-- **cybership_viz**: Nodes and configurations to visualize the vessel in RViz. This package provides a visual representation of the vessel using its URDF models.
-- **cybership_description**: URDF models and coordinate frame definitions for accurate vessel representation.
-- **cybership_config**: Centralized configuration files that are shared and used by various components in the suite.
-- **cybership_interfaces**: Common message and service definitions to standardize communication across the suite.
-- **Other modules**: Additional packages for utilities, thruster control, dynamic positioning, and sensor drivers like BNO055 and motion capture (mocap).
+<img src="docs/images/web_gui.png" alt="Web GUI: the boat has driven to a goal and holds position" width="820">
 
-# Installation
+<sub>The web GUI: click on the map to send the boat somewhere, switch waves and current on and off, STOP.</sub>
 
-Follow these steps to set up your ROS 2 workspace with the CyberShip Software Suite:
- > [!IMPORTANT]
- > Make sure that you have sourced the ROS 2 installation
- >
- > ```bash
- > source /opt/ros/<distro>/setup.bash
- > ```
- >
- > Replace `<distro>` with your ROS 2 distribution (e.g., `humble`, `jazzy`, `lyrical`, etc.).
+</div>
 
- > [!IMPORTANT]
- > make sure that you have `ros-dev-tools` installed. You can install it using:
- >
- >```bash
- >sudo apt install ros-<distro>-ros-dev-tools
- >```
+---
 
- > [!NOTE]
- > Guides assumes you have `$ROS_WORKSPACE` environment variable set to the root of your ROS 2 workspace. ROS workspace is usually is at `~/ros_ws` or similar. You can set this variable
- >
- > ```bash
- > export ROS_WORKSPACE=~/ros_ws
- > ```
- >
- > or add it to your shell configuration file (e.g., `~/.bashrc`) for persistence.
+## Contents
 
- > [!NOTE]
- > The following instructions assume you have already set up a ROS 2 workspace. If you haven't done so, you can create one using the following commands:
- >
- >```bash
- > mkdir -p $ROS_WORKSPACE/src
- > cd $ROS_WORKSPACE
- > colcon build
- > source install/setup.bash
- > ```
+- [What you get](#what-you-get)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Using the simulator](#using-the-simulator)
+- [How it works](#how-it-works)
+- [Tests and tools](#tests-and-tools)
+- [Repository layout](#repository-layout)
+- [Troubleshooting](#troubleshooting)
+- [Credits and license](#credits-and-license)
 
-## For the lazy ones
+## What you get
 
-You can use the provided installation script to automate the setup process:
+| | |
+|---|---|
+| 🚤 **Vessel model** | 6-DOF Fossen model of Microampere: added mass and damping from Capytaine on the hull CAD, restoring forces, CG offset, nonlinear damping |
+| 🌊 **Environment** | Ocean current and irregular waves (JONSWAP, short-crested) with motion RAOs |
+| 📡 **Sensors** | GNSS (standard or RTK) with lever arm and slow drift, compass and gyro, at their real rates |
+| 🧭 **Observer** | DP Kalman filter with wave filter and bias estimate (Fossen 13.4.6) |
+| 🎯 **Control** | Model-based DP controller, guidance that picks forward, reverse or sideways moves, optional ALOS path following |
+| ⚙️ **Thrusters** | Constrained allocation (QP) for two stern thrusters and a bow azimuth, T200 ESC/PWM model |
+| 🖥️ **Interfaces** | RViz with the real hull mesh, and a simple web GUI in the browser |
+
+## Requirements
+
+| What | Version |
+|---|---|
+| OS | **Ubuntu 24.04** |
+| ROS 2 | **Jazzy** (`ros-jazzy-desktop`) |
+| Python | 3.12 (comes with Ubuntu 24.04) |
+| Python packages | [`requirements.txt`](requirements.txt), installed in a venv |
+
+Install ROS 2 Jazzy first with the [official guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html), then:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NTNU-MCS/cybership_software_suite/refs/heads/master/lazy_install.sh | bash
+sudo apt install ros-jazzy-desktop ros-dev-tools python3-venv python3-pip \
+                 ros-jazzy-topic-tools ros-jazzy-nav2-msgs ros-jazzy-xacro
 ```
 
-## For the ones who like to read
+## Quick start
 
-1. **Clone the Repository and Submodules**
-
-   ```bash
-   cd $ROS_WORKSPACE/src
-   git clone https://github.com/NTNU-MCS/cybership_software_suite
-   cd cybership_software_suite
-   git submodule update --init --recursive
-
-2. Set Up a Python Virtual Environment
-
-    ```bash
-    cd $ROS_WORKSPACE
-    python3 -m venv venv --system-site-packages --symlinks
-    source venv/bin/activate
-    touch venv/COLCON_IGNORE
-    ```
-
-3. Install Python Dependencies
-
-    ```bash
-    cd $ROS_WORKSPACE
-    source venv/bin/activate
-    find src/cybership_software_suite -name "requirements*txt" -exec pip install -r {} \;
-    ```
-
-4. Install ROS Dependencies and Build
-
-    ```bash
-    cd $ROS_WORKSPACE
-    rosdep install --from-paths src -i
-    colcon build --symlink-install
-    ```
-
- > [!WARNING]
- > Make sure that you have initialized rosdep and sourced the ROS 2 environment before running the above command. You can do this by running:
- >
- > ```bash
- > source /opt/ros/<distro>/setup.bash
- > sudo rosdep init
- > rosdep update
- > ```
- >
- > Replace `<distro>` with your ROS 2 distribution (e.g., `humble`, `jazzy`, etc.).
- > If you encounter any issues with dependencies, please refer to the documentation of the specific package for additional instructions.
-
-1. Source the Environment
-
-    ```bash
-    source $ROS_WORKSPACE/venv/bin/activate
-    source $ROS_WORKSPACE/install/setup.bash
-    ```
-
-## Bringing Up a Vessel
-
-There are two main modes to bring up a vessel: physical and simulation.
-
-For a Physical Deployment:
-Use the cybership_bringup package. For example, to bring up the Voyager vessel, run:
+**1. Clone into a ROS workspace**
 
 ```bash
-ros2 launch cybership_bringup voyager.launch.py vessel_name:=voyager vessel_model:=voyager
+mkdir -p ~/ros_ws/src && cd ~/ros_ws/src
+git clone --recursive https://github.com/alihsar1kaya/cybership_blueboat.git
 ```
 
-You can similarly launch other vessel types like Enterprise or Drillship by choosing the corresponding launch file in cybership_bringup.
-
-For Simulation:
-Use the cybership_simulator package. This runs simplified physics scripts:
-
-## Visualization
-
-Visualize your vessel using the RViz visualization tools provided in the suite. The cybership_viz package sets up RViz with a preconfigured scene showing your vessel's URDF model and sensor data overlays. To launch visualization:
-
-Additionally, the cybership_description package can publish the URDF model via:
-
-## Additional Notes
-
-Dynamic Positioning:
-The cybership_dp package provides controllers for dynamic positioning. Launch the complete DP system or individual controllers as needed.
-
-## Sensor Integration & Drivers
-
-The suite integrates various sensors such as the BNO055 IMU and motion capture systems. Please refer to corresponding packages (e.g., cybership_external/bno055 and cybership_mocap) for detailed instructions.
-
-## Utilities and Interfaces
-
-Use the utility functions in cybership_utilities for standardized launch arguments and helper functions across your launch files. Common interfaces are provided in cybership_interfaces.
-
-# Docker
+**2. Python environment**
 
 ```bash
-docker compose --profile voyager up
+cd ~/ros_ws
+python3 -m venv venv --system-site-packages && touch venv/COLCON_IGNORE
+source /opt/ros/jazzy/setup.bash && source venv/bin/activate
+pip install -r src/cybership_blueboat/requirements.txt
 ```
 
-# Documentation
+**3. Build**
 
-The documentations is mostly done through readme files of the subpackages and inline comments.
-[Operational manual is available here.](docs/operational_manual.pdf)
+```bash
+sudo rosdep init 2>/dev/null; rosdep update
+rosdep install --from-paths src -i -y --rosdistro jazzy
+colcon build --symlink-install
+```
+
+**4. Run**
+
+```bash
+source install/setup.bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+```
+
+RViz opens with the boat. Open **http://localhost:8080** for the web GUI and click on the map to give it a goal. 🎉
+
+> **Every new terminal** needs the three `source` lines:
+> ```bash
+> cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && source install/setup.bash
+> ```
+
+## Using the simulator
+
+### Launch options
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true [options]
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `dp` | `false` | Start the DP stack (controller, allocation, guidance, web GUI) |
+| `observer` | `false` | Controller uses the Kalman filter estimate from simulated sensors instead of the true state |
+| `gnss` | `standard` | `standard` (~0.2 m noise and slow drift) or `rtk` (~2 cm) |
+| `waves` | `false` | Irregular waves from the start (can also be switched on in the GUI) |
+| `wave_hs` / `wave_tp` / `wave_dir` | `0.1` / `2.3` / `0` | Wave height [m], peak period [s], direction the waves travel towards [deg] |
+| `use_gui` | `true` | Start RViz |
+| `web` / `web_port` | `true` / `8080` | Web GUI on/off and its port |
+
+### Giving goals
+
+- **Web GUI**: click on the map, type the final heading in degrees (0 = north, 90 = east), press *Kjør dit* (go).
+- **RViz**: use *2D Goal Pose*.
+- **Command line**:
+  ```bash
+  ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: world}, pose: {position: {x: 5.0, y: 3.0}, orientation: {z: 0.383, w: 0.924}}}"
+  ```
+
+### Changing the sea while running
+
+```bash
+ros2 param set /microampere/sim environment.current.speed 0.15        # m/s
+ros2 param set /microampere/sim environment.current.direction_deg 90  # flows towards east
+ros2 param set /microampere/sim environment.waves.Hs 0.1              # m, 0 = no waves
+```
+
+> The web GUI labels are in Norwegian: *Mål* = goal, *Kjør dit* = go there, *Hold her* = hold here, *Bølger* = waves, *Strøm* = current, *STOPP* = stop (zero thrust), *FORTSETT* = resume.
+
+## How it works
+
+The stack follows Fossen's GNC block diagram. Each block is a ROS 2 node, so the simulator can later be swapped for the real boat's drivers without touching the rest.
+
+```mermaid
+flowchart LR
+    GUI["Web GUI / RViz<br/>goal"] -->|/goal_pose| CTRL
+    subgraph DP["DP stack (cybership_dp)"]
+        OBS["Observer<br/>Kalman filter"] -->|navigation/odom<br/>navigation/bias| CTRL["Guidance +<br/>DP controller"]
+        CTRL -->|force command| MUX["Mux<br/>(STOP)"]
+        MUX --> ALLOC["Thrust<br/>allocation"]
+    end
+    ALLOC -->|thruster commands| SIM
+    subgraph SIM["Simulator (cybership_simulator)"]
+        THR["Thrusters"] --> CRAFT["Marine craft<br/>6-DOF model"]
+        ENV["Current + waves"] --> CRAFT
+        CRAFT --> SENS["GNSS, compass,<br/>gyro"]
+    end
+    SENS -->|sensor/gnss<br/>sensor/imu| OBS
+```
+
+All boat data (mass, hull, hydrodynamics, damping, thrusters, sensors) lives in one file:
+[`cybership_config/config/microampere/vessel.yaml`](cybership_config/config/microampere/vessel.yaml). The simulator and the controller read the same file.
+
+<details>
+<summary><b>Model details</b></summary>
+
+| Block | Implementation | Reference |
+|---|---|---|
+| Kinematics, rigid body, Coriolis | `cybership_utilities/marine_craft/` | Fossen (2021) ch. 2–3 |
+| Added mass and damping | Capytaine radiation on the hull CAD, power-based averaging `hydro_capytaine.npz` | Fossen ch. 5–6, MSS |
+| Ocean current | relative velocity, Property 10.1 | ch. 10.3 |
+| Waves | JONSWAP + cos² spreading, force and motion RAOs, total = LF + WF | ch. 10.2 |
+| Sensors | `marine_craft/sensors.py` | ch. 13–14 |
+| Observer | `cybership_utilities/observer.py` (EKF with nonlinear damping, wave filter) | ch. 13.4.6 |
+| DP control | `cybership_dp/nodes/position_control_node.py` | ch. 15 |
+| Allocation | `cybership_dp/constrained_allocation.py` (QP with slack) | ch. 11.2.3 |
+| Path following | `cybership_dp/los.py` (ALOS), off by default | ch. 12.5, Fossen (2023) |
+
+</details>
+
+## Tests and tools
+
+```bash
+# unit tests (vessel model, sensors, observer, waves, allocation, ALOS)
+python3 -m pytest -q src/cybership_blueboat/cybership_utilities/test src/cybership_blueboat/cybership_dp/test
+```
+
+Headless scenario tests are in [`tools/`](tools/README.md), e.g.
+
+```bash
+GOAL="10 0 0" CURRENT="0.15 90" bash src/cybership_blueboat/tools/run_goal_motion_test.sh demo 0 observer:=true gnss:=rtk
+```
+
+Results are written to `~/ros_ws/results/`.
+
+## Repository layout
+
+```
+cybership_config/       vessel.yaml, controller settings, Capytaine hydrodynamics and tools
+cybership_simulator/    simulator node (vessel.py) and vessel.launch.py
+cybership_dp/           DP controller, guidance, ALOS, allocation, observer node
+cybership_utilities/    Fossen model, sensors, waves, Kalman filter, web GUI
+cybership_description/  URDF and hull meshes for RViz
+cybership_viz/          RViz configs
+tools/                  scenario tests and plots
+docs/                   original Cybership suite README and manual
+```
+
+The other packages (`cybership_bringup`, `cybership_mocap`, `cybership_thrusters`, ...) come from the original Cybership suite and are used for the lab vessels.
+
+## Troubleshooting
+
+<details>
+<summary><b>The web GUI does not open / "address already in use"</b></summary>
+
+Another simulator is still running. Stop it with `Ctrl+C`, or start on another port: `web_port:=8081`.
+</details>
+
+<details>
+<summary><b>Nothing happens in RViz, or two terminals do not see each other</b></summary>
+
+Both terminals must use the same `ROS_DOMAIN_ID` (check with `echo $ROS_DOMAIN_ID`) and must have sourced the workspace.
+</details>
+
+<details>
+<summary><b>The build fails in a hardware package</b></summary>
+
+Only the simulator packages are needed:
+
+```bash
+colcon build --symlink-install --packages-up-to cybership_simulator cybership_dp cybership_viz
+```
+</details>
+
+<details>
+<summary><b>NumPy errors after pip install</b></summary>
+
+ROS 2 Jazzy needs NumPy 1.x: `pip install "numpy<2"`.
+</details>
+
+## Credits and license
+
+- Built on the [**Cybership Software Suite**](https://github.com/NTNU-MCS/cybership_software_suite) by NTNU-MCS ([DOI 10.5281/zenodo.17233653](https://doi.org/10.5281/zenodo.17233653)). Its original README is in [`docs/README_cybership.md`](docs/README_cybership.md).
+- Models follow T. I. Fossen, *Handbook of Marine Craft Hydrodynamics and Motion Control* (2nd ed., Wiley 2021), and the [MSS toolbox](https://github.com/cybergalactic/MSS).
+- Hull geometry: [Blue Robotics BlueBoat](https://bluerobotics.com/store/boat/blueboat/blueboat/).
+- Licensed under **GPL-3.0**, see [`LICENSE.md`](LICENSE.md).

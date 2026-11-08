@@ -4,7 +4,7 @@
 #   bash tools/run_dp_wave_test.sh <Hs> <Tp> <direction_deg> <label> [launch args, e.g. observer:=true wave_filter_omega0:=2.7]
 source /opt/ros/jazzy/setup.bash; source ~/ros_ws/venv/bin/activate; source ~/ros_ws/install/setup.bash
 export ROS_DOMAIN_ID=79
-setsid ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true use_gui:=false "${@:5}" > /tmp/dpwave_$4.log 2>&1 &
+setsid ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true use_gui:=false web:=false "${@:5}" > /tmp/dpwave_$4.log 2>&1 &
 sleep 12
 ros2 param set /microampere/sim environment.waves.Tp $2 >/dev/null
 ros2 param set /microampere/sim environment.waves.direction_deg $3 >/dev/null
@@ -35,6 +35,6 @@ z = np.array(s["z"])
 print(f"{sys.argv[1]}: Hs realised {4*z.std():.2f} m | pos error mean {err.mean():.2f} m, max {err.max():.2f} m | "
       f"heading std {math.degrees(np.std(late[:, 3])):.1f} deg | thruster activity {act:.0f} N/s")
 PY
-pkill -INT -f "[v]essel.launch.py vessel:=microampere dp:=true use_gui:=false"; sleep 3
+pkill -INT -f "[v]essel.launch.py vessel:=microampere dp:=true use_gui:=false web:=false"; sleep 3
 for p in $(pgrep -f "[i]nstall/cybership_|[r]obot_state_publisher --ros-args|[s]tatic_transform_publisher --frame-id world|[t]opic_tools/mux"); do
   grep -q "ROS_DOMAIN_ID=79" /proc/$p/environ 2>/dev/null && kill -9 $p; done

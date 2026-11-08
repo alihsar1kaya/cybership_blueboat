@@ -40,8 +40,8 @@ start pos   ros2 launch cybership_dp position_controller.launch.py vessel_name:=
 sleep 6
 ros2 service call /$VESSEL/force_mux/select topic_tools_interfaces/srv/MuxSelect \
   '{topic: "control/force/command/position"}' > /dev/null
-start rec  python3 $WS/tools/record_dp.py $VESSEL "$OUT"
+start rec  python3 "$(dirname "$(readlink -f "$0")")"/record_dp.py $VESSEL "$OUT"
 sleep 1
 
-python3 $WS/tools/four_corner_wait.py $VESSEL
+python3 "$(dirname "$(readlink -f "$0")")"/four_corner_wait.py $VESSEL
 echo "Data lagret i $OUT"

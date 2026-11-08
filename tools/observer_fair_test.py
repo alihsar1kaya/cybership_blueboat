@@ -16,7 +16,7 @@ from multiprocessing import Pool
 import numpy as np
 from scipy.optimize import minimize
 
-REPO = os.path.expanduser("~/ros_ws/src/cybership_software_suite")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # repo root, whatever its folder name
 sys.path.insert(0, f"{REPO}/cybership_observer/src")
 sys.path.insert(0, f"{REPO}/cybership_utilities/test")
 from cybership_observer.observer import LuenbergerObserver  # noqa: E402

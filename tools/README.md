@@ -1,6 +1,6 @@
 # Test and plot scripts (Microampere DP)
 
-Run from `~/ros_ws` (`~/ros_ws/tools` is a symlink to this folder). Headless tests use ROS_DOMAIN_ID 81.
+Run from `~/ros_ws` with the workspace sourced, e.g. `bash src/<repo>/tools/run_goal_motion_test.sh demo 0`. Headless tests use their own ROS_DOMAIN_ID and no web GUI, so they do not disturb a running simulator.
 
 | Script | What it does |
 |---|---|

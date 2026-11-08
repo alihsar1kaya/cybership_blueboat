@@ -10,7 +10,7 @@ source $WS/venv/bin/activate
 source $WS/install/setup.bash
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-49}
 
-setsid ros2 launch cybership_simulator vessel.launch.py vessel:=$VESSEL dp:=true use_gui:=false "${@:3}" \
+setsid ros2 launch cybership_simulator vessel.launch.py vessel:=$VESSEL dp:=true use_gui:=false web:=false "${@:3}" \
   > /tmp/dp_step_$VESSEL.log 2>&1 &
 LAUNCH=$!
 cleanup() {
@@ -19,4 +19,4 @@ cleanup() {
 trap cleanup EXIT
 sleep 10
 
-python3 $WS/tools/dp_step_test.py --vessel $VESSEL --label $LABEL
+python3 "$(dirname "$(readlink -f "$0")")"/dp_step_test.py --vessel $VESSEL --label $LABEL
