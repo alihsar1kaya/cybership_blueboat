@@ -68,7 +68,7 @@ class ConstrainedAllocator:
             self.ub.append(f_max)
         self.T_e = np.column_stack(cols_e)                    # extended thrust configuration, 3 x n_e
         W_inv = np.diag(1.0 / np.asarray(w_e))
-        self.T_e_pinv = W_inv @ self.T_e.T @ np.linalg.inv(self.T_e @ W_inv @ self.T_e.T)  # weighted pinv
+        self.T_e_pinv = W_inv @ self.T_e.T @ np.linalg.pinv(self.T_e @ W_inv @ self.T_e.T)  # weighted pinv (pinv: also for fewer than 3 DOF, e.g. no bow thruster)
         self.lb, self.ub, self.w = map(np.asarray, (self.lb, self.ub, self.w))
 
     def T(self, angles):
