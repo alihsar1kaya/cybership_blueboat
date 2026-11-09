@@ -174,6 +174,24 @@ The scripts in [`tools/`](tools/README.md) do this for you and log the result. T
 GOAL="10 0 0" CURRENT="0.15 90" bash src/cybership_blueboat/tools/run_goal_motion_test.sh demo 0 observer:=true gnss:=rtk
 ```
 
+### 8. Sensor delays and GNSS problems
+
+The simulator delays the sensors and the thruster commands the way real hardware does: GNSS arrives about 0.1 s after the measurement, and a thruster reacts about 0.05 s after the command. The values are under `latency` in `vessel.yaml`. The Kalman filter knows when each GNSS fix was taken and corrects for the delay.
+
+You can also take the GNSS away while the boat holds position:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+# in a second terminal:
+ros2 param set /microampere/sim sensors.gnss.available false   # GNSS gone
+ros2 param set /microampere/sim sensors.gnss.available true    # back
+ros2 param set /microampere/sim sensors.gnss.rtk_fix false     # RTK fix lost, accuracy drops to ~20-50 cm
+ros2 param set /microampere/sim sensors.gnss.rtk_fix true      # fix back
+ros2 param set /microampere/sim sensors.gnss.outage_rate 1     # random outages, about one per minute
+```
+
+Without GNSS the filter keeps going on the boat model and the compass (dead reckoning), and the observer prints a warning. In a 0.1 m/s current the boat drifted at most 8 cm during a 20 s outage, then returned once GNSS came back. Losing the RTK fix is worse: the boat follows the receiver's slow error and wanders 20–40 cm, because nothing tells it the position is wrong.
+
 ### Switching the controller off and on
 
 ```bash
@@ -204,7 +222,7 @@ Add them to the end of the `ros2 launch` line as `name:=value`. They are read on
 | `wind_dir` | `0` | deg | direction the wind blows towards |
 | `use_gui` | `true` | | start RViz |
 
-### Weather while running
+### Weather and sensors while running
 
 Change these with `ros2 param set /microampere/sim <name> <value>`. They take effect at once.
 
@@ -220,6 +238,10 @@ Change these with `ros2 param set /microampere/sim <name> <value>`. They take ef
 | `environment.wind.mu` | `0` | 1/s | how fast gusts return to the mean |
 | `environment.current.speed` | `0` | m/s | current speed, 0 turns it off |
 | `environment.current.direction_deg` | `0` | deg | direction the current flows towards |
+| `sensors.gnss.available` | `true` | | false simulates a GNSS outage |
+| `sensors.gnss.rtk_fix` | `true` | | false makes an RTK receiver fall back to normal accuracy (only with `gnss:=rtk`) |
+| `sensors.gnss.outage_rate` | `0` | 1/min | random outages per minute, 0 for none |
+| `sensors.gnss.outage_duration` | `10` | s | length of each random outage |
 
 Directions use the marine convention: x is north, y is east, and 90° is east. Wind, waves and current are all given as the direction they move towards, so a wind coming from the north is `wind_dir:=180`.
 
@@ -234,6 +256,7 @@ All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybershi
 | `model` | mass, inertia, hydrodynamics, damping and the wind areas |
 | `thrusters` | one entry per thruster with position, direction and strength |
 | `sensors` | rate and noise for GNSS, compass and gyro |
+| `latency` | delays of GNSS, IMU and thruster commands, in seconds |
 | `allocation` | how the total force is split between the thrusters |
 
 Each value has a comment saying where it came from. The ones marked ESTIMATE still need measuring on the real boat.

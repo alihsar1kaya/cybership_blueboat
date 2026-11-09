@@ -30,6 +30,7 @@ Run:
 """
 
 import copy
+import heapq
 import math
 import os
 
@@ -47,7 +48,7 @@ from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster
 from cybership_utilities.marine_craft.environment import OceanCurrent, Wind
-from cybership_utilities.marine_craft.sensors import make_sensors
+from cybership_utilities.marine_craft.sensors import Gnss, gnss_config, make_sensors
 from cybership_utilities.marine_craft.waves import make_waves
 from cybership_utilities import hydro
 from std_msgs.msg import Float64
@@ -312,6 +313,11 @@ class ConfigurableSimulator(BaseSimulator):
     # ------------------------------------------------------------------------
 
     def _on_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
+        """A command arrives; it acts after the command latency (computer -> ESC -> motor)."""
+        self._later(getattr(self, "_latency", {}).get("thrusters", 0.0),
+                    lambda: self._apply_thruster_command(t, msg))
+
+    def _apply_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
         """Store the command; the actuator model turns it into actual thrust in iterate()."""
         name = t["name"]
         fx, fy = self._actuators[name].set_command(msg.force.x, msg.force.y)
@@ -335,6 +341,20 @@ class ConfigurableSimulator(BaseSimulator):
         self._sensors = make_sensors(self.config, seed=None if seed < 0 else seed,
                                      gnss_profile=self.get_parameter("sensors.gnss_profile").value)
         self._noise_rng = np.random.default_rng(None if seed < 0 else seed + 1)
+        # Latency (vessel.yaml 'latency', seconds): sensor messages are published that long after the
+        # measurement (stamped with the measurement time), thruster commands act that long after arrival.
+        lat = self.config.get("latency") or {}
+        self._latency = {k: float(lat.get(k, 0.0)) for k in ("gnss", "imu", "thrusters")}
+        self._queue, self._queue_n = [], 0
+        # GNSS outages and RTK fix loss (Fossen 13.4.4: the observer dead-reckons without GNSS)
+        for name, default in (("sensors.gnss.available", True), ("sensors.gnss.rtk_fix", True),
+                              ("sensors.gnss.outage_rate", 0.0), ("sensors.gnss.outage_duration", 10.0)):
+            self.declare_parameter(name, default, ParameterDescriptor(dynamic_typing=True))
+        self._gnss_outage_until = -1.0
+        self._gnss_float = None
+        if self.get_parameter("sensors.gnss_profile").value == "rtk" and "gnss" in self._sensors:
+            # what the RTK receiver gives without a fix: the standard receiver's errors
+            self._gnss_float = Gnss(rng=self._noise_rng, **gnss_config(self.config, "standard"))
         self._pub_gnss = self.create_publisher(NavSatFix, "sensor/gnss", 10)
         self._pub_gnss_ned = self.create_publisher(geometry_msgs.msg.PointStamped, "sensor/gnss/ned", 10)
         self._pub_imu = self.create_publisher(Imu, "sensor/imu", 10)
@@ -345,7 +365,33 @@ class ConfigurableSimulator(BaseSimulator):
         self._last_psi = None
         self.get_logger().info(f"Sensors: {sorted(self._sensors)}, GNSS "
                                f"{self.get_parameter('sensors.gnss_profile').value}, noisy odom "
-                               f"{self.get_parameter('sensors.noisy_odom').value}")
+                               f"{self.get_parameter('sensors.noisy_odom').value}, latency {self._latency} s")
+
+    def _later(self, delay, fn):
+        """Run fn after 'delay' seconds of simulation time (immediately if delay <= 0)."""
+        if delay <= 0:
+            fn()
+            return
+        self._queue_n += 1
+        heapq.heappush(self._queue, (self._step_count * self.dt + delay, self._queue_n, fn))
+
+    def _run_due(self):
+        t = self._step_count * self.dt
+        while self._queue and self._queue[0][0] <= t + 1e-9:
+            heapq.heappop(self._queue)[2]()
+
+    def _gnss_available(self, t):
+        g = lambda n: self.get_parameter(f"sensors.gnss.{n}").value
+        if not g("available"):
+            return False
+        if t < self._gnss_outage_until:
+            return False
+        rate = float(g("outage_rate"))      # outages per minute
+        if rate > 0 and self._noise_rng.random() < rate / 60.0 * self.dt:
+            self._gnss_outage_until = t + float(g("outage_duration"))
+            self.get_logger().warn(f"GNSS outage for {float(g('outage_duration')):.0f} s")
+            return False
+        return True
 
     def _publish_path(self):
         pose = geometry_msgs.msg.PoseStamped()
@@ -364,19 +410,23 @@ class ConfigurableSimulator(BaseSimulator):
         eta, nu = self.vessel.get_states()
         stamp = self.get_clock().now().to_msg()
         if "gnss" in self._sensors:
-            m = self._sensors["gnss"].update(t, eta, nu)
-            if m is not None:
+            rtk_lost = self._gnss_float is not None and not self.get_parameter("sensors.gnss.rtk_fix").value
+            gnss = self._gnss_float if rtk_lost else self._sensors["gnss"]
+            m = gnss.update(t, eta, nu)
+            if m is not None and self._gnss_available(t):
                 fix = NavSatFix()
                 fix.header.stamp, fix.header.frame_id = stamp, self._frame("gnss_link")
-                fix.status.status, fix.status.service = NavSatStatus.STATUS_FIX, NavSatStatus.SERVICE_GPS
+                rtk = self._gnss_float is not None and not rtk_lost
+                fix.status.status = NavSatStatus.STATUS_GBAS_FIX if rtk else NavSatStatus.STATUS_FIX
+                fix.status.service = NavSatStatus.SERVICE_GPS
                 fix.latitude, fix.longitude, fix.altitude = m["lat"], m["lon"], m["alt"]
                 fix.position_covariance = [m["sigma"] ** 2, 0.0, 0.0, 0.0, m["sigma"] ** 2, 0.0, 0.0, 0.0, 1.0]
                 fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
-                self._pub_gnss.publish(fix)
                 ned = geometry_msgs.msg.PointStamped()
                 ned.header.stamp, ned.header.frame_id = stamp, self.world_frame_id
                 ned.point.x, ned.point.y, ned.point.z = (float(v) for v in m["ned"])
-                self._pub_gnss_ned.publish(ned)
+                self._later(self._latency["gnss"], lambda f=fix, n=ned: (self._pub_gnss.publish(f),
+                                                                        self._pub_gnss_ned.publish(n)))
         if "compass" in self._sensors:
             m = self._sensors["compass"].update(t, eta, nu)
             if m is not None:
@@ -392,7 +442,7 @@ class ConfigurableSimulator(BaseSimulator):
                 imu.angular_velocity.x, imu.angular_velocity.y = float(m["p"]), float(m["q"])
                 imu.angular_velocity.z = float(m["r"])
                 imu.linear_acceleration_covariance[0] = -1.0  # no accelerometer data
-                self._pub_imu.publish(imu)
+                self._later(self._latency["imu"], lambda m=imu: self._pub_imu.publish(m))
 
     def publish_odom(self):
         """True state on sim/odom_true; measurement/odom is the true state or, if noisy, state + noise."""
@@ -431,6 +481,7 @@ class ConfigurableSimulator(BaseSimulator):
         """Step environment and thruster dynamics, then the vessel (BaseSimulator.iterate: tau = B u)."""
         self._step_count += 1
         publish_state = self._step_count % self.STATE_EVERY == 0
+        self._run_due()
         self._current.step(self.dt)
         self.vessel.current_ned = self._current.velocity_ned()
         if self._wind is not None:

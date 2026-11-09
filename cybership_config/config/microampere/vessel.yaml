@@ -149,6 +149,16 @@ sensors:
     bias_sigma_deg_s: 0.05
     bias_tau: 300.0
 
+# Latency [s]: a sensor message is published this long after the measurement (stamped with the measurement
+# time), a thruster command acts this long after it is sent. The observer compensates the GNSS delay
+# (dp_observer_node.py delay_compensation). ESTIMATES: GNSS receiver + serial ~0.1 s (u-blox at 5 Hz), IMU a
+# few ms, computer -> ESC -> motor command path ~0.05 s (the thrust build-up itself is time_constant).
+# MEASURE on the boat: timestamps in a rosbag (sensor stamp vs arrival, command vs thruster response).
+latency:
+  gnss: 0.1
+  imu: 0.005
+  thrusters: 0.05
+
 allocation:
   # Fossen 11.2.3: min f'Wf + s'Qs  s.t.  T(alpha) f = tau + s,  -0.8*67 <= F1,F2,F3 <= 67
   # (cybership_dp/constrained_allocation.py). W = thruster 'weight' (effort), Q = slack weights per

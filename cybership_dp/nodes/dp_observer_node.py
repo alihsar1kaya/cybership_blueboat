@@ -10,12 +10,19 @@ state the controller uses.
     navigation/bias             Vector3Stamped <- bias force b_hat in NED [N, N, N m]
 
 The filter predicts at 'rate' Hz and corrects when a GNSS fix or a heading arrives (asynchronous,
-Ch. 13.4.4). M, D and the nonlinear damping come from vessel.yaml, the same model as the controller.
+Ch. 13.4.4). Without GNSS it keeps predicting from the model and the compass (dead reckoning).
+M, D and the nonlinear damping come from vessel.yaml, the same model as the controller.
+
+Delayed GNSS (delay_compensation): a fix arrives ~0.1 s after it was taken (header.stamp). The filter
+goes back to the stored state at that time, applies the fix and predicts forward again with the stored
+inputs and headings, so the old measurement is compared with the state it belongs to.
+The GNSS noise is taken from the message covariance (it grows when an RTK receiver loses its fix).
 
     ros2 run cybership_dp dp_observer_node.py --ros-args -r __ns:=/microampere -p vessel_model:=microampere
 """
 
 import math
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -47,6 +54,8 @@ class DPObserverNode(Node):
         self.declare_parameter("wave_filter.omega0", 0.0)       # [rad/s], e.g. 2 pi / Tp
         self.declare_parameter("wave_filter.zeta", 0.1)
         self.declare_parameter("wave_filter.q", [0.1, 0.1, 0.001])
+        self.declare_parameter("delay_compensation", True)
+        self.declare_parameter("gnss_timeout", 1.0)            # [s] warn and dead-reckon after this
 
         config, path = vessel_model.load_vessel_config(self.get_parameter("vessel_model").value)
         params = vessel_model.model_parameters(config)
@@ -72,6 +81,11 @@ class DPObserverNode(Node):
         self.roll_pitch = (0.0, 0.0)
         self.initialized = {"gnss": False, "psi": False}
         self.h = 1.0 / self.get_parameter("rate").value
+        # history for delayed fixes: states before each prediction and the headings in between, ~1 s
+        self.history = deque(maxlen=int(1.0 / self.h))
+        self.headings = deque(maxlen=int(2.0 / self.h))
+        self.t_gnss = None
+        self.gnss_lost = False
 
         self.create_subscription(NavSatFix, "sensor/gnss", self.on_gnss, 10)
         self.create_subscription(Imu, "sensor/imu", self.on_imu, 10)
@@ -94,20 +108,58 @@ class DPObserverNode(Node):
             self.kf.x[self.kf.nw + 2] = psi
             self.initialized["psi"] = True
         self.kf.correct_compass(psi, self.sigma_psi)
+        self.headings.append((self.now(), psi))
 
     def on_gnss(self, msg):
         north, east, down = llh2flat(math.radians(msg.longitude), math.radians(msg.latitude), msg.altitude,
                                      self.lon0, self.lat0)
         p = remove_lever_arm([north, east, down], self.lever_arm, *self.roll_pitch, self.kf.eta[2])
+        sigma = self.sigma_gnss
+        if msg.position_covariance_type != NavSatFix.COVARIANCE_TYPE_UNKNOWN:
+            sigma = math.sqrt(max(msg.position_covariance[0], msg.position_covariance[4]))
+        now = self.now()
+        if self.gnss_lost:
+            self.get_logger().info(f"GNSS back after {now - self.t_gnss:.1f} s")
+            self.gnss_lost = False
+        self.t_gnss = now
         if not self.initialized["gnss"]:
             self.kf.x[self.kf.nw:self.kf.nw + 2] = p[0:2]
             self.initialized["gnss"] = True
-        self.kf.correct_gnss(p[0], p[1], self.sigma_gnss)
+        t_meas = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+        if self.get_parameter("delay_compensation").value and now - t_meas > 0.5 * self.h and self.history:
+            self.correct_delayed(t_meas, p, sigma)
+        else:
+            self.kf.correct_gnss(p[0], p[1], sigma)
+
+    def now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def correct_delayed(self, t_meas, p, sigma):
+        """Apply a fix taken at t_meas: back to the stored state then, correct, predict forward again."""
+        hist = list(self.history)
+        k = next((i for i in range(len(hist) - 1, -1, -1) if hist[i][0] <= t_meas), None)
+        if k is None:                       # older than the history: use it as if it were new
+            self.kf.correct_gnss(p[0], p[1], sigma)
+            return
+        t0, x, P, _ = hist[k]
+        self.kf.x, self.kf.P = x.copy(), P.copy()
+        self.kf.correct_gnss(p[0], p[1], sigma)
+        times = [h[0] for h in hist[k:]] + [self.now()]
+        for j, (t_j, _, _, tau_j) in enumerate(hist[k:]):
+            self.kf.predict(tau_j, self.h)
+            for t_psi, psi in self.headings:
+                if t_j < t_psi <= times[j + 1]:
+                    self.kf.correct_compass(psi, self.sigma_psi)
 
     def step(self):
         if not all(self.initialized.values()):
             return
+        now = self.now()
+        if not self.gnss_lost and self.t_gnss is not None and now - self.t_gnss > self.get_parameter("gnss_timeout").value:
+            self.gnss_lost = True
+            self.get_logger().warn("No GNSS: dead reckoning on the model and the compass")
         self.publish()
+        self.history.append((now, self.kf.x.copy(), self.kf.P.copy(), self.tau.copy()))
         self.kf.predict(self.tau, self.h)
 
     def publish(self):
