@@ -122,10 +122,24 @@ def test_hull_model_matches_shoeboxpy_in_straight_line():
 
 # --- Microampere: physically reasonable -------------------------------------------------------
 
+def top_speed_thrust(name="microampere"):
+    """Thrust the two stern thrusters still give at max_speed (thrust drops with speed, actuators.py)."""
+    cfg = config(name)
+    d, u0 = cfg["model"]["damping"], (cfg.get("thruster_model") or {}).get("zero_thrust_speed")
+    return d["max_thrust"] * (1 - d["max_speed"] / u0) if u0 else d["max_thrust"]
+
+
+def surge_quadratic(name="microampere"):
+    return vessel_model.model_parameters(config(name))["nonlinear"]["surge_quadratic"]
+
+
 def test_microampere_top_speed_from_surge_resistance():
-    """Two stern thrusters at 67 N give max_speed (X_|u|u = max_thrust / max_speed^2, Fossen's Otter)."""
+    """
+    Full throttle on the stern thrusters gives max_speed: X_|u|u = T(max_speed) / max_speed^2 (Fossen's
+    Otter calibration, with the thrust that is left at that speed).
+    """
     d = config("microampere")["model"]["damping"]
-    model = run(craft("microampere"), [d["max_thrust"], 0, 0, 0, 0, 0], 60.0)
+    model = run(craft("microampere"), [top_speed_thrust(), 0, 0, 0, 0, 0], 60.0)
     # the linear term has faded to e^(-3 * 3.15) ~ 1e-4 of X_u at top speed
     assert model.nu[0] == pytest.approx(d["max_speed"], rel=0.005)
     assert 2.5 < model.nu[0] < 3.5
@@ -139,7 +153,7 @@ def test_surge_damping_blends_linear_into_quadratic():
     model = craft("microampere")
     d = config("microampere")["model"]["damping"]
     Xu = model.M[0, 0] / d["surge_time_constant"]
-    Xuu = d["max_thrust"] / d["max_speed"] ** 2
+    Xuu = surge_quadratic()
     for u in (0.01, 0.2, 1.0, 3.0, -0.5):
         X = model.damping(np.array([u, 0, 0, 0, 0, 0]))[0]
         assert X == pytest.approx(-(Xu * math.exp(-3 * abs(u)) * u + Xuu * abs(u) * u), rel=1e-9)
@@ -229,13 +243,12 @@ def test_microampere_is_stable_at_top_speed():
     model = vessel_model.make_marine_craft(vessel_model.model_parameters(config("microampere")),
                                            eta0=np.radians([0, 0, 0, 3, 3, 0]),
                                            nu0=np.array([0, 0, 0, 0, 0, 0.05]))
-    run(model, [201, 0, 0, 0, 0, 0], 30.0)
+    F = 1.5 * top_speed_thrust()       # all three thrusters forward, at top speed
+    run(model, [F, 0, 0, 0, 0, 0], 30.0)
     assert np.all(np.isfinite(model.nu))
     assert abs(model.eta[3]) < math.radians(1) and abs(model.eta[4]) < math.radians(1)
     assert abs(model.nu[5]) < math.radians(1)
-    d = config("microampere")["model"]["damping"]
-    Xuu = d["max_thrust"] / d["max_speed"] ** 2
-    assert model.nu[0] == pytest.approx(math.sqrt(201 / Xuu), abs=0.05)  # all three thrusters forward
+    assert model.nu[0] == pytest.approx(math.sqrt(F / surge_quadratic()), abs=0.05)
 
 
 # --- Ocean current (Fossen 2021, Ch. 10.3) ----------------------------------------------------

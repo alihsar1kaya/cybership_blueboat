@@ -159,3 +159,45 @@ def test_azimuth_mode_has_hysteresis():
         a.set_command(10 * math.cos(ang), 10 * math.sin(ang))
         modes.append(a.command[0] > 0)
     assert len(set(modes)) == 1
+
+
+# --- operating conditions: battery voltage and inflow speed -----------------------------------------
+
+T200 = {"volts": [12.0, 16.0, 20.0], "thrust": [3.71, 5.25, 6.7]}     # kgf, Blue Robotics datasheet
+
+
+def test_voltage_factor_follows_the_datasheet():
+    from cybership_utilities.marine_craft.actuators import voltage_factor
+    assert voltage_factor(20.0, T200, 20.0) == pytest.approx(1.0)
+    assert voltage_factor(16.0, T200, 20.0) == pytest.approx(5.25 / 6.7)
+    assert voltage_factor(12.0, T200, 20.0) == pytest.approx(3.71 / 6.7)
+    assert voltage_factor(14.0, T200, 16.0) == pytest.approx((3.71 + 5.25) / 2 / 5.25)
+
+
+def test_low_battery_gives_less_thrust_for_the_same_command():
+    t = FixedThruster(max_force=67.0, reverse_ratio=0.8)
+    t.set_command(30.0)
+    t.step(0.01)
+    t.voltage_factor = 0.7
+    assert t.output()[0] == pytest.approx(21.0)
+
+
+def test_thrust_drops_with_inflow_and_vanishes_at_the_zero_thrust_speed():
+    t = FixedThruster(max_force=67.0, zero_thrust_speed=5.0)
+    t.set_command(67.0)
+    t.step(0.01)
+    assert t.output()[0] == pytest.approx(67.0)
+    t.inflow = 2.5
+    assert t.output()[0] == pytest.approx(33.5)          # half the bollard thrust at half u_0
+    t.inflow = 6.0
+    assert t.output()[0] == pytest.approx(0.0)
+    t.inflow = -1.0                                       # moving backwards: a bit more thrust
+    assert 67.0 < t.output()[0] <= 1.3 * 67.0
+
+
+def test_reverse_thrust_drops_when_backing_up():
+    t = FixedThruster(max_force=67.0, reverse_ratio=0.8, zero_thrust_speed=5.0)
+    t.set_command(-40.0)
+    t.step(0.01)
+    t.inflow = -1.0                                       # inflow along the thrust axis is backwards
+    assert -40.0 < t.output()[0] < 0.0

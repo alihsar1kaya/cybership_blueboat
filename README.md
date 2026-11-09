@@ -192,6 +192,20 @@ ros2 param set /microampere/sim sensors.gnss.outage_rate 1     # random outages,
 
 Without GNSS the filter keeps going on the boat model and the compass (dead reckoning), and the observer prints a warning. In a 0.1 m/s current the boat drifted at most 8 cm during a 20 s outage, then returned once GNSS came back. Losing the RTK fix is worse: the boat follows the receiver's slow error and wanders 20–40 cm, because nothing tells it the position is wrong.
 
+### 9. Battery voltage and thrust at speed
+
+The thrusters lose force in two ways, as on the real boat. A lower battery voltage gives less thrust for the same command (the T200 gives 6.7 kgf at 20 V but 5.25 kgf at 16 V), and a propeller pushes less the faster water flows into it, so the thrust falls as the boat picks up speed.
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+# in a second terminal:
+ros2 param set /microampere/sim battery.voltage 14.8                 # a 4S battery, about 70 % of full thrust
+ros2 param set /microampere/sim environment.current.speed 0.2
+ros2 param set /microampere/sim environment.current.direction_deg 90
+```
+
+The controller is not told about the voltage, so it has to make up for the weaker thrusters through its bias estimate. At 14.8 V in a 0.2 m/s side current the boat held within 6 cm, against 2 cm at full voltage, with the bow thruster close to its limit.
+
 ### Switching the controller off and on
 
 ```bash
@@ -238,6 +252,7 @@ Change these with `ros2 param set /microampere/sim <name> <value>`. They take ef
 | `environment.wind.mu` | `0` | 1/s | how fast gusts return to the mean |
 | `environment.current.speed` | `0` | m/s | current speed, 0 turns it off |
 | `environment.current.direction_deg` | `0` | deg | direction the current flows towards |
+| `battery.voltage` | `20` | V | battery voltage; lower gives less thrust (T200 thrust-voltage curve) |
 | `sensors.gnss.available` | `true` | | false simulates a GNSS outage |
 | `sensors.gnss.rtk_fix` | `true` | | false makes an RTK receiver fall back to normal accuracy (only with `gnss:=rtk`) |
 | `sensors.gnss.outage_rate` | `0` | 1/min | random outages per minute, 0 for none |
@@ -256,6 +271,7 @@ All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybershi
 | `model` | mass, inertia, hydrodynamics, damping and the wind areas |
 | `thrusters` | one entry per thruster with position, direction and strength |
 | `sensors` | rate and noise for GNSS, compass and gyro |
+| `thruster_model` | battery voltage, thrust-voltage curve and how fast thrust drops with speed |
 | `latency` | delays of GNSS, IMU and thruster commands, in seconds |
 | `allocation` | how the total force is split between the thrusters |
 
@@ -374,7 +390,7 @@ The unit tests check the boat model, the weather, the sensors, the Kalman filter
 
 ## Known limitations
 
-- Several boat values are still estimates (centre of gravity, inertia, surge time constant, thruster positions). They are marked ESTIMATE in `vessel.yaml` and should be measured on the real boat.
+- Several boat values are still estimates (centre of gravity, inertia, surge time constant, thruster positions, the thrust at speed, and which voltage the 67 N thruster rating refers to). They are marked ESTIMATE in `vessel.yaml` and should be measured on the real boat.
 - The slow drift force from waves (second order) is not modelled. The Kalman filter's bias estimate absorbs it, as it would on the real boat.
 - The wind areas come from the CAD model. The real boat's antennas and electronics are not in it.
 - There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.

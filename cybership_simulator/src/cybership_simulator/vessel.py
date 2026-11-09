@@ -46,7 +46,7 @@ import skadipy
 
 from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
-from cybership_utilities.marine_craft.actuators import make_thruster
+from cybership_utilities.marine_craft.actuators import make_thruster, voltage_factor
 from cybership_utilities.marine_craft.environment import OceanCurrent, Wind
 from cybership_utilities.marine_craft.sensors import Gnss, gnss_config, make_sensors
 from cybership_utilities.marine_craft.waves import make_waves
@@ -64,6 +64,7 @@ class ConfigurableSimulator(BaseSimulator):
             self.allocator._b_matrix[3:5, :] = 0.0
         self._setup_environment()
         self._setup_sensors()
+        self._setup_thruster_model()
 
     # ------------------------------------------------------------------------
     # Environment (Fossen Ch. 10.3): ocean current
@@ -143,6 +144,9 @@ class ConfigurableSimulator(BaseSimulator):
         for param in params:
             if param.name == "environment.current.speed":
                 self._current.set(speed=float(param.value))
+            elif param.name == "battery.voltage":
+                self._set_voltage(float(param.value))
+                self.get_logger().info(f"Battery {param.value} V: full thrust x{self._voltage_factor:.2f}")
             elif param.name.startswith("environment.wind.") and self._wind is not None:
                 n = param.name.split(".")[-1]
                 if n == "speed":
@@ -293,9 +297,11 @@ class ConfigurableSimulator(BaseSimulator):
         self._force_pubs = {}
         self._actuators = {}  # name -> actuator model (thruster dynamics, see marine_craft/actuators.py)
         self._step_count = 0
+        tm = self.config.get("thruster_model") or {}
         for t in self.config["thrusters"]:
             name = t["name"]
-            self._actuators[name] = make_thruster(t)
+            # zero_thrust_speed per thruster, else the common one in thruster_model
+            self._actuators[name] = make_thruster({"zero_thrust_speed": tm.get("zero_thrust_speed"), **t})
             self._issued_pubs[name] = self.create_publisher(
                 geometry_msgs.msg.WrenchStamped, f"thruster/{name}/issued", 1
             )
@@ -316,6 +322,27 @@ class ConfigurableSimulator(BaseSimulator):
         """A command arrives; it acts after the command latency (computer -> ESC -> motor)."""
         self._later(getattr(self, "_latency", {}).get("thrusters", 0.0),
                     lambda: self._apply_thruster_command(t, msg))
+
+    def _setup_thruster_model(self):
+        """Battery voltage (parameter battery.voltage) and the thrust-voltage table of vessel.yaml."""
+        tm = self.config.get("thruster_model") or {}
+        self._tm = tm
+        self.declare_parameter("battery.voltage", float(tm.get("battery_voltage", tm.get("rated_voltage", 0.0))),
+                               ParameterDescriptor(dynamic_typing=True))
+        self._set_voltage(float(self.get_parameter("battery.voltage").value))
+        if tm:
+            self.get_logger().info(
+                f"Thrusters: battery {self.get_parameter('battery.voltage').value} V (rated {tm.get('rated_voltage')} V,"
+                f" full thrust x{self._voltage_factor:.2f}), inflow effect "
+                f"{'u0 = ' + str(tm.get('zero_thrust_speed')) + ' m/s' if tm.get('zero_thrust_speed') else 'off'}")
+
+    def _set_voltage(self, v):
+        tm = self._tm
+        self._voltage_factor = 1.0
+        if tm.get("thrust_vs_voltage") and tm.get("rated_voltage") and v > 0:
+            self._voltage_factor = voltage_factor(v, tm["thrust_vs_voltage"], tm["rated_voltage"])
+        for act in self._actuators.values():
+            act.voltage_factor = self._voltage_factor
 
     def _apply_thruster_command(self, t, msg: geometry_msgs.msg.Wrench):
         """Store the command; the actuator model turns it into actual thrust in iterate()."""
@@ -501,9 +528,17 @@ class ConfigurableSimulator(BaseSimulator):
         if publish_state:
             self._publish_environment()
         self._publish_sensors()
+        # water velocity relative to the hull in BODY (u_r, v_r): the inflow of each propeller
+        psi = self.vessel.eta[5]
+        c, sn = math.cos(psi), math.sin(psi)
+        vc = self.vessel.current_ned
+        u_r = self.vessel.nu[0] - (c * vc[0] + sn * vc[1])
+        v_r = self.vessel.nu[1] - (-sn * vc[0] + c * vc[1])
         for t in self.config["thrusters"]:
             act = self._actuators[t["name"]]
             act.step(self.dt)
+            a = getattr(act, "angle", math.radians(t.get("direction_deg", 0.0)))
+            act.inflow = u_r * math.cos(a) + v_r * math.sin(a)
             fx, fy, angle = act.output()
             idx = self._thruster_index[t["name"]]
             self.u[idx, 0] = fx

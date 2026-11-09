@@ -149,6 +149,22 @@ sensors:
     bias_sigma_deg_s: 0.05
     bias_tau: 300.0
 
+# Thruster operating conditions (cybership_utilities/marine_craft/actuators.py, ThrusterConditions).
+# Battery voltage: full thrust follows the T200 datasheet (bluerobotics.com, T200 R2: 3.71 / 5.25 / 6.7 kgf
+# forward at 12 / 16 / 20 V). max_force = 67 N above equals the 20 V value (6.7 kgf); the datasheet gives
+# 5.25 kgf = 51.5 N at the nominal 16 V (390 W). CHECK with the team which voltage the boat runs on (a
+# 4S battery is 13-16.8 V) and what "67 N at 400 W" was measured at. Change it live:
+#   ros2 param set /microampere/sim battery.voltage 14.8
+# Speed: with a linear K_T(J) (Fossen 9.1) full throttle gives no thrust at the inflow speed u_0 (pitch
+# speed). ESTIMATE from the datasheet: theoretical jet speed 4.45 m/s at 16 V (3600 rpm), scaled to 20 V
+# with sqrt(thrust) -> ~5.0 m/s. The surge drag X_|u|u is calibrated with the thrust left at max_speed
+# (vessel_model.py), so the top speed stays max_speed. MEASURE: bollard pull and thrust at speed.
+thruster_model:
+  rated_voltage: 20.0          # [V] voltage at which max_force applies
+  battery_voltage: 20.0        # [V] start value of the parameter battery.voltage
+  thrust_vs_voltage: {volts: [12.0, 16.0, 20.0], thrust: [3.71, 5.25, 6.7]}   # [kgf], only the ratio is used
+  zero_thrust_speed: 5.0       # [m/s] u_0 at rated voltage, null = thrust independent of speed
+
 # Latency [s]: a sensor message is published this long after the measurement (stamped with the measurement
 # time), a thruster command acts this long after it is sent. The observer compensates the GNSS delay
 # (dp_observer_node.py delay_compensation). ESTIMATES: GNSS receiver + serial ~0.1 s (u-blox at 5 Hz), IMU a

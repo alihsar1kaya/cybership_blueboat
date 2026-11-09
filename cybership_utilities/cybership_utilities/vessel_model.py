@@ -140,7 +140,12 @@ def model_parameters(config, rho=1000.0, g=9.81):
     G[4, 4] += mass * g * cg[2]
 
     if model and "damping" in model:
-        D, extra = _fossen_damping(model["damping"], np.diag(MRB) + np.diag(MA), np.diag(G), B_eq)
+        d = dict(model["damping"])
+        u0 = (config.get("thruster_model") or {}).get("zero_thrust_speed")
+        if u0 and "max_thrust" in d and "max_speed" in d:
+            # thrust drops with speed (actuators.py): at top speed the drag equals the thrust left there
+            d["max_thrust"] = float(d["max_thrust"]) * max(1.0 - float(d["max_speed"]) / float(u0), 0.0)
+        D, extra = _fossen_damping(d, np.diag(MRB) + np.diag(MA), np.diag(G), B_eq)
         nonlinear.update(extra)
         source += ", Fossen damping"
     elif model:
