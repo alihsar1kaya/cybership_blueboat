@@ -3,7 +3,7 @@ Generic launch file for the configurable simulator.
 
     ros2 launch cybership_simulator vessel.launch.py vessel:=voyager
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere use_gui:=false
-    ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.1
+    ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.05
     then open http://localhost:8080 (web GUI, web:=false to skip)
 
 Loads cybership_config/config/<vessel>/vessel.yaml. Unlike <vessel>.launch.py, the
@@ -223,7 +223,7 @@ def generate_launch_description():
             "waves", default_value="false",
             description="Irregular waves (JONSWAP, Capytaine RAOs); also turns on the observer's wave filter. "
                         "Can be changed while running: ros2 param set /<ns>/sim environment.waves.Hs <m>"),
-        launch.actions.DeclareLaunchArgument("wave_hs", default_value="0.1", description="Significant wave height [m]"),
+        launch.actions.DeclareLaunchArgument("wave_hs", default_value="0.05", description="Significant wave height [m] (0.05: calm water, the BlueBoat is not for rough seas)"),
         launch.actions.DeclareLaunchArgument("wave_tp", default_value="2.3", description="Peak period [s]"),
         launch.actions.DeclareLaunchArgument("wave_dir", default_value="0.0",
                                              description="Direction the waves travel towards [deg], 0 = north"),
