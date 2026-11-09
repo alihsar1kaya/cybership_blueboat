@@ -67,7 +67,7 @@
     </div>
 
     <div class="card" id="seacard" hidden>
-      <h2>Sjø (bare simulator)</h2>
+      <h2>Vær (bare simulator)</h2>
       <div class="row"><span>Bølger</span>
         <div class="switch"><button id="woff" class="on">av</button><button id="won">på</button></div></div>
       <label>Bølgehøyde <b id="hsv">0.10</b> m</label>
@@ -78,6 +78,10 @@
       <input id="cur" type="range" min="0" max="0.3" step="0.05" value="0">
       <label>Strømmen går mot <b id="cdv">0</b>°</label>
       <input id="cd" type="range" min="0" max="350" step="10" value="0">
+      <label>Vind <b id="vv">0</b> m/s</label>
+      <input id="wind" type="range" min="0" max="15" step="1" value="0">
+      <label>Vinden blåser mot <b id="vdv">0</b>°</label>
+      <input id="vd" type="range" min="0" max="350" step="10" value="0">
     </div>
 
     <button id="stop">STOPP</button>
@@ -208,6 +212,10 @@ $("cur").oninput = () => $("cv").textContent = Number($("cur").value).toFixed(2)
 $("cur").onchange = () => sea({ current: Number($("cur").value) });
 $("cd").oninput = () => $("cdv").textContent = $("cd").value;
 $("cd").onchange = () => sea({ current_dir: Number($("cd").value) });
+$("wind").oninput = () => $("vv").textContent = $("wind").value;
+$("wind").onchange = () => sea({ wind: Number($("wind").value) });
+$("vd").oninput = () => $("vdv").textContent = $("vd").value;
+$("vd").onchange = () => sea({ wind_dir: Number($("vd").value) });
 let seaInit = false;
 
 // --- status -----------------------------------------------------------------------------------------
@@ -242,7 +250,8 @@ function update() {
     if (!seaInit) {     // show the simulator's values once
       if (on) { $("hs").value = S.sea.Hs; } $("wd").value = S.sea.wave_dir;
       $("cur").value = S.sea.current; $("cd").value = S.sea.current_dir;
-      ["hs", "wd", "cur", "cd"].forEach(id => $(id).oninput());
+      $("wind").value = S.sea.wind; $("vd").value = S.sea.wind_dir;
+      ["hs", "wd", "cur", "cd", "wind", "vd"].forEach(id => $(id).oninput());
       seaInit = true;
     }
   }

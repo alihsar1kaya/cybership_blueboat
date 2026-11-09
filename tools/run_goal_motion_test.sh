@@ -10,6 +10,7 @@ if [ "$2" != "0" ]; then
 fi
 sleep 5
 if [ -n "$CURRENT" ]; then ros2 param set /microampere/sim environment.current.speed ${CURRENT% *} >/dev/null; ros2 param set /microampere/sim environment.current.direction_deg ${CURRENT#* } >/dev/null; sleep 20; fi
+if [ -n "$WIND" ]; then ros2 param set /microampere/sim environment.wind.speed ${WIND% *} >/dev/null; ros2 param set /microampere/sim environment.wind.direction_deg ${WIND#* } >/dev/null; sleep 20; fi
 [ -n "$PF" ] && ros2 param set /microampere/position_controller guidance.path_following $PF >/dev/null
 python3 "$(dirname "$(readlink -f "$0")")"/goal_motion_test.py --label $1 ${GOAL:+--goal $GOAL}
 pkill -INT -f "[v]essel.launch.py vessel:=microampere dp:=true use_gui:=false web:=false"; sleep 3

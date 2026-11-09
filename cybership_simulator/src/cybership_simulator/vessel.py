@@ -46,7 +46,7 @@ import skadipy
 from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster
-from cybership_utilities.marine_craft.environment import OceanCurrent
+from cybership_utilities.marine_craft.environment import OceanCurrent, Wind
 from cybership_utilities.marine_craft.sensors import make_sensors
 from cybership_utilities.marine_craft.waves import make_waves
 from cybership_utilities import hydro
@@ -77,6 +77,11 @@ class ConfigurableSimulator(BaseSimulator):
             "environment.current.speed_min": 0.0,
             "environment.current.speed_max": 1.0,
             "environment.current.seed": -1,            # -1: random
+            "environment.wind.speed": 0.0,             # [m/s] mean wind speed (10 m/s = Beaufort 5)
+            "environment.wind.direction_deg": 0.0,     # [deg] blows towards, 0 = north, 90 = east
+            "environment.wind.mu": 0.0,                # gusts, Gauss-Markov: mean reversion [1/s], 0 = off
+            "environment.wind.sigma": 0.0,             # gusts: noise [m/s/sqrt(s)], 0 = off
+            "environment.wind.seed": -1,
             "environment.waves.Hs": 0.0,               # [m] significant wave height, 0 = no waves
             "environment.waves.Tp": 2.3,               # [s] peak period (w0 = 2 pi / Tp)
             "environment.waves.direction_deg": 0.0,    # [deg] travel towards, 0 = north
@@ -94,6 +99,21 @@ class ConfigurableSimulator(BaseSimulator):
             speed=float(g("speed")), direction_deg=float(g("direction_deg")), mu=float(g("mu")),
             sigma=float(g("sigma")), speed_min=float(g("speed_min")), speed_max=float(g("speed_max")),
             seed=None if int(seed) < 0 else int(seed))
+        # Wind (Fossen 10.1): areas and Blendermann coefficients from vessel.yaml (model.wind)
+        w = (self.config.get("model") or {}).get("wind")
+        gw = lambda n: self.get_parameter(f"environment.wind.{n}").value
+        self._wind = None
+        if w:
+            seed = int(gw("seed"))
+            self._wind = Wind(w["areas"], w.get("coefficients", "speed_boat"), w.get("rho_a", 1.225),
+                              speed=float(gw("speed")), direction_deg=float(gw("direction_deg")),
+                              mu=float(gw("mu")), sigma=float(gw("sigma")), seed=None if seed < 0 else seed)
+            self.get_logger().info(f"Wind: {gw('speed')} m/s towards {gw('direction_deg')} deg "
+                                   f"(Blendermann '{w.get('coefficients', 'speed_boat')}', "
+                                   f"A_Fw {w['areas']['A_Fw']} m2, A_Lw {w['areas']['A_Lw']} m2)")
+        elif float(gw("speed")) > 0:
+            self.get_logger().warn("Wind needs model.wind (areas) in vessel.yaml; no wind")
+        self._pub_wind = self.create_publisher(geometry_msgs.msg.Vector3Stamped, "sim/environment/wind", 1)
         self.add_on_set_parameters_callback(self._on_environment_change)
         self._pub_current = self.create_publisher(
             geometry_msgs.msg.Vector3Stamped, "sim/environment/current", 1)
@@ -122,6 +142,16 @@ class ConfigurableSimulator(BaseSimulator):
         for param in params:
             if param.name == "environment.current.speed":
                 self._current.set(speed=float(param.value))
+            elif param.name.startswith("environment.wind.") and self._wind is not None:
+                n = param.name.split(".")[-1]
+                if n == "speed":
+                    self._wind.set(speed=float(param.value))
+                elif n == "direction_deg":
+                    self._wind.set(direction_deg=float(param.value))
+                elif n == "mu":
+                    self._wind.gusts.mu = float(param.value)
+                elif n == "sigma":
+                    self._wind.gusts.sigma = float(param.value)
             elif param.name == "environment.current.direction_deg":
                 self._current.set(direction_deg=float(param.value))
             elif param.name == "environment.current.mu":
@@ -163,6 +193,11 @@ class ConfigurableSimulator(BaseSimulator):
         msg.header.stamp = stamp
         msg.vector.x, msg.vector.y, msg.vector.z = (float(x) for x in v)
         self._pub_current.publish(msg)
+        if self._wind is not None:
+            wmsg = geometry_msgs.msg.Vector3Stamped()
+            wmsg.header = msg.header
+            wmsg.vector.x, wmsg.vector.y, wmsg.vector.z = (float(x) for x in self._wind.velocity_ned())
+            self._pub_wind.publish(wmsg)
 
         # Arrow at the vessel, 5 m per m/s, in the world (NED) frame
         eta = self.vessel.eta
@@ -398,6 +433,10 @@ class ConfigurableSimulator(BaseSimulator):
         publish_state = self._step_count % self.STATE_EVERY == 0
         self._current.step(self.dt)
         self.vessel.current_ned = self._current.velocity_ned()
+        if self._wind is not None:
+            # wind loads on the LF state (Fossen 10.1), relative to the boat's velocity over ground
+            self._wind.step(self.dt)
+            self.vessel.tau_ext = self._wind.loads(self.vessel.eta, self.vessel.nu)
         if self._waves_dirty:
             self._update_waves()
         if self._waves is not None:

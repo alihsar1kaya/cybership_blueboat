@@ -36,6 +36,7 @@ def _launch_setup(context, *args, **kwargs):
     lc = lambda name: launch.substitutions.LaunchConfiguration(name).perform(context)
     use_waves = lc("waves").lower() == "true"
     wave_hs, wave_tp, wave_dir = float(lc("wave_hs")), float(lc("wave_tp")), float(lc("wave_dir"))
+    wind_speed, wind_dir = float(lc("wind_speed")), float(lc("wind_dir"))
     if wave_filter_w0 <= 0.0:
         # observer wave filter always on at the wave peak frequency: waves can be switched on while running
         # (web GUI), and the filter costs nothing in calm water (tools/observer_fair_test.py)
@@ -71,7 +72,8 @@ def _launch_setup(context, *args, **kwargs):
                 {"vessel_model": vessel, "tf_prefix": vessel_name, "sensors.noisy_odom": noisy_odom,
                  "sensors.gnss_profile": gnss,
                  "environment.waves.Hs": wave_hs if use_waves else 0.0,
-                 "environment.waves.Tp": wave_tp, "environment.waves.direction_deg": wave_dir},
+                 "environment.waves.Tp": wave_tp, "environment.waves.direction_deg": wave_dir,
+                 "environment.wind.speed": wind_speed, "environment.wind.direction_deg": wind_dir},
             ],
         ),
         launch_ros.actions.Node(
@@ -225,6 +227,12 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument("wave_tp", default_value="2.3", description="Peak period [s]"),
         launch.actions.DeclareLaunchArgument("wave_dir", default_value="0.0",
                                              description="Direction the waves travel towards [deg], 0 = north"),
+        launch.actions.DeclareLaunchArgument(
+            "wind_speed", default_value="0.0",
+            description="Mean wind speed [m/s] (Blendermann loads, vessel.yaml model.wind). "
+                        "Can be changed while running: ros2 param set /<ns>/sim environment.wind.speed <m/s>"),
+        launch.actions.DeclareLaunchArgument("wind_dir", default_value="0.0",
+                                             description="Direction the wind blows towards [deg], 0 = north"),
         launch.actions.DeclareLaunchArgument(
             "gnss", default_value="standard",
             description="GNSS receiver: 'standard' (~0.2 m + slow wander) or 'rtk' (~2 cm), vessel.yaml sensors"),

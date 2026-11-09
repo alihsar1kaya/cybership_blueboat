@@ -33,7 +33,7 @@
 | | |
 |---|---|
 | 🚤 **Vessel model** | 6-DOF Fossen model of Microampere: added mass and damping from Capytaine on the hull CAD, restoring forces, CG offset, nonlinear damping |
-| 🌊 **Environment** | Ocean current and irregular waves (JONSWAP, short-crested) |
+| 🌊 **Environment** | Ocean current, wind (Blendermann coefficients, areas from the CAD) and irregular waves (JONSWAP, short-crested) |
 | 📡 **Sensors** | GNSS (standard or RTK) with lever arm and slow drift, compass and gyro, at their real rates |
 | 🧭 **Observer** | DP Kalman filter with wave filter and bias estimate (Fossen 13.4.6) |
 | 🎯 **Control** | Model-based DP controller, guidance that picks forward, reverse or sideways moves, optional ALOS path following |
@@ -113,7 +113,10 @@ There are two kinds of switches:
 | cm-accurate GNSS (RTK) | add `gnss:=rtk` (default `standard`: ~0.2 m noise and slow drift) |
 | start with waves | add `waves:=true wave_hs:=0.1 wave_tp:=2.3 wave_dir:=0` |
 | run without RViz (e.g. on a server) | add `use_gui:=false` |
+| start with wind | add `wind_speed:=8 wind_dir:=90` (blows towards east) |
 | turn waves on/off while running | `ros2 param set /microampere/sim environment.waves.Hs 0.1` (`0` = off) |
+| change the wind while running | `ros2 param set /microampere/sim environment.wind.speed 8` and `... environment.wind.direction_deg 90` |
+| gusty wind | `ros2 param set /microampere/sim environment.wind.sigma 0.5` and `... environment.wind.mu 0.1` |
 | add an ocean current | `ros2 param set /microampere/sim environment.current.speed 0.15` |
 | change the current direction | `ros2 param set /microampere/sim environment.current.direction_deg 90` (flows towards east) |
 | switch DP off (zero thrust) | `ros2 service call /microampere/position_controller/change_state std_srvs/srv/SetBool "{data: false}"` |
@@ -137,9 +140,10 @@ ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
 | `noisy_odom` | `false` | without observer: give the controller the true state plus noise |
 | `waves` | `false` | irregular waves from the start |
 | `wave_hs` / `wave_tp` / `wave_dir` | `0.1` / `2.3` / `0` | wave height [m], peak period [s], direction the waves travel towards [deg] |
+| `wind_speed` / `wind_dir` | `0` / `0` | mean wind speed [m/s] and the direction it blows towards [deg] |
 | `use_gui` | `true` | start RViz |
 
-> **Directions** follow the marine convention (NED): x = north, y = east, headings in degrees from north, 90 = east.
+> **Directions** follow the marine convention (NED): x = north, y = east, headings in degrees from north, 90 = east. Current, wind and waves are all given as the direction they move **towards**: a wind *from* the north is `wind_dir:=180`.
 
 ## Change the boat (`vessel.yaml`)
 
@@ -153,6 +157,7 @@ Every value has a comment with its source. After editing, just restart the launc
 | `model.mass`, `inertia`, `cg` | rigid body | weigh the boat and put the real mass here |
 | `model.hydro` | added mass and wave data from Capytaine (`hydro_capytaine.npz`) | remove it to use the simple `added_mass` list instead |
 | `model.damping` | how the water slows the boat | `surge_time_constant`, `max_speed` from trials |
+| `model.wind` | areas above the waterline and wind coefficients | new superstructure: rerun `cybership_config/tools/wind_areas.py` on the CAD |
 | `sensors` | GNSS, compass, gyro: rate, noise, drift, antenna position | match your real sensors |
 | `allocation` | how the force is split on the thrusters | `slack_weights`: which DOF to give up first when thrust runs out |
 | `thrusters` | one entry per thruster | move, add, remove, change strength |
@@ -239,7 +244,7 @@ flowchart LR
     ALLOC -->|thruster commands| SIM
     subgraph SIM["Simulator (cybership_simulator)"]
         THR["Thrusters"] --> CRAFT["Marine craft<br/>6-DOF model"]
-        ENV["Current + waves"] --> CRAFT
+        ENV["Current, wind,<br/>waves"] --> CRAFT
         CRAFT --> SENS["GNSS, compass,<br/>gyro"]
     end
     SENS -->|sensor/gnss<br/>sensor/imu| OBS
@@ -275,6 +280,7 @@ ros2 service call /microampere/force_mux/select topic_tools_interfaces/srv/MuxSe
 | Kinematics, rigid body, Coriolis | `cybership_utilities/marine_craft/` | Fossen (2021) ch. 2–3 |
 | Added mass and damping | Capytaine radiation on the hull CAD, power-based averaging | Fossen ch. 5–6, MSS |
 | Ocean current | relative velocity, Property 10.1 | ch. 10.3 |
+| Wind | Blendermann (1994) coefficients, projected areas from the CAD, optional gusts | ch. 10.1 |
 | Waves | JONSWAP + cos² spreading, force and motion RAOs, total = LF + WF | ch. 10.2 |
 | Sensors | `marine_craft/sensors.py` | ch. 13–14 |
 | Observer | `cybership_utilities/observer.py` (EKF with nonlinear damping, wave filter) | ch. 13.4.6 |
@@ -287,7 +293,7 @@ ros2 service call /microampere/force_mux/select topic_tools_interfaces/srv/MuxSe
 ## Tests and tools
 
 ```bash
-# unit tests (vessel model, sensors, observer, waves, allocation, ALOS)
+# unit tests (vessel model, current, wind, waves, sensors, observer, allocation, ALOS)
 python3 -m pytest -q src/cybership_blueboat/cybership_utilities/test src/cybership_blueboat/cybership_dp/test
 ```
 

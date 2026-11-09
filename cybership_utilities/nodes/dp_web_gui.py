@@ -32,7 +32,8 @@ from cybership_utilities import vessel_model
 
 LABELS = {"port": "Babord", "starboard": "Styrbord", "bow_azimuth": "Baug"}
 SEA = {"Hs": "environment.waves.Hs", "Tp": "environment.waves.Tp", "wave_dir": "environment.waves.direction_deg",
-       "current": "environment.current.speed", "current_dir": "environment.current.direction_deg"}
+       "current": "environment.current.speed", "current_dir": "environment.current.direction_deg",
+       "wind": "environment.wind.speed", "wind_dir": "environment.wind.direction_deg"}
 DRIVE_INPUT, STOP_INPUT = "control/force/command/position", "control/force/command/manual"
 
 

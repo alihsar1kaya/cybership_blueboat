@@ -109,6 +109,15 @@ model:
   # line is ~10-18 cm below the waterline, roughly where the hull resistance acts).
   cancel_munk: [pitch, yaw]
   thruster_roll_pitch_moments: false
+  # Wind loads (Fossen 10.1, TTK4190 L7 slides 5-10; cybership_utilities/marine_craft/environment.py).
+  # Areas above the waterline at 274 mm draft from the CAD (cybership_config/tools/wind_areas.py),
+  # incl. the deck box/mast in the CAD (top 0.60 m above the waterline). ESTIMATE: the real boat's
+  # antennas and electronics differ; photograph it from ahead and from the side to check.
+  # Coefficients: Blendermann (1994) 'speed_boat' (CD_t 0.90, CD_lAF 0.55/0.60, delta 0.60, kappa 1.1).
+  wind:
+    areas: {A_Fw: 0.109, A_Lw: 0.174, H_Fw: 0.153, H_Lw: 0.109, s_L: 0.057, L_oa: 1.204}
+    coefficients: speed_boat
+    rho_a: 1.225          # [kg/m^3] air at 15 deg C
 
 # Sensors (Fossen 2021, Ch. 13.1/14.1; cybership_utilities/marine_craft/sensors.py). Error = white noise
 # + first-order Gauss-Markov bias. ESTIMATES until the real sensors are logged at rest (ask the
