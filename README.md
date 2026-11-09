@@ -9,7 +9,7 @@ Simulator and dynamic positioning (DP) controller for *Microampere*, a BlueBoat 
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue)
 
-[Install](#install) · [Run](#run) · [Switches](#switches) · [Change the boat](#change-the-boat) · [How it works](#how-it-works)
+[Install](#install) · [First run](#first-run) · [Examples](#examples) · [Reference](#reference) · [Change the boat](#change-the-boat) · [How it works](#how-it-works)
 
 </div>
 
@@ -19,13 +19,13 @@ Simulator and dynamic positioning (DP) controller for *Microampere*, a BlueBoat 
 
 You give the boat a goal in RViz. It drives there and holds its position and heading while waves, wind and current push it around.
 
-The boat model follows Fossen's marine craft equations. The added mass and damping come from running Capytaine on the hull CAD, so they are not guessed. Every number about the boat sits in one YAML file, and each part of the system (simulator, observer, controller, thrust allocation) is a separate ROS 2 node. That makes it easy to change the boat, or to swap the simulator for the real boat later.
+The boat model follows Fossen's marine craft equations. The added mass and damping come from running Capytaine on the hull CAD, so they are computed rather than guessed. Every number about the boat sits in one YAML file, and each part of the system (simulator, observer, controller, thrust allocation) is a separate ROS 2 node. That makes it easy to change the boat, or to swap the simulator for the real boat later.
 
 ---
 
 ## Install
 
-You need Ubuntu 24.04 and ROS 2 Jazzy ([install guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)).
+You need Ubuntu 24.04 and ROS 2 Jazzy ([install guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)). The rest takes about ten minutes.
 
 ```bash
 # 1. system packages
@@ -36,7 +36,7 @@ sudo apt install ros-jazzy-desktop ros-dev-tools python3-venv python3-pip \
 mkdir -p ~/ros_ws/src && cd ~/ros_ws/src
 git clone --recursive https://github.com/alihsar1kaya/cybership_blueboat.git
 
-# 3. Python packages
+# 3. Python packages, in a virtual environment that can still see ROS
 cd ~/ros_ws
 python3 -m venv venv --system-site-packages && touch venv/COLCON_IGNORE
 source /opt/ros/jazzy/setup.bash && source venv/bin/activate
@@ -48,18 +48,7 @@ rosdep install --from-paths src -i -y --rosdistro jazzy
 colcon build --symlink-install
 ```
 
----
-
-## Run
-
-```bash
-source install/setup.bash
-ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
-```
-
-RViz opens with the boat. Pick **2D Goal Pose** in the toolbar, then click and drag on the map to set the position and heading. The boat goes there and stays.
-
-Every new terminal has to be sourced first:
+Every terminal you open afterwards has to be sourced before ROS commands work:
 
 ```bash
 cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && source install/setup.bash
@@ -67,53 +56,178 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 
 ---
 
-## Switches
+## First run
 
-### At start
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true
+```
 
-Add these to the end of the `ros2 launch` line.
+RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. Short moves of a metre or so are done sideways. For longer ones the boat turns, drives forwards or backwards (whichever is quicker) and then turns to the heading you chose. Once there it stays within a centimetre or two.
 
-| Add | Effect |
-|---|---|
-| `dp:=true` | starts the controller. Without it the boat just floats |
-| `observer:=true` | the controller gets noisy sensor data through a Kalman filter instead of the true state |
-| `gnss:=rtk` | GNSS with about 2 cm error. The default receiver has about 20 cm noise and drifts slowly |
-| `waves:=true` | waves, 0.05 m high by default. Change the height with `wave_hs:=0.08` |
-| `wind_speed:=8 wind_dir:=90` | 8 m/s wind blowing towards east |
-| `use_gui:=false` | runs without RViz, for servers and automatic tests |
+Stop everything with `Ctrl+C` in the launch terminal.
 
-### While it runs
+---
 
-Run these in a second terminal.
+## Examples
 
-| To | Command |
-|---|---|
-| turn waves on or off | `ros2 param set /microampere/sim environment.waves.Hs 0.05` (0 is off) |
-| turn wind on or off | `ros2 param set /microampere/sim environment.wind.speed 8` (0 is off) |
-| change the wind direction | `ros2 param set /microampere/sim environment.wind.direction_deg 90` |
-| turn current on or off | `ros2 param set /microampere/sim environment.current.speed 0.15` (0 is off) |
-| change the current direction | `ros2 param set /microampere/sim environment.current.direction_deg 90` |
-| switch the controller off or on | `ros2 service call /microampere/position_controller/change_state std_srvs/srv/SetBool "{data: false}"` (`true` turns it back on) |
+Each example is a complete command you can paste. They all start the controller (`dp:=true`), so you can give goals in RViz as in the first run.
 
-Directions use the marine convention: x is north, y is east, and 90° is east. Wind, waves and current are all given as the direction they move towards, so a wind coming from the north is `wind_dir:=180`.
+### 1. Calm water, perfect knowledge
 
-The BlueBoat is a 1.2 m boat built for calm water, so keep the waves between 0.02 and 0.1 m. At 0.1 m it already rolls and pitches about 1°.
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true
+```
 
-<details>
-<summary>Sending a goal from the terminal</summary>
+The controller is given the true position and velocity straight from the simulator. This is the best the boat can do and a good baseline when you compare other settings.
+
+### 2. Realistic sensors
+
+```bash
+# accurate RTK GNSS (about 2 cm)
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+
+# ordinary GNSS (about 20 cm noise and a slow drift of a few decimetres)
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true
+```
+
+With `observer:=true` the controller no longer sees the truth. It gets GNSS, compass and gyro readings at their real rates, and a Kalman filter turns them into an estimate. With RTK the boat holds 1–2 cm. With ordinary GNSS it holds 5–15 cm, but it slowly wanders with the GNSS error because it has no way of knowing the receiver is wrong. That is why the real boat should have RTK.
+
+### 3. Waves
+
+Pick a wave height with `wave_hs` (in metres). The BlueBoat is built for calm water, so the useful range is small:
+
+| Sea | Command addition | What you see |
+|---|---|---|
+| Light ripples | `waves:=true wave_hs:=0.02` | barely moves |
+| Default | `waves:=true` (0.05 m) | rolls and pitches about 0.5° |
+| Choppy for this boat | `waves:=true wave_hs:=0.1` | rolls and pitches about 1°, heaves 2 cm |
+
+For example:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.1
+```
+
+You can also change the waves while the simulator runs. Open a second terminal and turn them up, down or off:
+
+```bash
+ros2 param set /microampere/sim environment.waves.Hs 0.03            # calmer
+ros2 param set /microampere/sim environment.waves.Hs 0.1             # rougher
+ros2 param set /microampere/sim environment.waves.Hs 0               # off
+ros2 param set /microampere/sim environment.waves.direction_deg 90   # waves now travel towards east
+ros2 param set /microampere/sim environment.waves.Tp 2.0             # shorter, steeper waves
+```
+
+The boat rocks with the waves, but the controller should not try to fight that motion. The Kalman filter separates the slow drift from the fast wave motion, so the thrusters stay calm. You can see this on `sim/path_lf` in RViz, the track without the wave motion.
+
+### 4. Wind
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk wind_speed:=8 wind_dir:=90
+```
+
+This is an 8 m/s wind (a fresh breeze, Beaufort 5) blowing towards east, so it hits the boat from the side. The bow thruster pushes back with about 6 N and the boat still holds within a centimetre.
+
+```bash
+ros2 param set /microampere/sim environment.wind.speed 12           # stronger
+ros2 param set /microampere/sim environment.wind.direction_deg 180  # now blowing towards south
+ros2 param set /microampere/sim environment.wind.sigma 0.5          # gusts on
+ros2 param set /microampere/sim environment.wind.mu 0.1             # how quickly gusts die out [1/s]
+```
+
+### 5. Current
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+# then, in a second terminal:
+ros2 param set /microampere/sim environment.current.speed 0.15
+ros2 param set /microampere/sim environment.current.direction_deg 90
+```
+
+Current is the hardest load for this boat. Sideways it can only push back with the bow thruster, and a side current above roughly 0.25 m/s is more than that thruster can hold. Head-on the stern thrusters take it easily, so if the current gets strong, give the boat a goal heading that points the bow into it.
+
+### 6. Everything at once
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk \
+    waves:=true wave_hs:=0.05 wave_dir:=45 wind_speed:=6 wind_dir:=90
+ros2 param set /microampere/sim environment.current.speed 0.1      # in a second terminal
+```
+
+### 7. Without RViz
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk use_gui:=false
+```
+
+Useful on a server or for automatic tests. Send goals from the terminal:
 
 ```bash
 # 5 m north, 3 m east, heading 45° (quaternion z = sin(45°/2), w = cos(45°/2))
 ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
   "{header: {frame_id: world}, pose: {position: {x: 5.0, y: 3.0}, orientation: {z: 0.383, w: 0.924}}}"
 ```
-</details>
+
+The scripts in [`tools/`](tools/README.md) do this for you and log the result. This one moves the boat 10 m north in a side current and prints the path length and how well it held position afterwards:
+
+```bash
+GOAL="10 0 0" CURRENT="0.15 90" bash src/cybership_blueboat/tools/run_goal_motion_test.sh demo 0 observer:=true gnss:=rtk
+```
+
+### Switching the controller off and on
+
+```bash
+ros2 service call /microampere/position_controller/change_state std_srvs/srv/SetBool "{data: false}"   # thrusters to zero
+ros2 service call /microampere/position_controller/change_state std_srvs/srv/SetBool "{data: true}"    # back on
+```
+
+---
+
+## Reference
+
+### Launch arguments
+
+Add them to the end of the `ros2 launch` line as `name:=value`. They are read once at start.
+
+| Argument | Default | Unit | Meaning |
+|---|---|---|---|
+| `vessel` | `voyager` | | which boat; loads `cybership_config/config/<vessel>/vessel.yaml` |
+| `dp` | `false` | | start the controller, guidance and thrust allocation |
+| `observer` | `false` | | feed the controller from simulated sensors and a Kalman filter instead of the true state |
+| `gnss` | `standard` | | `standard` or `rtk`; both profiles are defined in `vessel.yaml` |
+| `noisy_odom` | `false` | | without the observer: give the controller the true state plus white noise |
+| `waves` | `false` | | start with waves |
+| `wave_hs` | `0.05` | m | significant wave height; keep it below about 0.15 m for this boat |
+| `wave_tp` | `2.3` | s | peak period; 1.5–3 s fits short, wind-driven waves |
+| `wave_dir` | `0` | deg | direction the waves travel towards |
+| `wind_speed` | `0` | m/s | mean wind speed |
+| `wind_dir` | `0` | deg | direction the wind blows towards |
+| `use_gui` | `true` | | start RViz |
+
+### Weather while running
+
+Change these with `ros2 param set /microampere/sim <name> <value>`. They take effect at once.
+
+| Parameter | Default | Unit | Meaning |
+|---|---|---|---|
+| `environment.waves.Hs` | from `wave_hs` | m | wave height, 0 turns the waves off |
+| `environment.waves.Tp` | from `wave_tp` | s | peak period |
+| `environment.waves.direction_deg` | from `wave_dir` | deg | travel direction |
+| `environment.waves.spreading` | `1` | | 1 for short-crested (realistic) waves, 0 for long, parallel crests |
+| `environment.wind.speed` | from `wind_speed` | m/s | mean wind speed, 0 turns the wind off |
+| `environment.wind.direction_deg` | from `wind_dir` | deg | direction the wind blows towards |
+| `environment.wind.sigma` | `0` | m/s/√s | gust strength, 0 for steady wind |
+| `environment.wind.mu` | `0` | 1/s | how fast gusts return to the mean |
+| `environment.current.speed` | `0` | m/s | current speed, 0 turns it off |
+| `environment.current.direction_deg` | `0` | deg | direction the current flows towards |
+
+Directions use the marine convention: x is north, y is east, and 90° is east. Wind, waves and current are all given as the direction they move towards, so a wind coming from the north is `wind_dir:=180`.
 
 ---
 
 ## Change the boat
 
-All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybership_config/config/microampere/vessel.yaml). The simulator, the controller and the observer read the same file, so you only change things in one place. Edit it and restart the launch; there is no need to rebuild.
+All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybership_config/config/microampere/vessel.yaml). The simulator, the controller and the observer read the same file, so you only change things in one place. Edit it and restart the launch; you don't need to rebuild.
 
 | Section | Contents |
 |---|---|
@@ -195,14 +309,15 @@ All topics are under the vessel name, for example `/microampere/sensor/gnss`. A 
 
 | Topic | Type | From and to |
 |---|---|---|
-| `sensor/gnss` | `sensor_msgs/NavSatFix` | simulator or real GNSS to the observer |
-| `sensor/imu` | `sensor_msgs/Imu` | simulator or real IMU to the observer |
+| `sensor/gnss` | `sensor_msgs/NavSatFix` | simulator or real GNSS to the observer (5 Hz) |
+| `sensor/imu` | `sensor_msgs/Imu` | simulator or real IMU to the observer (50 Hz) |
 | `navigation/odom` | `nav_msgs/Odometry` | observer to the controller |
-| `control/force/command/position` | `geometry_msgs/Wrench` | controller to the force mux |
+| `control/force/command/position` | `geometry_msgs/Wrench` | controller to the force mux (body frame, N and Nm) |
 | `control/force/command/manual` | `geometry_msgs/Wrench` | joystick or your own node to the force mux |
 | `control/force/command/mux` | `geometry_msgs/Wrench` | force mux to the allocation |
 | `thruster/<name>/command` | `geometry_msgs/Wrench` | allocation to the simulator or real thrusters |
 | `sim/odom_true` | `nav_msgs/Odometry` | true state from the simulator, for evaluation |
+| `sim/path_lf` | `nav_msgs/Path` | the track without wave motion, for RViz |
 
 To drive manually through the mux: `ros2 service call /microampere/force_mux/select topic_tools_interfaces/srv/MuxSelect "{topic: control/force/command/manual}"`
 </details>
@@ -230,7 +345,17 @@ To drive manually through the mux: `ros2 service call /microampere/force_mux/sel
 python3 -m pytest -q src/cybership_blueboat/cybership_utilities/test src/cybership_blueboat/cybership_dp/test
 ```
 
-The scripts in [`tools/`](tools/README.md) run longer scenarios without RViz, such as step responses or holding position in current, waves and wind.
+The unit tests check the boat model, the weather, the sensors, the Kalman filter, the thrust allocation and the path following. They take about a minute and need no ROS nodes running.
+
+---
+
+## Known limitations
+
+- Several boat values are still estimates (centre of gravity, inertia, surge time constant, thruster positions). They are marked ESTIMATE in `vessel.yaml` and should be measured on the real boat.
+- The slow drift force from waves (second order) is not modelled. The Kalman filter's bias estimate absorbs it, as it would on the real boat.
+- The wind areas come from the CAD model. The real boat's antennas and electronics are not in it.
+- There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.
+- Only one goal at a time; there are no waypoint routes and no obstacle avoidance.
 
 ---
 
@@ -240,6 +365,12 @@ The scripts in [`tools/`](tools/README.md) run longer scenarios without RViz, su
 <summary>Nothing happens, or two terminals don't see each other</summary>
 
 Check that both terminals ran the `source` line and use the same `ROS_DOMAIN_ID` (`echo $ROS_DOMAIN_ID`).
+</details>
+
+<details>
+<summary>"Address already in use", or two boats fight each other</summary>
+
+An older simulator is still running. Stop it with `Ctrl+C` in its terminal before starting a new one.
 </details>
 
 <details>
