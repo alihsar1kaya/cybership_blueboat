@@ -91,6 +91,23 @@ ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true ob
 
 RViz opens with the boat. Click **2D Goal Pose** in the top bar, then click and drag on the map: the boat drives there and holds the position and heading. 🎉
 
+**With weather:** start with waves and wind:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk \
+    waves:=true wave_hs:=0.1 wind_speed:=8 wind_dir:=90
+```
+
+Waves, wind and current can also be switched on and off while the simulator runs, from a second terminal:
+
+```bash
+ros2 param set /microampere/sim environment.waves.Hs 0.1          # waves on (0 = off)
+ros2 param set /microampere/sim environment.wind.speed 8          # wind 8 m/s (0 = off)
+ros2 param set /microampere/sim environment.current.speed 0.15    # current 0.15 m/s (0 = off)
+```
+
+See [Everyday use](#everyday-use-switch-things-on-and-off) for all options.
+
 > **Every new terminal** needs the three `source` lines:
 > ```bash
 > cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && source install/setup.bash
