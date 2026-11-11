@@ -140,12 +140,7 @@ def model_parameters(config, rho=1000.0, g=9.81):
     G[4, 4] += mass * g * cg[2]
 
     if model and "damping" in model:
-        d = dict(model["damping"])
-        u0 = (config.get("thruster_model") or {}).get("zero_thrust_speed")
-        if u0 and "max_thrust" in d and "max_speed" in d:
-            # thrust drops with speed (actuators.py): at top speed the drag equals the thrust left there
-            d["max_thrust"] = float(d["max_thrust"]) * max(1.0 - float(d["max_speed"]) / float(u0), 0.0)
-        D, extra = _fossen_damping(d, np.diag(MRB) + np.diag(MA), np.diag(G), B_eq)
+        D, extra = _fossen_damping(model["damping"], np.diag(MRB) + np.diag(MA), np.diag(G), B_eq)
         nonlinear.update(extra)
         source += ", Fossen damping"
     elif model:
@@ -169,7 +164,7 @@ def _fossen_damping(d, M, G, B_eq=None):
 
     Surge, as Fossen calibrates the Otter:
         X_u    = M11 / T_surge                    linear, dominates at low speed
-        X_|u|u = max_thrust / max_speed^2         quadratic, gives the top speed
+        X_|u|u = max_thrust / max_speed^2         quadratic: the hull resistance is max_thrust at max_speed
         X = -(X_u e^(-k|u|) u + X_|u|u |u| u)     blending, k = surge_linear_decay (3)
 
     With hydro data (B_eq != 0), the linear D is Fossen's D = B_eq + Bv (MSS computeManeuveringModel.m):
@@ -231,3 +226,15 @@ def D_3dof(params):
     """Linear damping for surge, sway, yaw as a 3x3 matrix."""
     idx = [0, 1, 5]
     return params["D"][np.ix_(idx, idx)]
+
+
+def velocity_forces_3dof(craft):
+    """
+    Function nu_r = [u, v, r] -> D(nu_r) nu_r + C(nu_r) nu_r in surge, sway and yaw [N, N, N m] of a
+    MarineCraft (positive = opposing the motion): the velocity-dependent forces of the 3-DOF model
+    M nu_r_dot + C(nu_r) nu_r + D(nu_r) nu_r = tau, for the observer and the feedforward.
+    """
+    def forces(nu_r):
+        nu6 = np.array([nu_r[0], nu_r[1], 0.0, 0.0, 0.0, nu_r[2]])
+        return (-craft.damping(nu6) + craft.coriolis(nu6, nu6) @ nu6)[[0, 1, 5]]
+    return forces

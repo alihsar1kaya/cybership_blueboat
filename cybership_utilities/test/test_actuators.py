@@ -201,3 +201,16 @@ def test_reverse_thrust_drops_when_backing_up():
     t.step(0.01)
     t.inflow = -1.0                                       # inflow along the thrust axis is backwards
     assert -40.0 < t.output()[0] < 0.0
+
+
+def test_bollard_thrust_for_is_the_inverse_of_the_inflow_model():
+    """Ask for the corrected thrust and the thruster delivers what was wanted, ahead and astern."""
+    from cybership_utilities.marine_craft.actuators import bollard_thrust_for
+    for wanted, inflow in ((30.0, 0.6), (30.0, -0.3), (-20.0, -0.4), (-20.0, 0.5), (5.0, 1.5)):
+        t = FixedThruster(max_force=67.0, reverse_ratio=0.8, zero_thrust_speed=5.0)
+        t.set_command(bollard_thrust_for(wanted, inflow, 67.0, 0.8, 5.0))
+        t.step(0.01)
+        t.inflow = inflow
+        assert t.output()[0] == pytest.approx(wanted, abs=1e-6)
+    assert bollard_thrust_for(30.0, 0.6, 67.0, 0.8, 5.0) > 30.0        # more command when moving ahead
+    assert bollard_thrust_for(30.0, 0.6, 67.0) == 30.0                 # no inflow model: unchanged

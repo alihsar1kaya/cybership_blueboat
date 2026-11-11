@@ -177,3 +177,34 @@ def test_wave_filter_removes_the_wave_frequency_motion():
     assert with_wf[:, 0].std() < 0.3 * without[:, 0].std()       # LF north: waves filtered out
     assert with_wf[:, 0].std() < 0.03
     assert with_wf[:, 3].std() == pytest.approx(amp / math.sqrt(2), rel=0.3)   # WF state takes them
+
+
+def test_current_estimate_in_a_cross_current():
+    """
+    Station keeping in a 0.15 m/s current towards east while the heading goes from north to east and
+    back. With the current as a state the filter finds its velocity, and the bias stays small instead
+    of carrying the whole drag (about 30 N sideways at heading north).
+    """
+    p = microampere()
+    craft = vessel_model.make_marine_craft(p)
+    craft.current_ned = np.array([0.0, 0.15, 0.0])
+    damping = lambda nu: -craft.damping(np.array([nu[0], nu[1], 0, 0, 0, nu[2]]))[IDX]
+    kf = DPKalmanFilter(vessel_model.M_eff_3dof(p), vessel_model.D_3dof(p), q_bias=[0.2, 0.2, 0.02],
+                        q_nu=[0.05, 0.05, 0.005], damping=damping, current={"q": 1e-5, "p0": 0.04})
+    m = np.diag(vessel_model.M_eff_3dof(p))
+
+    def hold(t):
+        # PD on the true state plus the drag of the current, heading 0 -> 90 -> 0 deg
+        psi_d = math.radians(90.0) * min(max((t - 60.0) / 30.0, 0.0), 1.0) * (1.0 if t < 180.0 else 0.0)
+        eta, nu = craft.eta[IDX], craft.nu[IDX]
+        R = Rzyx(0, 0, eta[2])[:2, :2]
+        nu_c = np.r_[R.T @ craft.current_ned[:2], 0.0]
+        e = np.r_[R.T @ -eta[:2], ssa(psi_d - eta[2])]
+        return m * 0.5**2 * e - 2 * m * 0.5 * nu + damping(-nu_c)
+
+    log = run(craft, kf, hold, 300.0)
+    assert kf.current == pytest.approx([0.0, 0.15], abs=0.03)
+    assert np.abs(kf.bias[:2]).max() < 5.0
+    last = log[log[:, 0] > 120]
+    assert np.sqrt(np.mean((last[:, 10:12] - last[:, 4:6]) ** 2)) < 0.05      # velocity over ground
+    assert kf.nu_r[:2] == pytest.approx(kf.nu[:2] - Rzyx(0, 0, kf.eta[2])[:2, :2].T @ kf.current)

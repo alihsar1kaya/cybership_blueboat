@@ -75,3 +75,38 @@ def test_azimuth_set_point_holds_when_demand_is_tiny():
     a.allocate([0, 30, 0], SIDE)
     _, alpha, _ = a.allocate([0, -0.1, 0], SIDE)       # tiny opposite demand: do not swing 180 deg
     assert math.degrees(alpha["bow_azimuth"]) == pytest.approx(90)
+
+
+def test_inflow_compensation_restores_the_thrust_lost_at_speed():
+    """
+    0.6 m/s ahead with the stern thrusters against each other (holding a yaw moment): the one pushing
+    ahead loses thrust and the one in reverse gains, which is a net drag. The compensated commands,
+    run through the thruster model, give the forces the allocation wanted.
+    """
+    from cybership_utilities.marine_craft.actuators import FixedThruster
+    with open(os.path.join(REPO, "cybership_config", "config", "microampere", "vessel.yaml")) as f:
+        thrusters = yaml.safe_load(f)["thrusters"]
+    a = ConstrainedAllocator(thrusters, zero_thrust_speed=5.0)
+    f, _, _ = a.allocate([5.0, 0.0, 8.0], FWD)
+    assert f[0] > 0 > f[1]
+    nu_r = [0.6, 0.0, 0.1]
+    cmd = a.compensate_inflow(f, FWD, nu_r)
+    assert cmd[0] > f[0] and abs(cmd[1]) < abs(f[1])
+    for t, wanted, c in list(zip(thrusters, f, cmd))[:2]:
+        thr = FixedThruster(max_force=67.0, reverse_ratio=0.8, zero_thrust_speed=5.0)
+        thr.set_command(c)
+        thr.step(0.01)
+        thr.inflow = nu_r[0] - nu_r[2] * t["position"][1]
+        assert thr.output()[0] == pytest.approx(wanted, abs=1e-6)
+    # without an inflow model the forces pass through unchanged
+    assert np.allclose(microampere().compensate_inflow(f, FWD, nu_r), f)
+
+
+def test_azimuth_set_point_ignores_demands_below_the_threshold():
+    with open(os.path.join(REPO, "cybership_config", "config", "microampere", "vessel.yaml")) as f:
+        a = ConstrainedAllocator(yaml.safe_load(f)["thrusters"], angle_threshold=3.0)
+    a.allocate([0, 30, 0], SIDE)
+    _, alpha, _ = a.allocate([4.0, 0.0, 0.0], SIDE)     # 1.3 N per thruster ahead: not worth a turn
+    assert math.degrees(alpha["bow_azimuth"]) == pytest.approx(90)
+    _, alpha, _ = a.allocate([30.0, 0.0, 0.0], SIDE)
+    assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(0, abs=1e-6)

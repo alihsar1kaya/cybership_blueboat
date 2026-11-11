@@ -77,11 +77,13 @@ model:
     # The linear term gives the DP (low-speed) response and fades out with speed, the quadratic term
     # the top speed, so the two are not counted twice (L3b p. 26, 30).
     surge_time_constant: 5.0   # [s] Otter value (experiments). MEASURE: step in thrust at low speed
-    # Top speed with the two stern thrusters (134 N). Estimate: ITTC-57 friction on the CAD wetted
-    # area plus wave/form resistance calibrated on the BlueBoat datasheet (~9 N at 1 m/s, 80 N at
-    # 3 m/s for 16.9 kg), scaled to 30.2 kg -> X_|u|u = 13.5. MEASURE: top speed, stern thrusters only.
+    # Hull resistance: max_thrust at max_speed. Estimate: ITTC-57 friction on the CAD wetted area plus
+    # wave/form resistance calibrated on the BlueBoat datasheet (~9 N at 1 m/s, 80 N at 3 m/s for
+    # 16.9 kg), scaled to 30.2 kg -> X_|u|u = 13.5. This is the hull alone: the propellers give less
+    # thrust at speed (thruster_model below), so the boat tops out at about 2.3 m/s on the stern
+    # thrusters, not at max_speed. MEASURE: surge steps (tools/identification.md).
     max_speed: 3.15            # [m/s]
-    max_thrust: 134.0          # [N] 2 x 67 N
+    max_thrust: 134.0          # [N] resistance at max_speed (2 x 67 N bollard)
     surge_linear_decay: 3.0    # [s/m] Otter value
     sway_time_constant: 1.0    # [s] Y_v = M22 / T_sway   (Otter value)
     yaw_time_constant: 1.0     # [s] N_r = M66 / T_yaw    (Otter value)
@@ -157,8 +159,8 @@ sensors:
 #   ros2 param set /microampere/sim battery.voltage 14.8
 # Speed: with a linear K_T(J) (Fossen 9.1) full throttle gives no thrust at the inflow speed u_0 (pitch
 # speed). ESTIMATE from the datasheet: theoretical jet speed 4.45 m/s at 16 V (3600 rpm), scaled to 20 V
-# with sqrt(thrust) -> ~5.0 m/s. The surge drag X_|u|u is calibrated with the thrust left at max_speed
-# (vessel_model.py), so the top speed stays max_speed. MEASURE: bollard pull and thrust at speed.
+# with sqrt(thrust) -> ~5.0 m/s. The hull resistance (model.damping) does not depend on this value, so
+# the top speed follows from the two: ~2.3 m/s on the stern thrusters. MEASURE: bollard pull and top speed.
 thruster_model:
   rated_voltage: 20.0          # [V] voltage at which max_force applies
   battery_voltage: 20.0        # [V] start value of the parameter battery.voltage
@@ -182,6 +184,13 @@ allocation:
   method: constrained_qp
   dofs: [X, Y, N]
   slack_weights: [1.0e4, 1.0e4, 1.0e5]
+  # [N] the azimuth set-point only moves when at least this much is asked of it. With 1 N it chased the
+  # direction of forces too small to matter (4400 deg of turning over 14 goals in calm water, 70 with 3 N,
+  # same settling time and accuracy).
+  angle_threshold: 3.0
+  # correct the commands for the thrust lost at speed (thruster_model.zero_thrust_speed), using the
+  # observer's velocity and current estimate
+  inflow_compensation: true
 
 # ESC/PWM model (cybership_utilities/marine_craft/actuators.py, PwmThrusterCurve): Blue Robotics T200
 # with Basic ESC, 1100-1900 us, neutral 1500 us, deadzone +-25 us, thrust ~ quadratic in the pulse

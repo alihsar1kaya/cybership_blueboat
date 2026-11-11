@@ -70,11 +70,21 @@
       # [deg/s] then turn to the final heading at this rate (a 144 deg turn in 4 s pushed it 0.5 m away)
       final_turn_rate_deg_s: 15.0
       # Manoeuvre choice per goal (forward / reverse / dp) by estimated time:
-      #   T = (turn to the course + turn to the final heading) / turn rate + distance / speed
-      # e.g. 3 m straight behind, same heading: reverse ~9 s vs forward ~23 s (turn 180 there and back)
-      forward_speed: 0.6         # [m/s] bow first (DP transit with the reference filter)
+      #   T    = (turn to the course + turn to the final heading) / turn rate + distance / speed
+      #   T_dp = distance / speed in that body direction + turn to the final heading / final turn rate
+      # e.g. 3 m straight behind, same heading: reverse ~9 s vs forward ~35 s (turn 180 there and back);
+      # 3 m straight to the side: dp 15 s vs forward 20 s (measured 31 s vs 45 s to settle within 5 cm)
+      forward_speed: 0.6         # [m/s] bow first
       reverse_speed: 0.35        # [m/s] stern first: 80 % reverse thrust, blunt transom
-      turn_rate_deg_s: 20.0      # [deg/s] incl. accelerating (180 deg in ~9 s measured)
+      turn_rate_deg_s: 12.0      # [deg/s] average over a turn incl. starting and stopping
+      # The reference moves no faster than these speeds (forward_speed, reverse_speed, sway_speed as an
+      # ellipse in the body frame), through the water when the observer estimates the current. Without
+      # the limit the reference filter's speed grows with the distance: 4 m sideways asked for more sway
+      # force than the bow azimuth has (0.2 m/s sideways takes about 45 of its 67 N).
+      sway_speed: 0.2            # [m/s] 0 = no speed limit
+      min_speed: 0.05            # [m/s] over ground when the current alone uses up the limit
+      max_turn_rate_deg_s: 25.0  # [deg/s] heading reference; a 180 deg step gave 35 deg/s and 1 m of drift
+      max_dp_distance: 4.0       # [m] moving directly is an option up to here (it costs more thrust)
       max_reverse_distance: 6.0  # [m] back up only short distances
       align_angle_deg: 20.0     # [deg]
       # Transit = path following along the line start -> goal (Fossen Ch. 12.5, TTK4190 L6 slides 59-61):
@@ -95,7 +105,9 @@
 
     # Reference filter parameters
     filter:
-      omega: [0.25, 0.25, 0.80]  # Natural frequency for reference filter (yaw 0.8: peak ~36 deg/s, model max ~43)
+      # position 0.4: the speed limits in guidance bound the demand now, so the filter only rounds the
+      # corners (0.25 without limits; with the limits 0.25 lags 12 s behind and 0.5 starts to overshoot)
+      omega: [0.40, 0.40, 0.80]  # [rad/s] yaw 0.8: peak ~36 deg/s for a step, model max ~43
       delta: [1.00, 1.00, 1.00]     # Damping ratio for reference filter
 
     # Performance metrics configuration

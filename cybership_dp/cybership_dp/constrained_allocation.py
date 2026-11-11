@@ -16,6 +16,12 @@ Constrained thrust allocation with slack (Fossen 2021, Sec. 11.2.3), in two stag
                  s is the slack: the part of tau the thrusters cannot give. Q >> W, and Q per DOF
                  sets the priority when the demand is too large (e.g. keep heading, give up sway).
 
+Thrust loss at speed (compensate_inflow): a propeller gives less thrust when the water already flows
+into it (actuators.py, linear K_T(J)). The forces from stage 2 are what the thrusters should deliver; the
+command is raised (or lowered) so that they do at the boat's speed through the water. Without it the
+loss acts as a drag the controller does not know about, about 10 N at 0.6 m/s with the stern thrusters
+working against each other, and the boat overshoots when it stops.
+
 Plain Python (numpy/scipy), only surge, sway and yaw (X, Y, N). Thruster data from vessel.yaml.
 """
 
@@ -23,6 +29,8 @@ import math
 
 import numpy as np
 from scipy.optimize import lsq_linear
+
+from cybership_utilities.marine_craft.actuators import bollard_thrust_for
 
 
 def _wrap(a):
@@ -36,14 +44,17 @@ def _column(direction, x, y):
 
 
 class ConstrainedAllocator:
-    def __init__(self, thrusters, slack_weights=(1e4, 1e4, 1e5), angle_threshold=1.0):
+    def __init__(self, thrusters, slack_weights=(1e4, 1e4, 1e5), angle_threshold=1.0, zero_thrust_speed=None):
         """
         thrusters: vessel.yaml thruster entries (type, position, max_force, reverse_ratio,
                    direction_deg for fixed thrusters, allocation.weight).
         slack_weights: Q = diag(qX, qY, qN).
         angle_threshold [N]: only move an azimuth set-point when it is asked for at least this much
                    force, so it does not swing around when the demand is near zero.
+        zero_thrust_speed [m/s]: u_0 of the thrusters (thruster_model in vessel.yaml) for
+                   compensate_inflow; None = thrust independent of speed.
         """
+        self.zero_thrust_speed = zero_thrust_speed
         self.thrusters = list(thrusters)
         self.Q = np.asarray(slack_weights, dtype=float)
         self.angle_threshold = float(angle_threshold)
@@ -116,3 +127,21 @@ class ConstrainedAllocator:
         b = np.concatenate([np.sqrt(self.Q) * tau, np.zeros(len(self.thrusters))])
         f = lsq_linear(A, b, bounds=(self.lb, self.ub), method="bvls").x
         return f, alpha_cmd, T @ f - tau
+
+    def compensate_inflow(self, f, angles, nu_r):
+        """
+        Thrust to command (bollard, what the driver maps to PWM) so that each thruster delivers f at the
+        velocity through the water nu_r = [u_r, v_r, r]. The inflow of a thruster at (x, y) pointing along
+        alpha is (u_r - r y) cos(alpha) + (v_r + r x) sin(alpha). Clipped to the thruster limits.
+        """
+        if self.zero_thrust_speed is None:
+            return np.asarray(f, dtype=float)
+        u, v, r = nu_r
+        out = []
+        for t, f_i in zip(self.thrusters, f):
+            x, y = t["position"][0], t["position"][1]
+            a = math.radians(t.get("direction_deg", 0.0)) if t["type"] == "fixed" else angles[t["name"]]
+            inflow = (u - r * y) * math.cos(a) + (v + r * x) * math.sin(a)
+            out.append(bollard_thrust_for(float(f_i), inflow, float(t.get("max_force", np.inf)),
+                                          float(t.get("reverse_ratio", 1.0)), self.zero_thrust_speed))
+        return np.clip(out, self.lb, self.ub)

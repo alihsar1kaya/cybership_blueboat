@@ -62,7 +62,7 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true
 ```
 
-RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. Short moves of a metre or so are done sideways. For longer ones the boat turns, drives forwards or backwards (whichever is quicker) and then turns to the heading you chose. Once there it stays within a centimetre or two.
+RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. The guidance estimates how long each way of getting there takes and picks the quickest. Moves up to about 4 m are often done without turning, straight towards the goal at up to 0.2 m/s sideways. For longer ones the boat turns, drives forwards or backwards and then turns to the heading you chose. Once there it stays within a centimetre or two.
 
 Stop everything with `Ctrl+C` in the launch terminal.
 
@@ -273,9 +273,9 @@ All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybershi
 | `sensors` | rate and noise for GNSS, compass and gyro |
 | `thruster_model` | battery voltage, thrust-voltage curve and how fast thrust drops with speed |
 | `latency` | delays of GNSS, IMU and thruster commands, in seconds |
-| `allocation` | how the total force is split between the thrusters |
+| `allocation` | how the total force is split between the thrusters, when the azimuth is allowed to turn (`angle_threshold`) and whether the thrust lost at speed is compensated (`inflow_compensation`) |
 
-Each value has a comment saying where it came from. The ones marked ESTIMATE still need measuring on the real boat.
+Each value has a comment saying where it came from. The ones marked ESTIMATE still need measuring on the real boat; [`tools/identification.md`](tools/identification.md) describes the tests and `tools/identify.py` turns the logs into values for this file.
 
 <details>
 <summary>Changing a thruster</summary>
@@ -304,6 +304,9 @@ The settings are in [`cybership_config/config/microampere/controller_position.ya
 | `control.omega_n` | holds tighter and uses more thrust | softer |
 | `filter.omega` | reaches a new goal sooner | smoother moves |
 | `guidance.forward_speed` | faster transit | slower transit |
+| `guidance.sway_speed` | faster sideways moves, until the bow thruster saturates (0.2 m/s takes about 45 of its 67 N) | gentler on the bow thruster |
+| `guidance.max_turn_rate_deg_s` | quicker turns; above about 30 °/s the stern thrusters saturate and the boat slides off the spot | slower turns |
+| `guidance.max_dp_distance` | longer moves are done without turning first | the boat turns and drives more often |
 
 You can change them while it runs, for example `ros2 param set /microampere/position_controller guidance.forward_speed 0.4`.
 </details>
@@ -350,11 +353,13 @@ All topics are under the vessel name, for example `/microampere/sensor/gnss`. A 
 |---|---|---|
 | `sensor/gnss` | `sensor_msgs/NavSatFix` | simulator or real GNSS to the observer (5 Hz) |
 | `sensor/imu` | `sensor_msgs/Imu` | simulator or real IMU to the observer (50 Hz) |
-| `navigation/odom` | `nav_msgs/Odometry` | observer to the controller |
+| `navigation/odom` | `nav_msgs/Odometry` | observer to the controller and the allocation |
+| `navigation/current` | `geometry_msgs/Vector3Stamped` | observer's estimate of the current (north, east, m/s) to the controller and the allocation |
 | `control/force/command/position` | `geometry_msgs/Wrench` | controller to the force mux (body frame, N and Nm) |
 | `control/force/command/manual` | `geometry_msgs/Wrench` | joystick or your own node to the force mux |
 | `control/force/command/mux` | `geometry_msgs/Wrench` | force mux to the allocation |
 | `thruster/<name>/command` | `geometry_msgs/Wrench` | allocation to the simulator or real thrusters |
+| `control/allocation/slack` | `geometry_msgs/Wrench` | allocation to the observer: the part of the commanded force the thrusters could not give |
 | `sim/odom_true` | `nav_msgs/Odometry` | true state from the simulator, for evaluation |
 | `sim/path_lf` | `nav_msgs/Path` | the track without wave motion, for RViz |
 

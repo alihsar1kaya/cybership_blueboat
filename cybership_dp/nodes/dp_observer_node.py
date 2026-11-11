@@ -6,8 +6,10 @@ state the controller uses.
     sensor/gnss                 NavSatFix  -> local NED (flat Earth, origin from vessel.yaml), lever arm removed
     sensor/imu                  Imu        -> heading (compass) and roll/pitch (for the lever arm)
     control/force/command/mux   Wrench     -> tau, the input of the model
-    navigation/odom             Odometry   <- eta_hat (pose) and nu_hat (twist, BODY)
+    control/allocation/slack    Wrench     -> the part of tau the thrusters could not give (added to tau)
+    navigation/odom             Odometry   <- eta_hat (pose) and nu_hat (twist over ground, BODY)
     navigation/bias             Vector3Stamped <- bias force b_hat in NED [N, N, N m]
+    navigation/current          Vector3Stamped <- current velocity estimate in NED [m/s] (current.estimate)
 
 The filter predicts at 'rate' Hz and corrects when a GNSS fix or a heading arrives (asynchronous,
 Ch. 13.4.4). Without GNSS it keeps predicting from the model and the compass (dead reckoning).
@@ -22,7 +24,6 @@ The GNSS noise is taken from the message covariance (it grows when an RTK receiv
 """
 
 import math
-from collections import deque
 
 import numpy as np
 import rclpy
@@ -34,7 +35,7 @@ from sensor_msgs.msg import Imu, NavSatFix
 
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.sensors import gnss_config, llh2flat
-from cybership_utilities.observer import DPKalmanFilter, remove_lever_arm
+from cybership_utilities.observer import AsyncObserver, DPKalmanFilter, remove_lever_arm
 
 IDX = [0, 1, 5]
 
@@ -54,6 +55,12 @@ class DPObserverNode(Node):
         self.declare_parameter("wave_filter.omega0", 0.0)       # [rad/s], e.g. 2 pi / Tp
         self.declare_parameter("wave_filter.zeta", 0.1)
         self.declare_parameter("wave_filter.q", [0.1, 0.1, 0.001])
+        # Ocean current as a state (velocity in NED): the damping then acts on the velocity through the
+        # water. q small: the current changes over minutes, and a fast estimate picks up model errors
+        # during manoeuvres (1e-4 and up let it drift 0.1-0.3 m/s in the sweep tests).
+        self.declare_parameter("current.estimate", True)
+        self.declare_parameter("current.q", 1.0e-5)             # [(m/s)^2/s]
+        self.declare_parameter("current.p0", 0.04)              # [(m/s)^2] initial variance (0.2 m/s)
         self.declare_parameter("delay_compensation", True)
         self.declare_parameter("gnss_timeout", 1.0)            # [s] warn and dead-reckon after this
 
@@ -64,9 +71,13 @@ class DPObserverNode(Node):
         w0 = self.get_parameter("wave_filter.omega0").value
         wf = None if w0 <= 0 else {"omega0": w0, "zeta": self.get_parameter("wave_filter.zeta").value,
                                    "q": self.get_parameter("wave_filter.q").value}
+        current = None
+        if self.get_parameter("current.estimate").value:
+            current = {"q": self.get_parameter("current.q").value, "p0": self.get_parameter("current.p0").value}
         self.kf = DPKalmanFilter(vessel_model.M_eff_3dof(params), vessel_model.D_3dof(params),
                                  q_bias=self.get_parameter("q_bias").value,
-                                 q_nu=self.get_parameter("q_nu").value, damping=damping, wave_filter=wf)
+                                 q_nu=self.get_parameter("q_nu").value, damping=damping, wave_filter=wf,
+                                 current=current)
         s = config.get("sensors", {})
         gnss = gnss_config(config, self.get_parameter("gnss_profile").value) if "gnss" in s else {}
         compass = s.get("compass", {})
@@ -78,37 +89,40 @@ class DPObserverNode(Node):
         self.sigma_psi = math.radians(compass.get("sigma_deg", 1.0))
 
         self.tau = np.zeros(3)
+        self.slack, self.t_slack = np.zeros(3), -math.inf
         self.roll_pitch = (0.0, 0.0)
-        self.initialized = {"gnss": False, "psi": False}
         self.h = 1.0 / self.get_parameter("rate").value
-        # history for delayed fixes: states before each prediction and the headings in between, ~1 s
-        self.history = deque(maxlen=int(1.0 / self.h))
-        self.headings = deque(maxlen=int(2.0 / self.h))
+        # the filter with the delayed-fix handling (shared with the offline tests)
+        self.observer = AsyncObserver(self.kf, self.h, self.sigma_psi,
+                                      delay_compensation=self.get_parameter("delay_compensation").value)
         self.t_gnss = None
         self.gnss_lost = False
 
         self.create_subscription(NavSatFix, "sensor/gnss", self.on_gnss, 10)
         self.create_subscription(Imu, "sensor/imu", self.on_imu, 10)
         self.create_subscription(Wrench, "control/force/command/mux", self.on_tau, 10)
+        self.create_subscription(Wrench, "control/allocation/slack", self.on_slack, 10)
         self.pub_odom = self.create_publisher(Odometry, "navigation/odom", 10)
         self.pub_bias = self.create_publisher(Vector3Stamped, "navigation/bias", 10)
+        self.pub_current = self.create_publisher(Vector3Stamped, "navigation/current", 10)
         self.create_timer(self.h, self.step)
-        self.get_logger().info(f"DP Kalman filter (Fossen 13.4.6, wave filter {wf}) from {path}: "
+        self.get_logger().info(f"DP Kalman filter (Fossen 13.4.6, wave filter {wf}, current {current}) from {path}: "
                                f"GNSS sigma {self.sigma_gnss:.2f} m, "
                                f"compass {math.degrees(self.sigma_psi):.1f} deg, lever arm {self.lever_arm.tolist()}")
 
     def on_tau(self, msg):
         self.tau = np.array([msg.force.x, msg.force.y, msg.torque.z])
 
+    def on_slack(self, msg):
+        # saturated thrusters: the boat gets tau + slack, and the filter should be told the same,
+        # or the missing force ends up in the bias and the current
+        self.slack, self.t_slack = np.array([msg.force.x, msg.force.y, msg.torque.z]), self.now()
+
     def on_imu(self, msg):
         q = msg.orientation
         phi, theta, psi = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")
         self.roll_pitch = (phi, theta)
-        if not self.initialized["psi"]:
-            self.kf.x[self.kf.nw + 2] = psi
-            self.initialized["psi"] = True
-        self.kf.correct_compass(psi, self.sigma_psi)
-        self.headings.append((self.now(), psi))
+        self.observer.heading(self.now(), psi)
 
     def on_gnss(self, msg):
         north, east, down = llh2flat(math.radians(msg.longitude), math.radians(msg.latitude), msg.altitude,
@@ -122,45 +136,23 @@ class DPObserverNode(Node):
             self.get_logger().info(f"GNSS back after {now - self.t_gnss:.1f} s")
             self.gnss_lost = False
         self.t_gnss = now
-        if not self.initialized["gnss"]:
-            self.kf.x[self.kf.nw:self.kf.nw + 2] = p[0:2]
-            self.initialized["gnss"] = True
         t_meas = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
-        if self.get_parameter("delay_compensation").value and now - t_meas > 0.5 * self.h and self.history:
-            self.correct_delayed(t_meas, p, sigma)
-        else:
-            self.kf.correct_gnss(p[0], p[1], sigma)
+        self.observer.delay_compensation = self.get_parameter("delay_compensation").value
+        self.observer.gnss(now, t_meas, p[0], p[1], sigma)
 
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def correct_delayed(self, t_meas, p, sigma):
-        """Apply a fix taken at t_meas: back to the stored state then, correct, predict forward again."""
-        hist = list(self.history)
-        k = next((i for i in range(len(hist) - 1, -1, -1) if hist[i][0] <= t_meas), None)
-        if k is None:                       # older than the history: use it as if it were new
-            self.kf.correct_gnss(p[0], p[1], sigma)
-            return
-        t0, x, P, _ = hist[k]
-        self.kf.x, self.kf.P = x.copy(), P.copy()
-        self.kf.correct_gnss(p[0], p[1], sigma)
-        times = [h[0] for h in hist[k:]] + [self.now()]
-        for j, (t_j, _, _, tau_j) in enumerate(hist[k:]):
-            self.kf.predict(tau_j, self.h)
-            for t_psi, psi in self.headings:
-                if t_j < t_psi <= times[j + 1]:
-                    self.kf.correct_compass(psi, self.sigma_psi)
-
     def step(self):
-        if not all(self.initialized.values()):
+        if not self.observer.ready:
             return
         now = self.now()
         if not self.gnss_lost and self.t_gnss is not None and now - self.t_gnss > self.get_parameter("gnss_timeout").value:
             self.gnss_lost = True
             self.get_logger().warn("No GNSS: dead reckoning on the model and the compass")
         self.publish()
-        self.history.append((now, self.kf.x.copy(), self.kf.P.copy(), self.tau.copy()))
-        self.kf.predict(self.tau, self.h)
+        slack = self.slack if now - self.t_slack < 0.5 else 0.0
+        self.observer.step(now, self.tau + slack)
 
     def publish(self):
         stamp = self.get_clock().now().to_msg()
@@ -183,6 +175,11 @@ class DPObserverNode(Node):
         b.header.stamp, b.header.frame_id = stamp, odom.header.frame_id
         b.vector.x, b.vector.y, b.vector.z = (float(v) for v in self.kf.bias)
         self.pub_bias.publish(b)
+        if self.kf.nc:
+            c = Vector3Stamped()
+            c.header.stamp, c.header.frame_id = stamp, odom.header.frame_id
+            c.vector.x, c.vector.y = (float(v) for v in self.kf.current)
+            self.pub_current.publish(c)
 
 
 def main(args=None):

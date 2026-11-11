@@ -122,27 +122,38 @@ def test_hull_model_matches_shoeboxpy_in_straight_line():
 
 # --- Microampere: physically reasonable -------------------------------------------------------
 
-def top_speed_thrust(name="microampere"):
-    """Thrust the two stern thrusters still give at max_speed (thrust drops with speed, actuators.py)."""
-    cfg = config(name)
-    d, u0 = cfg["model"]["damping"], (cfg.get("thruster_model") or {}).get("zero_thrust_speed")
-    return d["max_thrust"] * (1 - d["max_speed"] / u0) if u0 else d["max_thrust"]
-
-
 def surge_quadratic(name="microampere"):
     return vessel_model.model_parameters(config(name))["nonlinear"]["surge_quadratic"]
 
 
-def test_microampere_top_speed_from_surge_resistance():
+def test_microampere_surge_resistance_gives_max_speed_at_max_thrust():
     """
-    Full throttle on the stern thrusters gives max_speed: X_|u|u = T(max_speed) / max_speed^2 (Fossen's
-    Otter calibration, with the thrust that is left at that speed).
+    X_|u|u = max_thrust / max_speed^2 (Fossen's Otter calibration): the hull resistance equals max_thrust at
+    max_speed. The propellers give less than that at speed (actuators.py), so the boat's real top speed is
+    lower, see test_actuators.py.
     """
     d = config("microampere")["model"]["damping"]
-    model = run(craft("microampere"), [top_speed_thrust(), 0, 0, 0, 0, 0], 60.0)
-    # the linear term has faded to e^(-3 * 3.15) ~ 1e-4 of X_u at top speed
+    assert surge_quadratic() == pytest.approx(d["max_thrust"] / d["max_speed"] ** 2)
+    model = run(craft("microampere"), [d["max_thrust"], 0, 0, 0, 0, 0], 60.0)
+    # the linear term has faded to e^(-3 * 3.15) ~ 1e-4 of X_u at that speed
     assert model.nu[0] == pytest.approx(d["max_speed"], rel=0.005)
     assert 2.5 < model.nu[0] < 3.5
+
+
+def test_microampere_top_speed_with_the_thrust_left_at_speed():
+    """
+    The propellers lose thrust with speed, T = T_0 (1 - u / u_0) at full throttle (actuators.py), so the top
+    speed on the stern thrusters is where that line crosses the hull resistance: about 2.3 m/s, not max_speed.
+    """
+    cfg = config("microampere")
+    T0, u0 = cfg["model"]["damping"]["max_thrust"], cfg["thruster_model"]["zero_thrust_speed"]
+    model = craft("microampere")
+    for _ in range(6000):
+        model.step(np.array([T0 * (1 - model.nu[0] / u0), 0, 0, 0, 0, 0]), 0.01)
+    Xuu = surge_quadratic()
+    expected = (-T0 / u0 + math.sqrt((T0 / u0) ** 2 + 4 * Xuu * T0)) / (2 * Xuu)
+    assert model.nu[0] == pytest.approx(expected, rel=0.01)
+    assert 2.0 < model.nu[0] < 2.6
 
 
 def test_surge_damping_blends_linear_into_quadratic():
@@ -243,7 +254,7 @@ def test_microampere_is_stable_at_top_speed():
     model = vessel_model.make_marine_craft(vessel_model.model_parameters(config("microampere")),
                                            eta0=np.radians([0, 0, 0, 3, 3, 0]),
                                            nu0=np.array([0, 0, 0, 0, 0, 0.05]))
-    F = 1.5 * top_speed_thrust()       # all three thrusters forward, at top speed
+    F = 1.5 * config("microampere")["model"]["damping"]["max_thrust"]   # all three thrusters forward
     run(model, [F, 0, 0, 0, 0, 0], 30.0)
     assert np.all(np.isfinite(model.nu))
     assert abs(model.eta[3]) < math.radians(1) and abs(model.eta[4]) < math.radians(1)

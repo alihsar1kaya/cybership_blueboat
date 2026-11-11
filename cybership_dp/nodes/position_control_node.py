@@ -20,7 +20,6 @@ from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Wrench, Pose2D, PoseStamped, TwistStamped, Vector3Stamped
 from nav_msgs.msg import Odometry
 import math
-import numpy as np
 from scipy.spatial.transform import Rotation as R
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionServer, GoalResponse, CancelResponse, ActionClient
@@ -123,6 +122,12 @@ class PositionController(Node):
                 ('guidance.turn_rate_deg_s', 20.0),    # [deg/s] typical turning rate incl. accelerating
                 ('guidance.max_reverse_distance', 6.0),  # [m] never back up farther than this
                 ('guidance.align_angle_deg', 20.0),    # [deg] start driving when the bow is this close
+                # limits on how fast the reference moves (0 = no limit). The speeds are through the water
+                # when the observer estimates the current: surge forward_speed / reverse_speed, sideways:
+                ('guidance.sway_speed', 0.0),          # [m/s] the bow azimuth alone carries the sway force
+                ('guidance.min_speed', 0.05),          # [m/s] over ground, when the current uses up the limit
+                ('guidance.max_turn_rate_deg_s', 0.0),  # [deg/s] heading reference
+                ('guidance.max_dp_distance', 0.0),     # [m] consider moving directly (dp) up to this distance
                 # Transit as path following along the straight line start -> goal (Fossen Ch. 12.5,
                 # TTK4190 L6): ALOS heading + surge speed control, no sway force (like the Otter USV).
                 # false: the transit is DP towards the goal through the reference filter (as before).
@@ -236,6 +241,8 @@ class PositionController(Node):
         self.integral_mb = np.zeros(3)  # model-based law: integral of [x, y, yaw] error
         self.bias_hat = None            # observer bias b_hat in NED [N, N, N m] (navigation/bias)
         self.create_subscription(Vector3Stamped, 'navigation/bias', self._on_bias, 10)
+        self.current_hat = None         # observer current velocity in NED [m/s, m/s] (navigation/current)
+        self.create_subscription(Vector3Stamped, 'navigation/current', self._on_current, 10)
 
         self.error_pos = np.zeros(2)
         self.error_yaw = 0.0
@@ -481,7 +488,7 @@ class PositionController(Node):
 
             metrics_msg = PerformanceMetrics()
             metrics_msg.header.stamp = self.get_clock().now().to_msg()
-            metrics_msg.header.frame_id = "voyager"
+            metrics_msg.header.frame_id = self.get_namespace().strip("/") or "vessel"
             metrics_msg.message = "Position tracking error (meters)"
 
             # Calculate statistics over the window
@@ -629,7 +636,7 @@ class PositionController(Node):
                                              wrap_to_pi(psi_d - current_yaw))
             self._publish_wrench(*self._path_following_tau(current_yaw, nu, psi_d, u_d))
             return
-        self.ref_filter.set_eta_r(ref)
+        self.ref_filter.set_eta_r(self._limit_reference(ref, current_yaw))
         self.ref_filter.update()
 
         # Retrieve filtered outputs: desired pose, velocity, and acceleration.
@@ -729,11 +736,30 @@ class PositionController(Node):
     def _on_bias(self, msg):
         self.bias_hat = np.array([msg.vector.x, msg.vector.y, msg.vector.z])
 
+    def _on_current(self, msg):
+        self.current_hat = np.array([msg.vector.x, msg.vector.y])
+
+    def _relative_reference(self, psi, nu_d, nu_d_dot):
+        """
+        Desired velocity and acceleration relative to the water (Fossen 10.3): nu_rd = nu_d - nu_c with
+        nu_c = R^T [V_N, V_E, 0] from the observer, and nu_c_dot = -r S nu_c for a current that is constant
+        in NED. Without a current estimate the two are returned unchanged.
+        """
+        if self.current_hat is None or not self.get_parameter('control.bias_feedforward').value:
+            return nu_d, nu_d_dot
+        nu_c = Rz(psi).T @ np.array([self.current_hat[0], self.current_hat[1], 0.0])
+        nu_c_dot = -nu_d[2] * np.array([-nu_c[1], nu_c[0], 0.0])
+        return nu_d - nu_c, nu_d_dot - nu_c_dot
+
     def _model_based_tau(self, psi, error_world, eta_d_dot, eta_d_ddot, nu):
         """
         Model-based DP law (Fossen), everything in the body frame:
 
             tau = M nu_d_dot + D(nu_d) nu_d + Kp R^T e + Kd (nu_d - nu) + Ki R^T int(e) dt
+
+        When the observer estimates the current (navigation/current) the feedforward uses the desired
+        velocity relative to the water, nu_d - R^T v_c: holding still in a current means moving through
+        the water, and the drag of that follows the hull when the boat turns.
 
         With control.bias_feedforward (observer running) the integral term is replaced by -R^T b_hat,
         the observer's estimate of the slowly varying forces (Fossen 13.4.6).
@@ -752,11 +778,12 @@ class PositionController(Node):
             tau_i = -R.T @ self.bias_hat
         else:
             tau_i = self._integral_action(R, error_world)
+        nu_rd, nu_rd_dot = self._relative_reference(psi, nu_d, nu_d_dot)
         if self._craft is not None:
-            damping_ff = -self._craft.damping(np.array([nu_d[0], nu_d[1], 0, 0, 0, nu_d[2]]))[[0, 1, 5]]
+            damping_ff = -self._craft.damping(np.array([nu_rd[0], nu_rd[1], 0, 0, 0, nu_rd[2]]))[[0, 1, 5]]
         else:
-            damping_ff = self.D_eff @ nu_d
-        tau = (self.M_eff @ nu_d_dot + damping_ff
+            damping_ff = self.D_eff @ nu_rd
+        tau = (self.M_eff @ nu_rd_dot + damping_ff
                + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
         return float(tau[0]), float(tau[1]), float(tau[2])
 
@@ -765,6 +792,7 @@ class PositionController(Node):
         f.eta_d, f.eta_d_dot, f.eta_d_ddot = eta.copy(), eta_dot.copy(), np.zeros(3)
         f._eta_r = eta.copy()
         f._x = np.concatenate([eta, eta_dot, np.zeros(3)])
+        self._carrot = eta.copy()
 
     def _path_following_tau(self, psi, nu, psi_d, u_d):
         """
@@ -777,10 +805,12 @@ class PositionController(Node):
         step = np.clip(u_d - self._u_ref, -a * self.dt, a * self.dt)
         self._u_ref += step
         u_ref_dot = step / self.dt
+        # damping on the speed through the water when the observer estimates the current
+        u_r = self._relative_reference(psi, np.array([self._u_ref, 0.0, 0.0]), np.zeros(3))[0][0]
         if self._craft is not None:
-            d = -self._craft.damping(np.array([self._u_ref, 0, 0, 0, 0, 0]))[0]
+            d = -self._craft.damping(np.array([u_r, 0, 0, 0, 0, 0]))[0]
         else:
-            d = self.D_eff[0, 0] * self._u_ref
+            d = self.D_eff[0, 0] * u_r
         X = self.M_eff[0, 0] * u_ref_dot + d + self.Kd_mb[0] * (self._u_ref - nu[0])
         N = self.Kp_mb[2] * wrap_to_pi(psi_d - psi) - self.Kd_mb[2] * nu[2]
         return float(X), 0.0, float(N)
@@ -795,15 +825,66 @@ class PositionController(Node):
                             -self.max_integral_force, self.max_integral_force)
         return tau_i
 
+    def _speed_limit(self, course, yaw):
+        """
+        Largest speed over ground [m/s] along `course` that keeps the velocity through the water inside
+        the boat's envelope: an ellipse in the body frame with forward_speed / reverse_speed along surge
+        and sway_speed along sway. Sway is the narrow one: the linear sway damping is large and only
+        the bow azimuth pushes sideways, so 0.2 m/s already takes about 45 N of its 67 N.
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        d = np.array([np.cos(course - yaw), np.sin(course - yaw)])
+        c = np.zeros(2)
+        if self.current_hat is not None:
+            c = (Rz(yaw).T @ np.array([self.current_hat[0], self.current_hat[1], 0.0]))[:2]
+        best = 0.0
+        for vx, ahead in ((g('forward_speed'), True), (g('reverse_speed'), False)):
+            w = 1.0 / np.array([vx, g('sway_speed')])**2
+            a, b, k = w @ (d * d), w @ (d * c), w @ (c * c) - 1.0
+            disc = b * b - a * k
+            if disc < 0.0:
+                continue
+            s = (b + np.sqrt(disc)) / a
+            if (s * d[0] - c[0] >= 0.0) == ahead:
+                best = max(best, s)
+        return max(best, g('min_speed'))
+
+    def _limit_reference(self, ref, yaw):
+        """
+        Rate limit the guidance reference before the reference filter. The filter alone has no speed
+        limit: its peak speed grows with the distance to the goal, so a 4 m sideways move asked for more
+        sway force than the azimuth has, and a 180 deg heading step gave 35 deg/s. The point the filter
+        follows moves towards the goal no faster than _speed_limit(), and the heading no faster than
+        max_turn_rate_deg_s.
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        c = getattr(self, '_carrot', None)
+        if c is None:
+            c = self._carrot = np.array(self.ref_filter.eta_d, dtype=float)
+        d = ref[:2] - c[:2]
+        distance = np.hypot(d[0], d[1])
+        if g('sway_speed') <= 0.0:
+            c[:2] = ref[:2]
+        elif distance > 1e-9:
+            speed = self._speed_limit(np.arctan2(d[1], d[0]), yaw)
+            c[:2] += d * min(1.0, speed * self.dt / distance)
+        step = wrap_to_pi(ref[2] - c[2])
+        rate = np.radians(g('max_turn_rate_deg_s'))
+        c[2] = wrap_to_pi(c[2] + (np.clip(step, -rate * self.dt, rate * self.dt) if rate > 0.0 else step))
+        return c.copy()
+
     def _choose_manoeuvre(self, distance, bearing, yaw):
         """
         How to get to the goal, chosen once per goal by an estimated time (seconds), like a skipper would:
 
             forward:  turn the bow to the goal, drive, turn to the final heading
             reverse:  turn the stern to the goal, back up, turn to the final heading (short distances)
-            dp:       move directly (sideways / diagonally with the azimuth), only for small corrections
+            dp:       move directly (sideways / diagonally with the azimuth) while turning slowly to the
+                      final heading; always for small corrections, and up to max_dp_distance when it is
+                      the fastest
 
             T = (|turn to the course| + |turn to the final heading|) / turn rate + distance / speed
+            T_dp = distance / speed in that body direction + |turn to the final heading| / final turn rate
         """
         g = lambda n: self.get_parameter(f'guidance.{n}').value
         if distance <= max(g('approach_radius'), g('min_transit_distance')):
@@ -816,6 +897,11 @@ class PositionController(Node):
                 continue
             turns = abs(wrap_to_pi(course - yaw)) + abs(wrap_to_pi(self.target_yaw - course))
             times[mode] = turns / rate + distance / speed
+        if g('sway_speed') > 0.0 and distance <= g('max_dp_distance'):
+            # the heading changes on the way: use the slower of the start and the final heading
+            speed = min(self._speed_limit(bearing, yaw), self._speed_limit(bearing, self.target_yaw))
+            times['dp'] = (distance / speed + abs(wrap_to_pi(self.target_yaw - yaw))
+                           / np.radians(g('final_turn_rate_deg_s')))
         best = min(times, key=times.get)
         return best, times
 

@@ -141,7 +141,9 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gns
             namespace=vessel_name,
             output="screen",
             parameters=[{"vessel_model": vessel, "frequency": 20.0}],
-            remappings=[("control/force/command", "control/force/command/mux")],
+            remappings=[("control/force/command", "control/force/command/mux")]
+            # velocity for the thrust-loss compensation: the estimate when there is an observer
+            + ([("measurement/odom", "navigation/odom")] if use_observer else []),
         ),
         # Force mux. The first input is selected at start, so the position controller drives the boat.
         launch_ros.actions.Node(

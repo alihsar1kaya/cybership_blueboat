@@ -114,6 +114,21 @@ class ThrusterConditions:
         return sign * float(np.clip(abs(f) - loss, 0.0, 1.3 * abs(f)))
 
 
+def bollard_thrust_for(thrust, inflow, max_force, reverse_ratio=1.0, zero_thrust_speed=None):
+    """
+    Inverse of the inflow model in ThrusterConditions.actual (rated voltage): the thrust T_0 to ask the
+    thruster for [N, at rest] so that it gives 'thrust' [N] with the water coming in at 'inflow' [m/s]
+    along the thrust axis. With a = sqrt(|T_0|) the model is a^2 - k a = |T|, k = sqrt(T_max) u_a / u_0.
+    """
+    if zero_thrust_speed is None or thrust == 0.0:
+        return thrust
+    sign = 1.0 if thrust > 0 else -1.0
+    f_max = max_force if thrust > 0 else reverse_ratio * max_force
+    k = math.sqrt(f_max) * inflow * sign / zero_thrust_speed
+    a = 0.5 * (k + math.sqrt(k * k + 4.0 * abs(thrust)))
+    return sign * a * a
+
+
 def _first_order(f, target, time_constant, dt):
     if time_constant <= 0.0:
         return target

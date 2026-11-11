@@ -528,7 +528,8 @@ class ConfigurableSimulator(BaseSimulator):
         if publish_state:
             self._publish_environment()
         self._publish_sensors()
-        # water velocity relative to the hull in BODY (u_r, v_r): the inflow of each propeller
+        # water velocity relative to the hull in BODY (u_r, v_r), plus the yaw rate times the thruster's
+        # position: the inflow of each propeller
         psi = self.vessel.eta[5]
         c, sn = math.cos(psi), math.sin(psi)
         vc = self.vessel.current_ned
@@ -538,7 +539,8 @@ class ConfigurableSimulator(BaseSimulator):
             act = self._actuators[t["name"]]
             act.step(self.dt)
             a = getattr(act, "angle", math.radians(t.get("direction_deg", 0.0)))
-            act.inflow = u_r * math.cos(a) + v_r * math.sin(a)
+            x, y, r = t["position"][0], t["position"][1], self.vessel.nu[5]
+            act.inflow = (u_r - r * y) * math.cos(a) + (v_r + r * x) * math.sin(a)
             fx, fy, angle = act.output()
             idx = self._thruster_index[t["name"]]
             self.u[idx, 0] = fx

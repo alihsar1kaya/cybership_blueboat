@@ -13,6 +13,9 @@ allocation.method in vessel.yaml:
   constrained_qp   Fossen 11.2.3: min f'Wf + s'Qs, s.t. T(alpha) f = tau + s, thruster limits,
                    with the azimuths at their ACTUAL angle (from thruster/<name>/state).
                    Publishes the slack s (what the thrusters cannot give) on control/allocation/slack.
+                   With allocation.inflow_compensation the commands are corrected for the thrust the
+                   propellers lose at speed, from measurement/odom (velocity) and navigation/current
+                   (the observer's current estimate, so the speed is through the water).
 """
 
 from __future__ import annotations
@@ -22,7 +25,8 @@ import math
 import numpy as np
 import skadipy
 import skadipy.allocator
-from geometry_msgs.msg import Wrench
+from geometry_msgs.msg import Vector3Stamped, Wrench
+from nav_msgs.msg import Odometry
 
 from cybership_interfaces.msg import ThrusterState
 
@@ -109,8 +113,15 @@ class VesselForceControllerROS(BaseForceControllerROS):
         if self._constrained:
             if alloc.get("dofs", ["X", "Y", "N"]) != ["X", "Y", "N"]:
                 raise ValueError("constrained_qp supports dofs [X, Y, N] only")
+            u_0 = (self.config.get("thruster_model", {}) or {}).get("zero_thrust_speed")
             self.allocator = ConstrainedAllocator(
-                self.config["thrusters"], slack_weights=alloc.get("slack_weights", (1e4, 1e4, 1e5)))
+                self.config["thrusters"], slack_weights=alloc.get("slack_weights", (1e4, 1e4, 1e5)),
+                angle_threshold=alloc.get("angle_threshold", 1.0),
+                zero_thrust_speed=u_0 if alloc.get("inflow_compensation", False) else None)
+            self._odom, self._current = None, np.zeros(2)
+            if self.allocator.zero_thrust_speed is not None:
+                self.create_subscription(Odometry, "measurement/odom", self._on_odom, 10)
+                self.create_subscription(Vector3Stamped, "navigation/current", self._on_current, 10)
             self._angles = {}  # actual azimuth angles from thruster/<name>/state
             for t in self.config["thrusters"]:
                 if t["type"] == "azimuth":
@@ -146,11 +157,32 @@ class VesselForceControllerROS(BaseForceControllerROS):
     # constrained_qp
     # ------------------------------------------------------------------------
 
+    def _on_odom(self, msg: Odometry) -> None:
+        q, v = msg.pose.pose.orientation, msg.twist.twist
+        psi = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self._odom = (self.get_clock().now().nanoseconds * 1e-9, psi,
+                      np.array([v.linear.x, v.linear.y, v.angular.z]))
+
+    def _on_current(self, msg: Vector3Stamped) -> None:
+        self._current = np.array([msg.vector.x, msg.vector.y])
+
+    def _velocity_through_water(self):
+        """nu_r = [u_r, v_r, r] from the last odometry and current estimate, None when the odometry is old."""
+        if self._odom is None or self.get_clock().now().nanoseconds * 1e-9 - self._odom[0] > 1.0:
+            return None
+        _, psi, nu = self._odom
+        c, s = math.cos(psi), math.sin(psi)
+        vn, ve = self._current
+        return nu - np.array([c * vn + s * ve, -s * vn + c * ve, 0.0])
+
     def timer_callback(self) -> None:
         if not getattr(self, "_constrained", False):
             return super().timer_callback()
         tau = np.asarray(self.tau_cmd, dtype=float).ravel()[[0, 1, 5]]
         f, alpha_cmd, slack = self.allocator.allocate(tau, self._angles)
+        nu_r = self._velocity_through_water() if self.allocator.zero_thrust_speed is not None else None
+        if nu_r is not None:
+            f = self.allocator.compensate_inflow(f, self._angles, nu_r)
         for t, f_i in zip(self.config["thrusters"], f):
             pub = self._pubs.get(t["name"])
             if pub is None:
