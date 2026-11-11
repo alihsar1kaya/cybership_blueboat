@@ -32,7 +32,9 @@ from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger, Empty
 from cybership_controller.position.reference_filter import ThirdOrderReferenceFilter
 from cybership_dp.los import ALOS
+from cybership_dp.dubins import DubinsPath
 from rclpy.duration import Duration
+from rclpy.task import Future
 from tf2_ros import Buffer, TransformListener, TransformException
 import tf2_geometry_msgs
 try:
@@ -132,6 +134,21 @@ class PositionController(Node):
                 # TTK4190 L6): ALOS heading + surge speed control, no sway force (like the Otter USV).
                 # false: the transit is DP towards the goal through the reference filter (as before).
                 ('guidance.path_following', False),
+                ('guidance.dubins_radius', 0.0),
+                ('guidance.los_method', 'alos'),
+                ('guidance.approach_length', 0.0),
+                ('guidance.force_manoeuvre', ''),
+                ('guidance.max_path_turn_deg', 270.0),
+                ('guidance.time_model.path', [6.0, 1.667, 3.82]),
+                ('guidance.time_model.pivot', [6.0, 1.667, 3.82, 2.86]),
+                ('guidance.time_model.forward', [0.0, 1.667, 2.86]),
+                ('guidance.time_model.reverse', [0.0, 2.857, 2.86]),
+                ('guidance.time_model.dp', [0.0, 1.0, 3.82]),
+                ('guidance.arrival_turn_penalty', 0.0),
+                ('guidance.approach_dp', False),
+                ('guidance.ilos_kappa', 0.2),
+                ('guidance.path_end_speed', 0.1),
+                ('guidance.reverse_penalty', 1.0),
                 ('guidance.los_lookahead', 2.5),       # [m] Delta (K_p = 1/Delta)
                 ('guidance.alos_gamma', 0.02),         # [rad/(m s)] crab-angle adaptation, 0 = plain LOS
                 ('guidance.alos_max_crab_deg', 30.0),  # [deg] limit on the crab-angle estimate
@@ -188,6 +205,7 @@ class PositionController(Node):
 
         # Action server goal tracking (for non-blocking execution)
         self.active_goal_handle = None
+        self._goal_done = None              # Future the execute callback waits on
         self.goal_within_tolerance_since = None
 
         # Add parameter callback for runtime updates
@@ -532,13 +550,7 @@ class PositionController(Node):
 
         # Check for cancellation request
         if self.active_goal_handle.is_cancel_requested:
-            try:
-                self.active_goal_handle.canceled()
-                self.get_logger().info("NavigateToPose goal canceled")
-            except Exception as e:
-                self.get_logger().warn(f"Failed to cancel goal: {e}")
-            self.active_goal_handle = None
-            self.goal_within_tolerance_since = None
+            self._finish_goal("canceled")
             return
 
         # Compute remaining distance and angle error
@@ -563,8 +575,7 @@ class PositionController(Node):
             self.active_goal_handle.publish_feedback(feedback_msg)
         except Exception as e:
             self.get_logger().warn(f"Failed to publish feedback: {e}")
-            self.active_goal_handle = None
-            self.goal_within_tolerance_since = None
+            self._finish_goal("abort")
             return
 
         # Check if target is reached (both position and yaw) and held
@@ -573,20 +584,27 @@ class PositionController(Node):
             if self.goal_within_tolerance_since is None:
                 self.goal_within_tolerance_since = now_t
             if (now_t - self.goal_within_tolerance_since) >= self.success_hold_time:
-                # Goal succeeded - wrap in try-except to handle invalid state transitions
-                try:
-                    self.active_goal_handle.succeed()
-                    self.get_logger().info("NavigateToPose goal succeeded")
-                except Exception as e:
-                    self.get_logger().warn(f"Failed to succeed goal (already in terminal state): {e}")
-                finally:
-                    self.active_goal_handle = None
-                    self.goal_within_tolerance_since = None
-                    # Mark large errors to avoid lingering metrics effects
-                    self.error_pos = np.array([np.inf, np.inf])
-                    self.error_yaw = np.inf
+                self._finish_goal("succeed")
+                # Mark large errors to avoid lingering metrics effects
+                self.error_pos = np.array([np.inf, np.inf])
+                self.error_yaw = np.inf
         else:
             self.goal_within_tolerance_since = None
+
+    def _finish_goal(self, how):
+        """End the active goal with succeed, canceled or abort and let its execute callback return."""
+        handle, done = self.active_goal_handle, self._goal_done
+        self.active_goal_handle, self._goal_done = None, None
+        self.goal_within_tolerance_since = None
+        if handle is None:
+            return
+        try:
+            getattr(handle, how)()
+            self.get_logger().info(f"NavigateToPose goal ended: {how}")
+        except Exception as e:
+            self.get_logger().warn(f"Could not end goal with {how}: {e}")
+        if done is not None and not done.done():
+            done.set_result(how)
 
     def control_loop(self):
         """
@@ -631,19 +649,25 @@ class PositionController(Node):
             nu = np.array([current_vx, current_vy, current_yaw_rate])
             eta = np.array([current_x, current_y, current_yaw])
             self._reset_ref_filter(eta, Rz(current_yaw) @ nu)
-            psi_d, u_d = self._path_command
+            psi_d, u_d, kappa = self._path_command
             self.process_performance_metrics(eta, np.zeros(3), np.zeros(2), np.zeros(2),
                                              wrap_to_pi(psi_d - current_yaw))
-            self._publish_wrench(*self._path_following_tau(current_yaw, nu, psi_d, u_d))
+            self._publish_wrench(*self._path_following_tau(current_yaw, nu, psi_d, u_d, kappa))
             return
-        self.ref_filter.set_eta_r(self._limit_reference(ref, current_yaw))
-        self.ref_filter.update()
+        traj = getattr(self, '_traj', None)
+        if traj is not None:
+            # final approach: guidance gives the trajectory itself; keep the filter on it for the handover
+            desired_pose, desired_vel, desired_acc = traj
+            self._reset_ref_filter(desired_pose, desired_vel)
+        else:
+            self.ref_filter.set_eta_r(self._limit_reference(ref, current_yaw))
+            self.ref_filter.update()
 
-        # Retrieve filtered outputs: desired pose, velocity, and acceleration.
-        desired_pose = self.ref_filter.eta_d  # [x, y, yaw]
-        desired_vel = self.ref_filter.eta_d_dot  # velocity
-        # acceleration (feedforward term)
-        desired_acc = self.ref_filter.eta_d_ddot
+            # Retrieve filtered outputs: desired pose, velocity, and acceleration.
+            desired_pose = self.ref_filter.eta_d  # [x, y, yaw]
+            desired_vel = self.ref_filter.eta_d_dot  # velocity
+            # acceleration (feedforward term)
+            desired_acc = self.ref_filter.eta_d_ddot
 
         # Compute errors (position and yaw) between the filtered desired state and current state.
         error_pos = np.array(
@@ -794,25 +818,33 @@ class PositionController(Node):
         f._x = np.concatenate([eta, eta_dot, np.zeros(3)])
         self._carrot = eta.copy()
 
-    def _path_following_tau(self, psi, nu, psi_d, u_d):
+    def _path_following_tau(self, psi, nu, psi_d, u_d, kappa=0.0):
         """
         Path following in transit (Fossen Ch. 12.5): a surge speed controller and a heading autopilot,
         no sway force; ALOS has put the crab angle into psi_d. Same model-based gains as the DP law.
+        kappa is the path curvature (1/R on a Dubins arc): the yaw rate r_d = u_ref kappa is fed forward.
 
-            X = m11 u_ref_dot + d(u_ref) + Kd_u (u_ref - u),   N = Kp_r e_psi - Kd_r r,   Y = 0
+            X = m11 u_ref_dot + d(u_ref) + Kd_u (u_ref - u),   N = Kp_r e_psi + Kd_r (r_d - r) + d_r(r_d),   Y = 0
         """
         a = self.get_parameter('guidance.transit_accel').value
         step = np.clip(u_d - self._u_ref, -a * self.dt, a * self.dt)
         self._u_ref += step
         u_ref_dot = step / self.dt
+        r_d = self._u_ref * kappa
         # damping on the speed through the water when the observer estimates the current
         u_r = self._relative_reference(psi, np.array([self._u_ref, 0.0, 0.0]), np.zeros(3))[0][0]
         if self._craft is not None:
-            d = -self._craft.damping(np.array([u_r, 0, 0, 0, 0, 0]))[0]
+            dmp = -self._craft.damping(np.array([u_r, 0, 0, 0, 0, r_d]))
+            d, d_r = dmp[0], dmp[5]
         else:
-            d = self.D_eff[0, 0] * u_r
+            d, d_r = self.D_eff[0, 0] * u_r, self.D_eff[2, 2] * r_d
         X = self.M_eff[0, 0] * u_ref_dot + d + self.Kd_mb[0] * (self._u_ref - nu[0])
-        N = self.Kp_mb[2] * wrap_to_pi(psi_d - psi) - self.Kd_mb[2] * nu[2]
+        N = self.Kp_mb[2] * wrap_to_pi(psi_d - psi) + self.Kd_mb[2] * (r_d - nu[2]) + d_r
+        if self.get_parameter('control.bias_feedforward').value and self.bias_hat is not None:
+            # wind and other slow loads from the observer, as in the DP law (a head wind stopped the boat
+            # 0.3 m short of the goal at path_end_speed); sway is left to ALOS's crab angle
+            b = -Rz(psi).T @ self.bias_hat
+            X, N = X + b[0], N + b[2]
         return float(X), 0.0, float(N)
 
     def _integral_action(self, R, error_world):
@@ -873,36 +905,90 @@ class PositionController(Node):
         c[2] = wrap_to_pi(c[2] + (np.clip(step, -rate * self.dt, rate * self.dt) if rate > 0.0 else step))
         return c.copy()
 
-    def _choose_manoeuvre(self, distance, bearing, yaw):
+    def _plan_dubins(self, x, y, heading, mode='path', first_turn=0.0):
+        """
+        Quickest Dubins path (by the time model) from (x, y, heading) to the goal over arrival headings:
+        the goal heading, or one with a shorter path plus a turn on the spot at the goal. Paths that turn
+        more than max_path_turn_deg in total are left out while others exist: they were loops that took
+        about as long as the alternatives but looked like the boat had lost its way.
+        Returns (time, features, path, arrival heading) or None.
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        cand = []
+        for psi_a in [self.target_yaw] + list(np.linspace(-np.pi, np.pi, 24, endpoint=False)):
+            path = DubinsPath.with_approach((x, y, heading), (self.target_x, self.target_y, psi_a),
+                                            g('dubins_radius'), g('approach_length'))
+            f = [path.length, abs(wrap_to_pi(self.target_yaw - psi_a))]
+            if mode == 'pivot':
+                f.append(first_turn)
+            t = float(np.dot(g(f'time_model.{mode}'), [1.0] + f))
+            cand.append((t, f, path, psi_a))
+        ok = [c for c in cand if c[2].turning <= np.radians(g('max_path_turn_deg'))] or cand
+        best = None
+        for c in ok:
+            if best is None or c[0] < best[0] - 0.5:     # prefer the exact goal heading on a near tie
+                best = c
+        return best
+
+    def _dubins_enabled(self):
+        return (self.get_parameter('guidance.path_following').value and self.model_based
+                and self.get_parameter('guidance.dubins_radius').value > 0.0)
+
+    def _choose_manoeuvre(self, distance, bearing, yaw, x0=0.0, y0=0.0):
         """
         How to get to the goal, chosen once per goal by an estimated time (seconds), like a skipper would:
 
-            forward:  turn the bow to the goal, drive, turn to the final heading
+            path:     bow first along a Dubins path (turning while moving) with a straight final approach
+            pivot:    turn on the spot towards the goal first, then the Dubins path (goals behind the boat)
+            forward:  turn the bow to the goal, drive straight, turn to the final heading (no Dubins)
             reverse:  turn the stern to the goal, back up, turn to the final heading (short distances)
             dp:       move directly (sideways / diagonally with the azimuth) while turning slowly to the
-                      final heading; always for small corrections, and up to max_dp_distance when it is
-                      the fastest
+                      final heading; always for small corrections, and up to max_dp_distance
 
-            T = (|turn to the course| + |turn to the final heading|) / turn rate + distance / speed
-            T_dp = distance / speed in that body direction + |turn to the final heading| / final turn rate
+        Each estimate is linear in a few features of the manoeuvre, T = c . [1, features...], with the
+        coefficients guidance.time_model.<manoeuvre> fitted to simulated runs of every manoeuvre to random
+        goals (the hand-made estimates picked a slower manoeuvre for about a third of the goals):
+
+            path:    [1, path length, |final turn on the spot|]
+            pivot:   [1, path length, |final turn on the spot|, |turn on the spot first|]
+            forward / reverse: [1, distance, |turn to the course| + |turn to the final heading|]
+            dp:      [1, distance / speed limit, |turn to the final heading|]
         """
         g = lambda n: self.get_parameter(f'guidance.{n}').value
         if distance <= max(g('approach_radius'), g('min_transit_distance')):
             return 'dp', {}
-        rate = np.radians(g('turn_rate_deg_s'))
-        times = {}
-        for mode, course, speed in (('forward', bearing, g('forward_speed')),
-                                    ('reverse', wrap_to_pi(bearing + np.pi), g('reverse_speed'))):
+        T = lambda mode, f: float(np.dot(g(f'time_model.{mode}'), [1.0] + list(f)))
+        times, self._features, self._dubins_opts = {}, {}, {}
+        for mode, course in (('forward', bearing), ('reverse', wrap_to_pi(bearing + np.pi))):
             if mode == 'reverse' and distance > g('max_reverse_distance'):
                 continue
             turns = abs(wrap_to_pi(course - yaw)) + abs(wrap_to_pi(self.target_yaw - course))
-            times[mode] = turns / rate + distance / speed
+            self._features[mode] = [distance, turns]
+        if self._dubins_enabled():
+            # The arrival heading is free: the goal heading, or one that gives a shorter path plus a turn on
+            # the spot at the goal, whichever is quicker (a fixed goal heading on the "wrong" side made the
+            # boat drive a full loop).
+            for mode, pivot in (('path', yaw), ('pivot', bearing)):
+                if mode == 'pivot' and abs(wrap_to_pi(bearing - yaw)) < np.radians(g('align_angle_deg')):
+                    continue
+                best = self._plan_dubins(x0, y0, pivot, mode, abs(wrap_to_pi(pivot - yaw)))
+                if best is None:
+                    continue
+                self._features[mode] = best[1]
+                self._dubins_opts[mode] = (best[2], best[3])
+            self._features.pop('forward')   # the paths replace turn on the spot - drive straight - turn
         if g('sway_speed') > 0.0 and distance <= g('max_dp_distance'):
             # the heading changes on the way: use the slower of the start and the final heading
             speed = min(self._speed_limit(bearing, yaw), self._speed_limit(bearing, self.target_yaw))
-            times['dp'] = (distance / speed + abs(wrap_to_pi(self.target_yaw - yaw))
-                           / np.radians(g('final_turn_rate_deg_s')))
+            self._features['dp'] = [distance / speed, abs(wrap_to_pi(self.target_yaw - yaw))]
+        times = {k: T(k, f) * (g('reverse_penalty') if k == 'reverse' else 1.0) for k, f in self._features.items()}
         best = min(times, key=times.get)
+        forced = g('force_manoeuvre')
+        if forced:
+            best = forced if forced in times else best
+        if best in self._dubins_opts:
+            self._dubins, self._path_arrival = self._dubins_opts[best]
+            self._path_pivot = best == 'pivot'
         return best, times
 
     def _guidance_reference(self, x, y, yaw):
@@ -918,21 +1004,28 @@ class PositionController(Node):
         phase = getattr(self, '_guidance_phase', None)
 
         if phase is None:
-            self._manoeuvre, times = self._choose_manoeuvre(distance, bearing, yaw)
+            self._manoeuvre, times = self._choose_manoeuvre(distance, bearing, yaw, x, y)
             self.get_logger().info(
                 f"Guidance: {self._manoeuvre} to the goal {distance:.1f} m away"
                 + (" (estimated " + ", ".join(f"{k} {v:.0f} s" for k, v in times.items()) + ")" if times else ""))
             phase = 'station' if self._manoeuvre == 'dp' else 'turn'
+            if self._manoeuvre == 'path':
+                phase = 'path'
+                self.get_logger().info(f"Guidance: Dubins path {self._dubins.word}, {self._dubins.length:.1f} m")
             self._guidance_hold = (x, y)
             self._alos = ALOS(self.get_parameter('guidance.los_lookahead').value,
                               self.get_parameter('guidance.alos_gamma').value,
-                              self.get_parameter('guidance.alos_max_crab_deg').value)
+                              self.get_parameter('guidance.alos_max_crab_deg').value,
+                              self.get_parameter('guidance.los_method').value,
+                              self.get_parameter('guidance.ilos_kappa').value)
             self._alos.set_path((x, y), (self.target_x, self.target_y))
             self._max_cross_track = 0.0
             if self._manoeuvre == 'dp':
                 # small correction: change the heading slowly (rate limited) while moving; turning
                 # 90 deg in 4 s while translating pushed the boat 0.65 m the wrong way
                 self._guidance_heading, self._final_turn = yaw, True
+        if phase in ('path', 'approach'):
+            return self._dubins_reference(x, y, yaw)
         # the course the bow (forward) or the stern (reverse) points along
         reverse = getattr(self, '_manoeuvre', 'forward') == 'reverse'
         path_following = (self.get_parameter('guidance.path_following').value and self.model_based
@@ -954,8 +1047,16 @@ class PositionController(Node):
             phase, self._guidance_heading = 'arrive', course if phase == 'transit' else yaw
         elif phase == 'arrive' and distance < settle:
             phase, self._final_turn = 'station', True   # turn to the final heading, rate limited
-        elif phase == 'turn' and heading_error < align:
+        elif phase == 'turn' and heading_error < (np.radians(3.0) if getattr(self, '_manoeuvre', None) == 'pivot'
+                                                  else align):
+            # a pivot turns all the way: from 20 deg off, the Dubins path to a goal 3 m away was a full loop
             phase = 'transit'
+            if getattr(self, '_manoeuvre', None) == 'pivot':
+                # turned towards the goal on the spot: now the Dubins path from here
+                # plan again from where the boat is now (it may have drifted while turning)
+                _, _, self._dubins, self._path_arrival = self._plan_dubins(x, y, yaw)
+                self.get_logger().info(f"Guidance: Dubins path {self._dubins.word}, {self._dubins.length:.1f} m")
+                return self._dubins_reference(x, y, yaw)
         elif phase == 'transit' and heading_error > 2 * align:
             phase, self._guidance_hold = 'turn', (x, y)   # pushed off course: turn again
 
@@ -977,7 +1078,7 @@ class PositionController(Node):
             left = max(self._alos.remaining(x, y) - radius, 0.0)
             speed = g('reverse_speed') if reverse else g('forward_speed')
             u_d = min(speed, np.sqrt(g('arrive_speed')**2 + 2 * a * left))
-            self._path_command = (course, -u_d if reverse else u_d)
+            self._path_command = (course, -u_d if reverse else u_d, 0.0)
             return None
         if phase == 'transit':
             return np.array([self.target_x, self.target_y, course])
@@ -994,6 +1095,85 @@ class PositionController(Node):
                 self._final_turn = False
             return np.array([self.target_x, self.target_y, self._guidance_heading])
         return goal
+
+    def _crab_feedforward(self, pi_h):
+        """
+        Crab angle that cancels the estimated current across the path: with speed U through the water
+        along psi, the ground track stays on pi_h when U sin(psi - pi_h) = -c_perp, so
+        psi = pi_h - asin(c_perp / U). ALOS then only adapts what is left (wind, model errors);
+        on its own it needed most of a 4-10 m leg to learn the angle and drifted up to 0.9 m off.
+        """
+        if self.current_hat is None:
+            return 0.0
+        c_perp = -np.sin(pi_h) * self.current_hat[0] + np.cos(pi_h) * self.current_hat[1]
+        U = max(self._u_ref, 0.2)
+        return float(np.arcsin(np.clip(c_perp / U, -0.7, 0.7)))
+
+    def _dubins_reference(self, x, y, yaw):
+        """
+        Follow the Dubins path with ALOS (heading + surge speed, no sway force) and slow down towards its
+        end; near the end hand over to DP station keeping. The path ends with the goal heading, so the
+        boat drives there like a boat (turning while moving) instead of turning on the spot twice.
+        Returns None while following (the command is in _path_command), else the station reference.
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        path = self._dubins
+        if self._guidance_phase == 'approach':
+            return self._approach_reference()
+        if self._guidance_phase != 'path':
+            self.get_logger().info("Guidance: path")
+            self._u_ref = float(self.latest_odom.twist.twist.linear.x)
+            self._guidance_phase, self._path_moving, self._path_stall = 'path', False, 0.0
+        s, _, pi_h, ye, kappa = path.project(x, y)
+        self._max_cross_track = max(self._max_cross_track, abs(ye))
+        left = path.length - s
+        dx, dy = self.target_x - x, self.target_y - y
+        distance = np.hypot(dx, dy)
+        ahead = np.cos(yaw) * dx + np.sin(yaw) * dy           # goal distance along the bow
+        u = float(self.latest_odom.twist.twist.linear.x)
+        self._path_moving = self._path_moving or u > 0.15
+        self._path_stall = self._path_stall + self.dt if (self._path_moving and u < 0.05) else 0.0
+        dp_from = g('approach_length') if g('approach_dp') else g('settle_radius')
+        if (left < max(dp_from, g('settle_radius')) or distance < g('settle_radius')
+                or (distance < g('approach_radius') and ahead < g('settle_radius'))   # passed or abeam
+                or self._path_stall > 3.0):                                           # stopped short
+            self.get_logger().info(
+                f"Guidance: station (end of path, ALOS crab estimate {np.degrees(self._alos.beta_hat):.1f} deg, "
+                f"max cross-track error {self._max_cross_track:.2f} m)")
+            if g('approach_dp') and g('approach_length') > 0 and left > g('settle_radius'):
+                # DP follows the approach leg itself: a point sliding along it and braking evenly to rest
+                # at the goal, with its speed and deceleration fed forward. The azimuth corrects the
+                # sideways error on the way in, and there is no filter lag to catch up at the end.
+                u0 = max(float(self.latest_odom.twist.twist.linear.x), 0.05)
+                self._approach = dict(s=s, v=u0, decel=u0**2 / (2.0 * left))
+                self._guidance_phase = 'approach'
+                self.get_logger().info(f"Guidance: approach ({left:.1f} m at {u0:.2f} m/s)")
+                return self._approach_reference()
+            self._guidance_phase, self._final_turn, self._guidance_heading = 'station', True, yaw
+            return np.array([self.target_x, self.target_y, yaw])
+        psi_d = wrap_to_pi(self._alos.heading(pi_h, ye, self.dt) - self._crab_feedforward(pi_h))
+        a = g('transit_accel')
+        # slow down to path_end_speed where DP takes over (settle_radius before the end)
+        u_d = min(g('forward_speed'), np.sqrt(g('path_end_speed')**2 + 2 * a * max(left - max(dp_from, g('settle_radius')), 0.0)))
+        self._path_command = (psi_d, u_d, kappa)
+        return None
+
+    def _approach_reference(self):
+        """Pose, velocity and acceleration on the approach leg (constant deceleration to the goal)."""
+        ap, path = self._approach, self._dubins
+        ap['v'] = max(ap['v'] - ap['decel'] * self.dt, 0.0)
+        ap['s'] = min(ap['s'] + ap['v'] * self.dt, path.length)
+        x, y, h = path.at(ap['s'])
+        if ap['v'] <= 0.0 or ap['s'] >= path.length:
+            self._traj = None
+            self._reset_ref_filter(np.array([self.target_x, self.target_y, h]), np.zeros(3))
+            self._guidance_phase, self._final_turn, self._guidance_heading = 'station', True, h
+            self.get_logger().info("Guidance: station (end of approach)")
+            return np.array([self.target_x, self.target_y, h])
+        c, sn = np.cos(h), np.sin(h)
+        self._traj = (np.array([x, y, h]), np.array([ap['v'] * c, ap['v'] * sn, 0.0]),
+                      np.array([-ap['decel'] * c, -ap['decel'] * sn, 0.0]))
+        return np.array([x, y, h])
 
     def _publish_wrench(self, fx, fy, mz):
         wrench_msg = Wrench()
@@ -1039,11 +1219,11 @@ class PositionController(Node):
             response.message = "Controller disabled."
         return response
 
-    def execute_callback(self, goal_handle):
+    async def execute_callback(self, goal_handle):
         """
-        Non-blocking action server callback.
-        Goal progress is checked periodically in control_loop via check_goal_progress().
-        This approach is compatible with both single-threaded and multi-threaded executors.
+        Action server callback. It sets the target and then waits, without blocking the executor, until
+        check_goal_progress() (called from control_loop) ends the goal: reached, canceled, or replaced by
+        a newer goal. The goal must have a final state before this returns, else rclpy marks it aborted.
         """
         self.get_logger().info("Executing NavigateToPose goal...")
 
@@ -1069,6 +1249,7 @@ class PositionController(Node):
         self.target_x = target_in_odom.pose.position.x
         self.target_y = target_in_odom.pose.position.y
         self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
+        self._traj = None
         self._final_turn = False
 
         self.get_logger().info(
@@ -1087,13 +1268,14 @@ class PositionController(Node):
         # Publish target pose marker
         self.publish_target_pose_marker(target_in_odom)
 
-        # Store the goal handle for monitoring in control_loop
+        # A new goal replaces the one in progress
+        self._finish_goal("abort")
         self.active_goal_handle = goal_handle
+        self._goal_done = Future()
         self.goal_within_tolerance_since = None
 
-        # Return immediately; progress is checked in control_loop via check_goal_progress()
-        result = NavigateToPose.Result()
-        return result
+        await self._goal_done
+        return NavigateToPose.Result()
 
     def publish_target_pose_marker(self, pose_stamped: PoseStamped):
         """Publish a simple marker (e.g., an arrow) in RViz to visualize the requested pose."""

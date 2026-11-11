@@ -110,3 +110,16 @@ def test_azimuth_set_point_ignores_demands_below_the_threshold():
     assert math.degrees(alpha["bow_azimuth"]) == pytest.approx(90)
     _, alpha, _ = a.allocate([30.0, 0.0, 0.0], SIDE)
     assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(0, abs=1e-6)
+
+
+def test_azimuth_turns_for_a_small_demand_only_it_can_give():
+    # after a transit the azimuth points aft; a 1.6 N sway correction is below the threshold, but the
+    # stern thrusters cannot give it, so the azimuth must still turn (it held 11 cm off the goal)
+    with open(os.path.join(REPO, "cybership_config", "config", "microampere", "vessel.yaml")) as f:
+        a = ConstrainedAllocator(yaml.safe_load(f)["thrusters"], angle_threshold=3.0)
+    ahead = {"bow_azimuth": 0.0}
+    a.allocate([30.0, 0.0, 0.0], ahead)
+    _, alpha, slack = a.allocate([0.0, -1.6, 0.0], ahead)
+    assert abs(slack[1]) > 0.5
+    _, alpha, _ = a.allocate([0.0, -1.6, 0.0], ahead)
+    assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(90, abs=1.0)

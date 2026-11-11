@@ -67,7 +67,7 @@ def analyse(label, logdir):
         heading_travel = float(np.degrees(np.sum(np.abs(np.diff(np.unwrap(psi))))))
         heading_needed = abs(math.degrees(wrap(gpsi - psi0)))
         choice = next((txt.split()[0] for te, txt in events
-                       if t0 - 1 <= te <= t1 and re.match(r"(forward|reverse|dp) to the goal", txt)), "?")
+                       if t0 - 1 <= te <= t1 and re.match(r"(forward|reverse|dp|path|pivot) to the goal", txt)), "?")
         row = dict(scenario=label, goal=i + 1, dn=offs[i][0], de=offs[i][1], hdg=offs[i][2], dist=dist,
                    bearing_body=bearing_body, choice=choice, settle=settle, path=path,
                    path_ratio=path / dist if dist > 0.3 else np.nan, overshoot=overshoot, max_cross=max_cross,

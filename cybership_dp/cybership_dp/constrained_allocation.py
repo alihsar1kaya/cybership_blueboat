@@ -50,7 +50,8 @@ class ConstrainedAllocator:
                    direction_deg for fixed thrusters, allocation.weight).
         slack_weights: Q = diag(qX, qY, qN).
         angle_threshold [N]: only move an azimuth set-point when it is asked for at least this much
-                   force, so it does not swing around when the demand is near zero.
+                   force, so it does not swing around when the demand is near zero; or when the angle
+                   it holds leaves force undelivered (a small sway demand only the azimuth can give).
         zero_thrust_speed [m/s]: u_0 of the thrusters (thruster_model in vessel.yaml) for
                    compensate_inflow; None = thrust independent of speed.
         """
@@ -58,6 +59,7 @@ class ConstrainedAllocator:
         self.thrusters = list(thrusters)
         self.Q = np.asarray(slack_weights, dtype=float)
         self.angle_threshold = float(angle_threshold)
+        self._short = False      # the last allocation could not deliver the demand (slack)
 
         cols_e, w_e = [], []
         self.lb, self.ub, self.w = [], [], []
@@ -103,7 +105,7 @@ class ConstrainedAllocator:
                 k += 1
                 continue
             fx, fy = u_e[k], u_e[k + 1]
-            if math.hypot(fx, fy) >= self.angle_threshold:
+            if math.hypot(fx, fy) >= self.angle_threshold or self._short:
                 a = math.atan2(fy, fx)
                 current = (angles or {}).get(t["name"], self.alpha_cmd[t["name"]])
                 flipped = _wrap(a + math.pi)
@@ -126,7 +128,9 @@ class ConstrainedAllocator:
         A = np.vstack([np.sqrt(self.Q)[:, None] * T, np.diag(np.sqrt(self.w))])
         b = np.concatenate([np.sqrt(self.Q) * tau, np.zeros(len(self.thrusters))])
         f = lsq_linear(A, b, bounds=(self.lb, self.ub), method="bvls").x
-        return f, alpha_cmd, T @ f - tau
+        slack = T @ f - tau
+        self._short = bool(np.any(np.abs(slack) > 0.5))
+        return f, alpha_cmd, slack
 
     def compensate_inflow(self, f, angles, nu_r):
         """

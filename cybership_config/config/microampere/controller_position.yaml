@@ -14,7 +14,10 @@
       # so surge, sway and yaw get the same closed-loop behaviour although sway is ~5x heavier.
       # The fixed p_gain/i_gain/d_gain below are then NOT used.
       model_based: true
-      omega_n: [0.3, 0.3, 1.0]      # [rad/s] surge, sway, yaw (yaw 1.0: follows the faster turn reference)
+      # [rad/s] surge, sway, yaw (yaw 1.0: follows the faster turn reference). Sway 0.3 gave Kp 15 N/m against
+      # 171 N s/m of sway damping: an overdamped loop with an 11 s time constant, so the last 0.4 m sideways
+      # took 25 s. 0.45 / 0.6 (11.11 sweep): mean time to settle 3-4 s shorter in calm, current and wind.
+      omega_n: [0.45, 0.6, 1.0]
       zeta: [0.9, 0.9, 0.9]
       ki_ratio: 0.1
       # Anti-windup limit on the integral force. The integral must be able to cancel slowly varying
@@ -76,7 +79,7 @@
       # 3 m straight to the side: dp 15 s vs forward 20 s (measured 31 s vs 45 s to settle within 5 cm)
       forward_speed: 0.6         # [m/s] bow first
       reverse_speed: 0.35        # [m/s] stern first: 80 % reverse thrust, blunt transom
-      turn_rate_deg_s: 12.0      # [deg/s] average over a turn incl. starting and stopping
+      turn_rate_deg_s: 20.0      # [deg/s] incl. accelerating (180 deg in ~9 s measured)
       # The reference moves no faster than these speeds (forward_speed, reverse_speed, sway_speed as an
       # ellipse in the body frame), through the water when the observer estimates the current. Without
       # the limit the reference filter's speed grows with the distance: 4 m sideways asked for more sway
@@ -84,7 +87,17 @@
       sway_speed: 0.2            # [m/s] 0 = no speed limit
       min_speed: 0.05            # [m/s] over ground when the current alone uses up the limit
       max_turn_rate_deg_s: 25.0  # [deg/s] heading reference; a 180 deg step gave 35 deg/s and 1 m of drift
-      max_dp_distance: 4.0       # [m] moving directly is an option up to here (it costs more thrust)
+      max_dp_distance: 3.5       # [m] moving directly is an option up to here (short repositioning)
+      reverse_penalty: 1.0       # >1: backing up must be this much quicker than the alternatives
+      # Time estimates [s] for the manoeuvre choice, T = c . [1, features] (see _choose_manoeuvre), fitted
+      # (non-negative least squares) to every manoeuvre run to 42 random goals in the offline closed loop.
+      # The hand-made estimates chose a slower manoeuvre for 9 of 42 goals (mean 1.4 s, worst 13 s lost);
+      # these for 1 of 42 (0.1 s). A final turn on the spot costs ~7 s/rad, twice the old guess.
+      time_model:
+        path: [12.8, 1.68, 7.16]            # [1, path length m, final turn rad]
+        pivot: [12.55, 2.03, 6.78, 4.36]    # [1, path length m, final turn rad, first turn rad]
+        reverse: [19.01, 2.52, 3.79]        # [1, distance m, turns rad]
+        dp: [15.66, 0.67, 2.27]             # [1, distance / speed limit s, turn rad]
       max_reverse_distance: 6.0  # [m] back up only short distances
       align_angle_deg: 20.0     # [deg]
       # Transit = path following along the line start -> goal (Fossen Ch. 12.5, TTK4190 L6 slides 59-61):
@@ -96,7 +109,31 @@
       #   the boat slid 2.4 m back after arriving (observer bias learned during crabbing, then fed forward).
       # ALOS is Fossen's law for underactuated craft (Otter); a fully actuated boat on short legs does better
       # with DP (L6 slide 9). Kept for long transits / waypoints.
-      path_following: false
+      # Dubins paths (11.11): forward moves follow the shortest path with turning radius dubins_radius
+      # to the goal pose (or to a nearby arrival heading plus a small turn at the goal, if quicker), with
+      # the ALOS law above plus a crab angle fed forward from the observer's current estimate; DP takes
+      # over settle_radius before the end. The boat turns while it moves instead of turning on the spot,
+      # driving straight and turning on the spot again. Offline sweep, 14 goals (scratchpad harness):
+      #   mean time to settle  calm 32.0 -> 29.0 s, 0.15 m/s cross current 37.0 -> 31.7 s, 8 m/s wind 33.1 -> 29.9 s
+      #   turning on the spot  ~90 s -> ~30 s in total, thrust energy in current -30 %
+      # Off (dubins_radius 0): turn - drive straight (DP transit, or ALOS with path_following) - turn.
+      path_following: true
+      # [m] 0.6 m/s on a 2 m arc is 17 deg/s. Sweep (calm / 0.15 m/s current): R 1.0 drifts 2 m off the path
+      # in current (one timeout), 1.5 and 2.0 are equally quick, 2.5 is slower. With 2.0 a goal behind the boat
+      # is reached by turning towards it on the spot first and then the path (path 18 % shorter than U-turn loops)
+      dubins_radius: 2.0
+      # los, alos or ilos (ilos_kappa): with the crab angle fed forward from the current estimate they are
+      # within 1 s of each other; ilos with kappa 1.0 was worse (3 s slower, 2.2 m off the path in current)
+      los_method: alos
+      ilos_kappa: 0.2
+      # Final approach: the Dubins path ends approach_length before the goal and a straight leg on the goal
+      # heading follows. With approach_dp, DP tracks a point sliding along that leg and braking evenly to
+      # rest at the goal (speed and deceleration fed forward), so the azimuth fixes the sideways error on
+      # the way in. Without it the path ended in a turn and DP crept the last 0.3-0.5 m sideways.
+      # Sweep: overshoot in current 0.81 -> 0.28 m, straight 4 m goal 21 -> 14 s.
+      approach_length: 1.5      # [m]
+      approach_dp: true
+      path_end_speed: 0.45      # [m/s] speed where DP takes over (start of the approach leg)
       los_lookahead: 2.5        # [m] Delta; Otter (2 m) uses 10 m on 100 m legs, our legs are 2-20 m
       alos_gamma: 0.02          # [rad/(m s)] ~critically damped cross-track at 0.6 m/s with Delta 2.5
       alos_max_crab_deg: 30.0

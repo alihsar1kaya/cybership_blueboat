@@ -54,7 +54,8 @@ class NavigateToPoseClient(Node):
     def feedback_callback(self, feedback_msg):
         # Log feedback from the action server
         feedback = feedback_msg.feedback
-        self.get_logger().info(f'Feedback: {feedback.distance_remaining} meters remaining.')
+        self.get_logger().info(f'Feedback: {feedback.distance_remaining:.2f} meters remaining.',
+                               throttle_duration_sec=5.0)
 
     def get_result_callback(self, future):
         result = future.result().result

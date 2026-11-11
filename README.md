@@ -62,7 +62,7 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true
 ```
 
-RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. The guidance estimates how long each way of getting there takes and picks the quickest. Moves up to about 4 m are often done without turning, straight towards the goal at up to 0.2 m/s sideways. For longer ones the boat turns, drives forwards or backwards and then turns to the heading you chose. Once there it stays within a centimetre or two.
+RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. The guidance estimates how long each way of getting there takes and picks the quickest. Longer moves follow a Dubins path: the boat turns while it drives, like a boat does, and arrives pointing the way you chose. Short corrections of up to about 3.5 m are done without turning, at up to 0.2 m/s sideways, and a goal a few metres straight behind is reached by backing up. Once there it stays within a centimetre or two.
 
 Stop everything with `Ctrl+C` in the launch terminal.
 
@@ -307,6 +307,7 @@ The settings are in [`cybership_config/config/microampere/controller_position.ya
 | `guidance.sway_speed` | faster sideways moves, until the bow thruster saturates (0.2 m/s takes about 45 of its 67 N) | gentler on the bow thruster |
 | `guidance.max_turn_rate_deg_s` | quicker turns; above about 30 °/s the stern thrusters saturate and the boat slides off the spot | slower turns |
 | `guidance.max_dp_distance` | longer moves are done without turning first | the boat turns and drives more often |
+| `guidance.dubins_radius` | wider, gentler curves | tighter turns; 0 switches the curves off (turn on the spot, drive straight, turn again) |
 
 You can change them while it runs, for example `ros2 param set /microampere/position_controller guidance.forward_speed 0.4`.
 </details>
@@ -378,7 +379,7 @@ To drive manually through the mux: `ros2 service call /microampere/force_mux/sel
 | Kalman filter with wave filter | `cybership_utilities/observer.py` | ch. 13.4.6 |
 | DP controller and guidance | `cybership_dp/nodes/position_control_node.py` | ch. 15 |
 | Thrust allocation (QP) | `cybership_dp/constrained_allocation.py` | ch. 11.2.3 |
-| ALOS path following, off by default | `cybership_dp/los.py` | ch. 12.5 |
+| Dubins paths, followed with ALOS | `cybership_dp/dubins.py`, `cybership_dp/los.py` | ch. 12.4–12.5 |
 </details>
 
 ---

@@ -13,6 +13,11 @@ Path from waypoint p_i to p_i+1 (NED, metres):
 
 beta_hat estimates the crab angle beta_c = atan(v / u) (chi = psi + beta_c) from currents, wind and waves,
 which plain proportional LOS (gamma = 0) leaves as a steady cross-track error. USGES (Fossen 2023).
+
+Integral LOS (ILOS, Borhaug et al. 2008, Fossen 2021 Ch. 12.5.2), method='ilos':
+
+    psi_d       = pi_h - atan(K_p y_e + K_i y_int),   K_p = 1/Delta, K_i = kappa K_p
+    y_int_dot   = Delta y_e / (Delta^2 + (y_e + kappa y_int)^2)
 """
 
 import math
@@ -23,10 +28,14 @@ def wrap(a):
 
 
 class ALOS:
-    def __init__(self, lookahead, gamma=0.0, max_crab_deg=30.0):
-        """lookahead Delta [m] (K_p = 1/Delta), gamma [rad/(m s)] adaptation gain (0 = proportional LOS)."""
+    def __init__(self, lookahead, gamma=0.0, max_crab_deg=30.0, method="alos", kappa=0.2):
+        """lookahead Delta [m] (K_p = 1/Delta), gamma [rad/(m s)] adaptation gain (0 = proportional LOS);
+        method 'alos' (or 'los': gamma forced to 0) or 'ilos' with integral gain kappa."""
         self.delta = float(lookahead)
-        self.gamma = float(gamma)
+        self.method = method
+        self.gamma = 0.0 if method == "los" else float(gamma)
+        self.kappa = float(kappa)
+        self.y_int = 0.0
         self.max_crab = math.radians(max_crab_deg)
         self.beta_hat = 0.0
         self.p0 = self.p1 = (0.0, 0.0)
@@ -53,8 +62,17 @@ class ALOS:
 
     def update(self, x, y, h):
         """Desired heading psi_d for position (x, y); integrates beta_hat over h seconds (Euler)."""
-        _, ye = self.errors(x, y)
-        psi_d = wrap(self.pi_h - self.beta_hat - math.atan(ye / self.delta))
+        return self.heading(self.pi_h, self.errors(x, y)[1], h)
+
+    def heading(self, pi_h, ye, h):
+        """ALOS law for any path (also curved, Fossen 2021 Ch. 12.5): path-tangential angle pi_h at the
+        closest point and cross-track error ye there."""
+        if self.method == "ilos":
+            kp = 1.0 / self.delta
+            psi_d = wrap(pi_h - math.atan(kp * ye + self.kappa * kp * self.y_int))
+            self.y_int += h * self.delta * ye / (self.delta**2 + (ye + self.kappa * self.y_int)**2)
+            return psi_d
+        psi_d = wrap(pi_h - self.beta_hat - math.atan(ye / self.delta))
         rate = self.gamma * self.delta / math.sqrt(self.delta**2 + ye**2) * ye
         self.beta_hat = max(-self.max_crab, min(self.max_crab, self.beta_hat + h * rate))
         return psi_d
