@@ -61,6 +61,23 @@
     # Guidance "turn then go": far from the goal, turn the bow towards it, then drive bow first
     # (the stern thrusters are made for that); DP with the goal heading only near the goal.
     guidance:
+      # Planner for moves up to ocp_max_distance: 'ocp' = optimal-control trajectory planner
+      # (cybership_dp/trajectory_planner.py, CasADi/IPOPT; Fossen Ch. 12.1 trajectory tracking for a fully actuated
+      # boat, as NTNU milliAmpere), tracked by the DP law with feedforward. 'rules' = the Dubins/LOS manoeuvre rules
+      # below (still used for longer moves and as fallback). 42 short goals (12.11): mean time 28.9 -> 21.9 s calm,
+      # 31.6 -> 23.1 s current; paths over 2x the distance 9 -> 0 and 8 -> 1; turning on the spot halved.
+      planner: ocp
+      ocp_min_distance: 0.5        # [m] shorter moves (and small heading changes) are plain DP
+      ocp_max_distance: 25.0       # [m] longer moves: Dubins path + ALOS transit
+      ocp:                         # cost weights: time, sway (crabbing), yaw rate (spinning), backing up,
+        w_T: 1.0                   # thrust, thrust changes; the planner trades them off itself
+        w_v: 30.0
+        w_r: 5.0
+        w_rev: 8.0
+        w_xte: 0.0                 # off the straight line (10-40: shorter paths but twice the turning on the spot)
+        w_hold: 40.0               # off the start point during a turn on the spot (0: slid 16-22 cm, 40: 2 cm)
+        w_f: 2.0
+        w_df: 20.0
       turn_then_go: true
       # [m] goals closer than this: plain DP (small corrections, crab with the azimuth); farther goals:
       # turn the bow to the goal and drive. 5 m made the boat crab sideways for normal moves.
@@ -122,6 +139,30 @@
       # in current (one timeout), 1.5 and 2.0 are equally quick, 2.5 is slower. With 2.0 a goal behind the boat
       # is reached by turning towards it on the spot first and then the path (path 18 % shorter than U-turn loops)
       dubins_radius: 2.0
+      # Driving off directly on a Dubins path is only an option if the path is at most this times the distance
+      # (+ approach_length); else turn on the spot first, back up or DP. 42 random goals: paths over 2x the
+      # distance 8 -> 0 (calm) and 11 -> 3 (current), mean time +0.4 s / -0.2 s. 0 = no limit.
+      max_path_ratio: 0.0         # OFF: 1.6 made short goals (3-5 m) crab sideways with DP or pivot slowly
+      # Tighter turns at lower speed: every radius is tried, with the path speed limited to
+      # radius * path_turn_rate (0.6 m/s on 2 m, 0.3 m/s on 1 m). Short goals get a shorter approach leg
+      # (approach_ratio * distance, 0.5 m .. approach_length). Each radian of turning (on the way, on the
+      # spot and at the end) adds turn_penalty seconds to the choice: the quickest option was often a small
+      # loop. 42 goals 2.5-6 m away (12.11): time 31.6 -> 30.6 s calm, 34.8 -> 32.5 s current; path/distance
+      # 1.42 -> 1.36 calm, 1.76 -> 1.44 current. turn_penalty 6 gave fewer loops but backed up more.
+      dubins_radii: [2.0, 1.5, 1.0]  # [m]
+      path_turn_rate_deg_s: 17.0
+      approach_ratio: 0.3
+      turn_penalty: 5.0           # [s/rad]
+      # Turning on the spot (DP turns, before or after a path, before backing up) costs this much more again,
+      # so the boat prefers an arc to spinning like a fidget spinner. Less spinning means more loops on short
+      # goals (42 goals 2.5-6 m, calm): turn 3 / spot 0: 3.5 s on the spot, 8 paths > 2x distance;
+      # turn 5 / spot 3: 2.9 s, 10; turn 3 / spot 4: 2.4 s, 13. Mean time within 1 s. Both can be set live.
+      spot_turn_penalty: 3.0      # [s/rad]
+      # Turns on the spot follow a heading trajectory (accelerate, max_turn_rate_deg_s, brake to rest on the
+      # target) with the yaw rate fed forward, instead of the reference filter: 166 deg took 15.8 s with the
+      # filter, 7.5 s like this. 42 short goals: pivot / reverse goals 35.1 -> 30.6 s (calm).
+      turn_trajectory: true
+      turn_accel_deg_s2: 20.0
       # los, alos or ilos (ilos_kappa): with the crab angle fed forward from the current estimate they are
       # within 1 s of each other; ilos with kappa 1.0 was worse (3 s slower, 2.2 m off the path in current)
       los_method: alos

@@ -5,6 +5,8 @@ Generic launch file for the configurable simulator.
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere use_gui:=false
     ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk waves:=true wave_hs:=0.05
     then open http://localhost:8080 (web GUI, web:=false to skip)
+    ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true gazebo:=true
+    (also shows the boat in a VRX Gazebo world; our model stays the physics, Gazebo only draws it)
 
 Loads cybership_config/config/<vessel>/vessel.yaml. Unlike <vessel>.launch.py, the
 vessel name is not restricted to a fixed list. If a vessel has no URDF or RViz config
@@ -97,6 +99,8 @@ def _launch_setup(context, *args, **kwargs):
     if use_dp:
         web_port = int(lc("web_port")) if lc("web").lower() == "true" else 0
         actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss, web_port)
+    if lc("gazebo").lower() == "true":
+        actions += _gazebo_actions(vessel, vessel_name, lc("gz_world"), [float(v) for v in lc("gz_origin").split()])
     if use_gui:
         # Desired force tau_d as WrenchStamped, so RViz can draw it (green arrow)
         actions.append(launch_ros.actions.Node(
@@ -113,6 +117,32 @@ def _launch_setup(context, *args, **kwargs):
             parameters=[{"use_sim_time": False}],  # must match the sim's wall-clock stamps
         ))
     return actions
+
+
+def _gazebo_actions(vessel, vessel_name, world, origin):
+    """Gazebo world (our small_harbour, or a VRX world by name) and the node that moves our boat's mesh in it."""
+    from launch.launch_description_sources import PythonLaunchDescriptionSource
+    mesh = os.path.join(get_package_share_directory("cybership_description"), "meshes", vessel, f"{vessel}.stl")
+    own = os.path.join(get_package_share_directory("cybership_simulator"), "worlds", f"{world}.sdf")
+    if os.path.exists(own):
+        gz = launch.actions.IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(
+                get_package_share_directory("ros_gz_sim"), "launch", "gz_sim.launch.py")),
+            launch_arguments={"gz_args": f"-r {own}"}.items())
+    else:
+        vrx = os.path.join(get_package_share_directory("vrx_gz"), "launch", "vrx_environment.launch.py")
+        gz = launch.actions.IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(vrx),
+            launch_arguments={"world": world, "sim_mode": "sim", "bridge_competition_topics": "False"}.items())
+    return [
+        gz,
+        launch_ros.actions.Node(
+            package="cybership_simulator",
+            executable="gz_pose_bridge.py",
+            namespace=vessel_name,
+            parameters=[{"world": world, "mesh": mesh, "origin": origin}],
+        ),
+    ]
 
 
 def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard", web_port=0):
@@ -245,5 +275,14 @@ def generate_launch_description():
             "web", default_value="true",
             description="With dp:=true: simple web GUI (map, goals, STOP, sea state) on http://localhost:<web_port>"),
         launch.actions.DeclareLaunchArgument("web_port", default_value="8080", description="Port of the web GUI"),
+        launch.actions.DeclareLaunchArgument(
+            "gazebo", default_value="false",
+            description="Also show the boat in a VRX Gazebo world (needs ros_gz and vrx_gz); physics stays ours"),
+        launch.actions.DeclareLaunchArgument(
+            "gz_world", default_value="small_harbour",
+            description="small_harbour (ours, light) or a VRX world such as sydney_regatta (large, slow)"),
+        launch.actions.DeclareLaunchArgument(
+            "gz_origin", default_value="0 0",
+            description="Where our NED origin is in the Gazebo world [m, ENU x y]; -532 162 for sydney_regatta"),
         launch.actions.OpaqueFunction(function=_launch_setup),
     ])

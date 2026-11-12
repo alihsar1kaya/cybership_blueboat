@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!-- Small, light world for showing the boat: 100 x 100 m of flat water and a few dock blocks.
+     Our Fossen model in vessel.py is the physics; gz_pose_bridge.py only moves the mesh here. -->
+<sdf version="1.9">
+  <world name="small_harbour">
+    <physics name="1ms" type="ignored"><max_step_size>0.01</max_step_size><real_time_factor>1.0</real_time_factor></physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <scene><ambient>0.6 0.6 0.6 1</ambient><background>0.7 0.8 0.95 1</background><grid>false</grid></scene>
+    <light type="directional" name="sun">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 50 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse><specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.2 -0.9</direction>
+    </light>
+    <model name="water">
+      <static>true</static>
+      <link name="link">
+        <visual name="surface">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material><ambient>0.05 0.25 0.4 1</ambient><diffuse>0.1 0.35 0.55 1</diffuse><specular>0.4 0.4 0.4 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <!-- a simple dock 8 m north of the start (ENU: +y is north), 6 x 1.5 m -->
+    <model name="dock">
+      <static>true</static>
+      <pose>0 8 0.15 0 0 0</pose>
+      <link name="link">
+        <visual name="deck">
+          <geometry><box><size>6 1.5 0.3</size></box></geometry>
+          <material><ambient>0.45 0.35 0.25 1</ambient><diffuse>0.55 0.42 0.3 1</diffuse></material>
+        </visual>
+        <collision name="deck"><geometry><box><size>6 1.5 0.3</size></box></geometry></collision>
+      </link>
+    </model>
+  </world>
+</sdf>

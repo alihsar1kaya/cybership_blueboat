@@ -11,6 +11,7 @@
 # Licensed under GPL-3.0-or-later
 # ---------------------------------------------------------------------------
 
+import threading
 import time
 import numpy as np
 import rclpy
@@ -33,6 +34,7 @@ from std_srvs.srv import SetBool, Trigger, Empty
 from cybership_controller.position.reference_filter import ThirdOrderReferenceFilter
 from cybership_dp.los import ALOS
 from cybership_dp.dubins import DubinsPath
+from cybership_dp import trajectory_planner
 from rclpy.duration import Duration
 from rclpy.task import Future
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -137,8 +139,28 @@ class PositionController(Node):
                 ('guidance.dubins_radius', 0.0),
                 ('guidance.los_method', 'alos'),
                 ('guidance.approach_length', 0.0),
+                ('guidance.approach_ratio', 1.0),
+                ('guidance.dubins_radii', [0.0]),
+                ('guidance.path_turn_rate_deg_s', 17.0),
+                ('guidance.turn_penalty', 0.0),
+                ('guidance.spot_turn_penalty', 0.0),
+                ('guidance.turn_trajectory', False),
+                ('guidance.turn_accel_deg_s2', 20.0),
                 ('guidance.force_manoeuvre', ''),
+                ('guidance.planner', 'rules'),
+                ('guidance.ocp_min_distance', 0.5),
+                ('guidance.ocp_max_distance', 25.0),
+                ('guidance.ocp_threaded', True),
+                ('guidance.ocp.w_T', 1.0),
+                ('guidance.ocp.w_v', 30.0),
+                ('guidance.ocp.w_r', 5.0),
+                ('guidance.ocp.w_rev', 8.0),
+                ('guidance.ocp.w_xte', 0.0),
+                ('guidance.ocp.w_hold', 40.0),
+                ('guidance.ocp.w_f', 2.0),
+                ('guidance.ocp.w_df', 20.0),
                 ('guidance.max_path_turn_deg', 270.0),
+                ('guidance.max_path_ratio', 0.0),
                 ('guidance.time_model.path', [6.0, 1.667, 3.82]),
                 ('guidance.time_model.pivot', [6.0, 1.667, 3.82, 2.86]),
                 ('guidance.time_model.forward', [0.0, 1.667, 2.86]),
@@ -323,6 +345,7 @@ class PositionController(Node):
         if model_name:
             config, path = vessel_model.load_vessel_config(model_name)
             params = vessel_model.model_parameters(config)
+            self._vessel_cfg, self._vessel_params = config, params      # for the OCP planner
             self.M_eff = vessel_model.M_eff_3dof(params)
             self.D_eff = vessel_model.D_3dof(params)
             # Full model, so the feedforward can use the nonlinear damping D(nu_d) nu_d
@@ -905,25 +928,113 @@ class PositionController(Node):
         c[2] = wrap_to_pi(c[2] + (np.clip(step, -rate * self.dt, rate * self.dt) if rate > 0.0 else step))
         return c.copy()
 
+    def _use_ocp(self, distance, yaw):
+        """The optimal-control planner for moves up to ocp_max_distance (longer ones: Dubins / ALOS transit)."""
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        if g('planner') != 'ocp' or not self.model_based or getattr(self, '_vessel_cfg', None) is None:
+            return False
+        if getattr(self, '_ocp_failed', False):
+            return False
+        turn = abs(wrap_to_pi(self.target_yaw - yaw))
+        return distance <= g('ocp_max_distance') and (distance > g('ocp_min_distance') or turn > np.radians(20.0))
+
+    def _ocp_planner(self):
+        g = lambda n: self.get_parameter(f'guidance.ocp.{n}').value
+        weights = {k: g(k) for k in ('w_T', 'w_v', 'w_r', 'w_rev', 'w_xte', 'w_hold', 'w_f', 'w_df')}
+        if getattr(self, '_ocp', None) is None or self._ocp_weights != weights:
+            G = lambda n: self.get_parameter(f'guidance.{n}').value
+            self._ocp = trajectory_planner.OCPPlanner.from_vessel_config(
+                self._vessel_cfg, self._vessel_params, u_max=G('forward_speed'), u_min=-G('reverse_speed'),
+                r_max_deg=G('max_turn_rate_deg_s'), **weights)
+            self._ocp_weights = weights
+        return self._ocp
+
+    def _ocp_reference(self, x, y, yaw, phase):
+        """
+        Plan once per goal with the optimal-control planner (in a thread on the boat, so the 10 Hz loop keeps
+        holding position meanwhile), then feed the planned pose, velocity and acceleration to the DP law as a
+        trajectory (Fossen Ch. 12.1, trajectory tracking). At the end, station keeping on the goal.
+        """
+        if phase is None:
+            nu = self.latest_odom.twist.twist
+            start = [x, y, yaw, nu.linear.x, nu.linear.y, getattr(nu.angular, 'z', 0.0)]
+            goal = [self.target_x, self.target_y, self.target_yaw]
+            self._ocp_id = getattr(self, '_ocp_id', 0) + 1
+            self._ocp_result, self._ocp_hold = None, np.array([x, y, yaw])
+            job = lambda i=self._ocp_id: setattr(self, '_ocp_result', (i, self._ocp_planner().plan(start, goal)))
+            if self.get_parameter('guidance.ocp_threaded').value:
+                threading.Thread(target=job, daemon=True).start()
+            else:
+                job()
+            self._guidance_phase = phase = 'ocp_plan'
+            self._traj = None
+        if phase == 'ocp_plan':
+            res = self._ocp_result
+            if res is None or res[0] != self._ocp_id:
+                return self._ocp_hold                            # still planning: hold where we were
+            plan = res[1]
+            if not plan.get('ok'):
+                self.get_logger().warn("Guidance: OCP planner failed, falling back to the manoeuvre rules")
+                self._ocp_failed, self._guidance_phase = True, None
+                return self._ocp_hold
+            self._ocp_plan, self._ocp_t = plan, 0.0
+            self.get_logger().info(
+                f"Guidance: OCP plan {plan['T']:.1f} s, solved in {plan['solve_time']:.2f} s ({plan['guess']} guess)")
+            self._guidance_phase = phase = 'ocp'
+        self._ocp_t += self.dt
+        eta_d, eta_dot, eta_ddot, done = trajectory_planner.sample(self._ocp_plan, self._ocp_t)
+        if done:
+            self._traj = None
+            goal = np.array([self.target_x, self.target_y, self.target_yaw])
+            self._reset_ref_filter(goal, np.zeros(3))
+            self._guidance_phase, self._final_turn = 'station', False
+            self.get_logger().info("Guidance: station (end of OCP plan)")
+            return goal
+        self._traj = (eta_d, eta_dot, eta_ddot)
+        return eta_d
+
     def _plan_dubins(self, x, y, heading, mode='path', first_turn=0.0):
         """
         Quickest Dubins path (by the time model) from (x, y, heading) to the goal over arrival headings:
         the goal heading, or one with a shorter path plus a turn on the spot at the goal. Paths that turn
         more than max_path_turn_deg in total are left out while others exist: they were loops that took
         about as long as the alternatives but looked like the boat had lost its way.
-        Returns (time, features, path, arrival heading) or None.
+
+        Like a skipper, it may turn tighter at lower speed: every radius in dubins_radii is tried, with the
+        speed on that path limited to radius * path_turn_rate (0.6 m/s on R = 2 m, 0.3 m/s on R = 1 m at
+        17 deg/s). The time model sees the path length scaled by forward_speed / path speed. Short goals also
+        get a shorter approach leg (approach_ratio * distance, at least 0.5 m, at most approach_length):
+        with R = 2 m and a fixed 1.5 m leg, goals 3-5 m away with another final heading only had loops.
+        Returns (time, features, path, arrival heading, path speed) or None.
         """
         g = lambda n: self.get_parameter(f'guidance.{n}').value
+        distance = np.hypot(self.target_x - x, self.target_y - y)
+        approach = min(g('approach_length'), max(0.5, g('approach_ratio') * distance))
+        radii = [r for r in g('dubins_radii') if r > 0.0] or [g('dubins_radius')]
         cand = []
-        for psi_a in [self.target_yaw] + list(np.linspace(-np.pi, np.pi, 24, endpoint=False)):
-            path = DubinsPath.with_approach((x, y, heading), (self.target_x, self.target_y, psi_a),
-                                            g('dubins_radius'), g('approach_length'))
-            f = [path.length, abs(wrap_to_pi(self.target_yaw - psi_a))]
-            if mode == 'pivot':
-                f.append(first_turn)
-            t = float(np.dot(g(f'time_model.{mode}'), [1.0] + f))
-            cand.append((t, f, path, psi_a))
+        for R in radii:
+            speed = min(g('forward_speed'), R * np.radians(g('path_turn_rate_deg_s')))
+            for psi_a in [self.target_yaw] + list(np.linspace(-np.pi, np.pi, 24, endpoint=False)):
+                path = DubinsPath.with_approach((x, y, heading), (self.target_x, self.target_y, psi_a), R, approach)
+                path.approach, path.radius = approach, R
+                f = [path.length * g('forward_speed') / speed, abs(wrap_to_pi(self.target_yaw - psi_a))]
+                if mode == 'pivot':
+                    f.append(first_turn)
+                t = float(np.dot(g(f'time_model.{mode}'), [1.0] + f))
+                # turning costs extra: the quickest path was often a small loop that looked needless; turning
+                # on the spot (before or after the path) costs more again: it looks like a fidget spinner
+                t += g('turn_penalty') * (path.turning + f[1] + first_turn) + g('spot_turn_penalty') * (f[1] + first_turn)
+                cand.append((t, f, path, psi_a, speed))
+        # also no paths much longer than the distance: with the 1.5 m approach leg and R = 2 m, goals 3-6 m
+        # away got loops 2-3 times the distance that looked like the boat had lost its way
+        # (only for driving off directly; a pivot faces the goal first, so its path is short anyway and it
+        # stays available as the fallback)
         ok = [c for c in cand if c[2].turning <= np.radians(g('max_path_turn_deg'))] or cand
+        limit = g('max_path_ratio') * distance + approach
+        if mode == 'path' and g('max_path_ratio') > 0.0:
+            ok = [c for c in ok if c[2].length <= limit]
+            if not ok:
+                return None
         best = None
         for c in ok:
             if best is None or c[0] < best[0] - 0.5:     # prefer the exact goal heading on a near tie
@@ -968,26 +1079,43 @@ class PositionController(Node):
             # The arrival heading is free: the goal heading, or one that gives a shorter path plus a turn on
             # the spot at the goal, whichever is quicker (a fixed goal heading on the "wrong" side made the
             # boat drive a full loop).
-            for mode, pivot in (('path', yaw), ('pivot', bearing)):
-                if mode == 'pivot' and abs(wrap_to_pi(bearing - yaw)) < np.radians(g('align_angle_deg')):
-                    continue
-                best = self._plan_dubins(x0, y0, pivot, mode, abs(wrap_to_pi(pivot - yaw)))
+            # 'pivot' turns on the spot first, all the way to the goal or only part of it (30 deg steps), then
+            # drives off on an arc: a short twist often saves a long loop, like a skipper would do it
+            pivots = [bearing] + [wrap_to_pi(yaw + np.radians(k)) for k in range(-180, 181, 30) if k != 0]
+            for mode, headings in (('path', [yaw]), ('pivot', pivots)):
+                best = None
+                for pivot in headings:
+                    if mode == 'pivot' and abs(wrap_to_pi(pivot - yaw)) < np.radians(g('align_angle_deg')):
+                        continue
+                    c = self._plan_dubins(x0, y0, pivot, mode, abs(wrap_to_pi(pivot - yaw)))
+                    if c is not None and (best is None or c[0] < best[0]):
+                        best, best_pivot = c, pivot
                 if best is None:
                     continue
                 self._features[mode] = best[1]
-                self._dubins_opts[mode] = (best[2], best[3])
+                self._dubins_opts[mode] = (best[2], best[3], best[4])
+                if mode == 'pivot':
+                    self._pivot_heading = best_pivot
             self._features.pop('forward')   # the paths replace turn on the spot - drive straight - turn
         if g('sway_speed') > 0.0 and distance <= g('max_dp_distance'):
             # the heading changes on the way: use the slower of the start and the final heading
             speed = min(self._speed_limit(bearing, yaw), self._speed_limit(bearing, self.target_yaw))
             self._features['dp'] = [distance / speed, abs(wrap_to_pi(self.target_yaw - yaw))]
         times = {k: T(k, f) * (g('reverse_penalty') if k == 'reverse' else 1.0) for k, f in self._features.items()}
+        for k in ('reverse', 'forward', 'dp'):            # the same turning cost as the Dubins paths, all on the spot
+            if k in times:
+                times[k] += (g('turn_penalty') + g('spot_turn_penalty')) * self._features[k][1]
+        for k in ('path', 'pivot'):
+            if k in times:
+                path = self._dubins_opts[k][0]
+                spot = self._features[k][1] + (self._features[k][2] if k == 'pivot' else 0.0)
+                times[k] += g('turn_penalty') * (path.turning + spot) + g('spot_turn_penalty') * spot
         best = min(times, key=times.get)
         forced = g('force_manoeuvre')
         if forced:
             best = forced if forced in times else best
         if best in self._dubins_opts:
-            self._dubins, self._path_arrival = self._dubins_opts[best]
+            self._dubins, self._path_arrival, self._path_speed = self._dubins_opts[best]
             self._path_pivot = best == 'pivot'
         return best, times
 
@@ -1003,6 +1131,8 @@ class PositionController(Node):
         bearing = np.arctan2(dy, dx)
         phase = getattr(self, '_guidance_phase', None)
 
+        if phase in ('ocp_plan', 'ocp') or (phase is None and self._use_ocp(distance, yaw)):
+            return self._ocp_reference(x, y, yaw, phase)
         if phase is None:
             self._manoeuvre, times = self._choose_manoeuvre(distance, bearing, yaw, x, y)
             self.get_logger().info(
@@ -1038,6 +1168,8 @@ class PositionController(Node):
                 self._max_cross_track = max(self._max_cross_track, abs(self._alos.errors(x, y)[1]))
         else:
             course = bearing
+        if phase == 'turn' and getattr(self, '_manoeuvre', None) == 'pivot':
+            course = getattr(self, '_pivot_heading', course)
         course = wrap_to_pi(course + np.pi) if reverse else course
         heading_error = abs(wrap_to_pi(course - yaw))
         settle = self.get_parameter('guidance.settle_radius').value
@@ -1047,14 +1179,17 @@ class PositionController(Node):
             phase, self._guidance_heading = 'arrive', course if phase == 'transit' else yaw
         elif phase == 'arrive' and distance < settle:
             phase, self._final_turn = 'station', True   # turn to the final heading, rate limited
-        elif phase == 'turn' and heading_error < (np.radians(3.0) if getattr(self, '_manoeuvre', None) == 'pivot'
-                                                  else align):
+        elif phase == 'turn' and (heading_error < (np.radians(3.0) if getattr(self, '_manoeuvre', None) == 'pivot'
+                                                   else align)
+                                  or (heading_error < align and getattr(self, '_yaw_traj', None) is not None
+                                      and self._yaw_traj['t'] > self._yaw_traj['T'] + 3.0)):
             # a pivot turns all the way: from 20 deg off, the Dubins path to a goal 3 m away was a full loop
             phase = 'transit'
+            self._traj, self._yaw_traj = None, None
             if getattr(self, '_manoeuvre', None) == 'pivot':
                 # turned towards the goal on the spot: now the Dubins path from here
                 # plan again from where the boat is now (it may have drifted while turning)
-                _, _, self._dubins, self._path_arrival = self._plan_dubins(x, y, yaw)
+                _, _, self._dubins, self._path_arrival, self._path_speed = self._plan_dubins(x, y, yaw)
                 self.get_logger().info(f"Guidance: Dubins path {self._dubins.word}, {self._dubins.length:.1f} m")
                 return self._dubins_reference(x, y, yaw)
         elif phase == 'transit' and heading_error > 2 * align:
@@ -1069,7 +1204,14 @@ class PositionController(Node):
             if path_following and phase == 'transit':
                 self._u_ref = float(self.latest_odom.twist.twist.linear.x)
         self._guidance_phase = phase
+        if phase != 'turn':
+            self._traj, self._yaw_traj = None, None
         if phase == 'turn':
+            if self.get_parameter('guidance.turn_trajectory').value:
+                psi_d, r_d, a_d, self._turn_done = self._turn_trajectory(yaw, course)
+                self._traj = (np.array([*self._guidance_hold, psi_d]), np.array([0.0, 0.0, r_d]),
+                              np.array([0.0, 0.0, a_d]))
+                return np.array([*self._guidance_hold, psi_d])
             return np.array([*self._guidance_hold, course])
         if phase == 'transit' and path_following:
             # speed along the path: ramp down to arrive_speed at approach_radius
@@ -1133,14 +1275,15 @@ class PositionController(Node):
         u = float(self.latest_odom.twist.twist.linear.x)
         self._path_moving = self._path_moving or u > 0.15
         self._path_stall = self._path_stall + self.dt if (self._path_moving and u < 0.05) else 0.0
-        dp_from = g('approach_length') if g('approach_dp') else g('settle_radius')
+        leg = getattr(path, 'approach', g('approach_length'))
+        dp_from = leg if g('approach_dp') else g('settle_radius')
         if (left < max(dp_from, g('settle_radius')) or distance < g('settle_radius')
                 or (distance < g('approach_radius') and ahead < g('settle_radius'))   # passed or abeam
                 or self._path_stall > 3.0):                                           # stopped short
             self.get_logger().info(
                 f"Guidance: station (end of path, ALOS crab estimate {np.degrees(self._alos.beta_hat):.1f} deg, "
                 f"max cross-track error {self._max_cross_track:.2f} m)")
-            if g('approach_dp') and g('approach_length') > 0 and left > g('settle_radius'):
+            if g('approach_dp') and leg > 0 and left > g('settle_radius'):
                 # DP follows the approach leg itself: a point sliding along it and braking evenly to rest
                 # at the goal, with its speed and deceleration fed forward. The azimuth corrects the
                 # sideways error on the way in, and there is no filter lag to catch up at the end.
@@ -1151,12 +1294,46 @@ class PositionController(Node):
                 return self._approach_reference()
             self._guidance_phase, self._final_turn, self._guidance_heading = 'station', True, yaw
             return np.array([self.target_x, self.target_y, yaw])
+        # a lookahead longer than the turning radius cuts the arcs: scale it down on tight paths
+        self._alos.delta = min(g('los_lookahead'), max(1.0, 1.25 * getattr(path, 'radius', g('dubins_radius'))))
         psi_d = wrap_to_pi(self._alos.heading(pi_h, ye, self.dt) - self._crab_feedforward(pi_h))
         a = g('transit_accel')
         # slow down to path_end_speed where DP takes over (settle_radius before the end)
-        u_d = min(g('forward_speed'), np.sqrt(g('path_end_speed')**2 + 2 * a * max(left - max(dp_from, g('settle_radius')), 0.0)))
+        u_d = min(getattr(self, '_path_speed', g('forward_speed')), np.sqrt(g('path_end_speed')**2 + 2 * a * max(left - max(dp_from, g('settle_radius')), 0.0)))
         self._path_command = (psi_d, u_d, kappa)
         return None
+
+    def _turn_trajectory(self, yaw, target):
+        """
+        Heading trajectory for a turn on the spot: accelerate at turn_accel, hold max_turn_rate, brake to rest
+        exactly on the target heading. DP tracks it with the yaw rate and acceleration fed forward. The
+        reference filter took 15 s for 166 deg (it lagged 3-4 s at the start and crept over the last 5 deg);
+        this takes about 8 s. Returns (psi_d, r_d, r_d_dot, finished).
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        tr = getattr(self, '_yaw_traj', None)
+        if tr is None:
+            a, v = np.radians(g('turn_accel_deg_s2')), np.radians(g('max_turn_rate_deg_s'))
+            d = wrap_to_pi(target - yaw)
+            D = abs(d)
+            if D < v * v / a:                     # never reaches full rate: accelerate, then brake
+                v = np.sqrt(D * a)
+            t1 = v / a
+            t2 = t1 + max(D - v * v / a, 0.0) / v if v > 0 else t1
+            tr = self._yaw_traj = dict(psi0=yaw, sign=np.sign(d), D=D, a=a, v=v, t1=t1, t2=t2, T=t2 + t1, t=0.0)
+        tr['t'] += self.dt
+        t, a, v, t1, t2, T = tr['t'], tr['a'], tr['v'], tr['t1'], tr['t2'], tr['T']
+        if t < t1:
+            s_, r_, acc = 0.5 * a * t * t, a * t, a
+        elif t < t2:
+            s_, r_, acc = 0.5 * a * t1 * t1 + v * (t - t1), v, 0.0
+        elif t < T:
+            tau = T - t
+            s_, r_, acc = tr['D'] - 0.5 * a * tau * tau, a * tau, -a
+        else:
+            s_, r_, acc = tr['D'], 0.0, 0.0
+        k = tr['sign']
+        return wrap_to_pi(tr['psi0'] + k * s_), k * r_, k * acc, t >= T
 
     def _approach_reference(self):
         """Pose, velocity and acceleration on the approach leg (constant deceleration to the goal)."""
@@ -1249,7 +1426,8 @@ class PositionController(Node):
         self.target_x = target_in_odom.pose.position.x
         self.target_y = target_in_odom.pose.position.y
         self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
-        self._traj = None
+        self._traj, self._yaw_traj = None, None
+        self._ocp_failed = False
         self._final_turn = False
 
         self.get_logger().info(

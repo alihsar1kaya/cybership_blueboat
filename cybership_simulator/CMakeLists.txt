@@ -14,7 +14,7 @@ ament_python_install_package(${PROJECT_NAME}
 )
 
 install(
-  DIRECTORY launch config
+  DIRECTORY launch config worlds
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -24,6 +24,7 @@ install(
     src/${PROJECT_NAME}/enterprise.py
     src/${PROJECT_NAME}/drillship.py
     src/${PROJECT_NAME}/vessel.py
+    src/${PROJECT_NAME}/gz_pose_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
