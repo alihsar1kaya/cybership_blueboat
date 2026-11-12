@@ -62,7 +62,7 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true
 ```
 
-RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. The guidance estimates how long each way of getting there takes and picks the quickest. Longer moves follow a Dubins path: the boat turns while it drives, like a boat does, and arrives pointing the way you chose. Short corrections of up to about 3.5 m are done without turning, at up to 0.2 m/s sideways, and a goal a few metres straight behind is reached by backing up. Once there it stays within a centimetre or two.
+RViz opens with the boat at the origin. Pick **2D Goal Pose** in the toolbar, then click on the map where the boat should go and drag in the direction it should point. The guidance plans the whole move in about a second and the boat follows the plan: it turns while it drives where there is room, turns on the spot or backs up a little where that is shorter, and arrives pointing the way you chose. Once there it stays within a centimetre or two. The section [How it works](#how-it-works) explains what happens on the way.
 
 Stop everything with `Ctrl+C` in the launch terminal.
 
@@ -235,6 +235,8 @@ Add them to the end of the `ros2 launch` line as `name:=value`. They are read on
 | `wind_speed` | `0` | m/s | mean wind speed |
 | `wind_dir` | `0` | deg | direction the wind blows towards |
 | `use_gui` | `true` | | start RViz |
+| `gazebo` | `false` | | also show the boat in a Gazebo world (needs `ros_gz`; our model stays the physics, Gazebo only draws it) |
+| `gz_world` | `small_harbour` | | `small_harbour` (light, with a dock) or a VRX world such as `sydney_regatta` |
 
 ### Weather and sensors while running
 
@@ -303,13 +305,17 @@ The settings are in [`cybership_config/config/microampere/controller_position.ya
 |---|---|---|
 | `control.omega_n` | holds tighter and uses more thrust | softer |
 | `filter.omega` | reaches a new goal sooner | smoother moves |
+| `guidance.ocp.w_v` | less sideways motion | more crabbing with the bow thruster |
+| `guidance.ocp.w_r` | gentler turning, more arcs | quicker turns, more turning on the spot |
+| `guidance.ocp.w_rev` | backs up less | backs up more often |
+| `guidance.ocp.w_f`, `w_df` | calmer, slower moves | quicker moves with more thrust |
 | `guidance.forward_speed` | faster transit | slower transit |
 | `guidance.sway_speed` | faster sideways moves, until the bow thruster saturates (0.2 m/s takes about 45 of its 67 N) | gentler on the bow thruster |
 | `guidance.max_turn_rate_deg_s` | quicker turns; above about 30 °/s the stern thrusters saturate and the boat slides off the spot | slower turns |
 | `guidance.max_dp_distance` | longer moves are done without turning first | the boat turns and drives more often |
 | `guidance.dubins_radius` | wider, gentler curves | tighter turns; 0 switches the curves off (turn on the spot, drive straight, turn again) |
 
-You can change them while it runs, for example `ros2 param set /microampere/position_controller guidance.forward_speed 0.4`.
+The `guidance.ocp` weights shape the planned moves (everything up to 25 m). The Dubins settings below them only matter for longer moves. You can change them while it runs, for example `ros2 param set /microampere/position_controller guidance.ocp.w_rev 15.0`.
 </details>
 
 <details>
@@ -345,6 +351,18 @@ flowchart LR
     SENS --> OBS
 ```
 
+### The ideas in short
+
+The simulator moves the boat with Fossen's 6-DOF equations of motion, M ν̇ + C(ν)ν + D(ν)ν + g(η) = τ + τ_env. M holds the mass plus the added mass (the water the hull has to push along), D the damping and g the restoring forces from buoyancy. The added mass, damping and restoring terms come from Capytaine, a panel code run on the CAD hull, so they follow the BlueBoat's real shape rather than a box. Wind, waves and current add their own forces, and each thruster loses some thrust as the boat speeds up.
+
+The DP stack never sees that true state. It gets GNSS positions at 5 Hz, a compass and a gyro, all with noise and delays, and a Kalman filter turns them into an estimate using a simpler 3-DOF version of the same model. Between GNSS fixes the filter predicts where the boat should be from the forces it is pushing with, and each fix corrects the guess. Besides position, heading and velocity it estimates the current and a slowly varying bias force. The bias collects whatever the model gets wrong, such as wind or a damping value that is off, and the controller cancels it.
+
+When you give a goal, the guidance plans the whole move at once. Microampere has three thrusters, one of them a rotating bow azimuth, so it can push forwards, push sideways and turn independently. Fossen calls this fully actuated, and for such a boat at low speed the textbook answer is trajectory tracking: plan where the boat should be at every moment, then make it follow. The planner solves an optimal control problem with CasADi and IPOPT. It looks for the thrust from each thruster, second by second, that brings the boat from where it is to the goal pose at rest without exceeding the thrust and speed limits, at the lowest cost. The cost adds up time, sideways speed, yaw rate, backing up and thrust, each with a weight. Raise a weight and the boat does less of that; whether to turn while driving, turn on the spot or back up falls out of the optimization instead of a set of rules. NTNU's autonomous ferry milliAmpere plans its moves the same way. Moves longer than 25 m use a Dubins path followed with adaptive line-of-sight (ALOS) guidance instead, which suits long transits at speed.
+
+The controller then follows the plan. It works out the force the model says is needed to move along it (mass times acceleration plus damping), adds a correction in proportion to the position and velocity error, and subtracts the bias from the Kalman filter. The gains come from pole placement on the model, so the main tuning knob is how fast it should react (`control.omega_n`).
+
+Last, the thrust allocation splits the requested forces and turning moment between the three thrusters. It solves a small quadratic program that respects each thruster's limit and the slow rotation of the azimuth. When the request is more than the thrusters can give, it keeps the heading and gives up some surge and sway first.
+
 <details>
 <summary>Topics</summary>
 
@@ -378,6 +396,7 @@ To drive manually through the mux: `ros2 service call /microampere/force_mux/sel
 | Sensors | `marine_craft/sensors.py` | ch. 13–14 |
 | Kalman filter with wave filter | `cybership_utilities/observer.py` | ch. 13.4.6 |
 | DP controller and guidance | `cybership_dp/nodes/position_control_node.py` | ch. 15 |
+| Optimal-control trajectory planner (CasADi/IPOPT) | `cybership_dp/trajectory_planner.py` | ch. 12.1; Bitar et al. 2020 (milliAmpere) |
 | Thrust allocation (QP) | `cybership_dp/constrained_allocation.py` | ch. 11.2.3 |
 | Dubins paths, followed with ALOS | `cybership_dp/dubins.py`, `cybership_dp/los.py` | ch. 12.4–12.5 |
 </details>
@@ -400,7 +419,9 @@ The unit tests check the boat model, the weather, the sensors, the Kalman filter
 - The slow drift force from waves (second order) is not modelled. The Kalman filter's bias estimate absorbs it, as it would on the real boat.
 - The wind areas come from the CAD model. The real boat's antennas and electronics are not in it.
 - There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.
-- Only one goal at a time; there are no waypoint routes and no obstacle avoidance.
+- Only one goal at a time; there are no waypoint routes yet.
+- The planner does not know about the dock or other obstacles yet, so the boat can plan straight through them. The dock in the Gazebo world is only drawn.
+- The plan is made once per goal. On the way the boat lies up to about 20 cm behind it; planning again during the move (MPC) is the next step.
 
 ---
 
