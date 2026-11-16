@@ -28,6 +28,7 @@ from rclpy.executors import MultiThreadedExecutor
 from cybership_tests.go_to_client import NavigateToPoseClient
 from shoeboxpy.model3dof import Shoebox
 from cybership_utilities import vessel_model
+from cybership_utilities.marine_craft.tow import towed_from_config
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import SetBool, Trigger, Empty
@@ -145,6 +146,11 @@ class PositionController(Node):
                 ('guidance.turn_penalty', 0.0),
                 ('guidance.spot_turn_penalty', 0.0),
                 ('guidance.turn_trajectory', False),
+                ('guidance.weathervane', False),
+                ('guidance.weathervane_rate_deg_s', 3.0),
+                ('guidance.weathervane_deadband_deg', 10.0),
+                ('guidance.weathervane_min_current', 0.03),
+                ('guidance.weathervane_min_force', 3.0),
                 ('guidance.turn_accel_deg_s2', 20.0),
                 ('guidance.force_manoeuvre', ''),
                 ('guidance.planner', 'rules'),
@@ -193,6 +199,9 @@ class PositionController(Node):
                 # cybership_config/config/<vessel_model>/vessel.yaml (same as the simulator)
                 # and vessel.length/beam/draft are ignored.
                 ('vessel_model', ''),
+                # Towed load (vessel.yaml 'tow', launch tow:=true tow_model:=true): the load's mass and drag in
+                # surge in the DP law and the OCP planner
+                ('tow.enabled', False),
                 ('vessel.length', 1.0),
                 ('vessel.beam', 0.3),
                 ('vessel.draft', 0.02),
@@ -348,6 +357,21 @@ class PositionController(Node):
             self._vessel_cfg, self._vessel_params = config, params      # for the OCP planner
             self.M_eff = vessel_model.M_eff_3dof(params)
             self.D_eff = vessel_model.D_3dof(params)
+            self._tow_surge = None
+            if self.get_parameter('tow.enabled').value and config.get('tow'):
+                # a load on a towbar moves with the boat in surge: its mass and drag in the DP law and the OCP
+                # planner (a rope only pulls: just the drag). The observer takes the load cell's force as an
+                # input, so the sideways pull in a turn does not end up in the bias. Cancelling the measured
+                # force here instead was unstable in yaw: it holds the load's inertia (45 kg x 0.6^2 m^2 at
+                # the stern, more than the boat's 9.4 kg m^2), and the filter delays it
+                tb = towed_from_config(config['tow'])
+                m_t, a_t, b_t = tb.surge_model()
+                self._tow_surge = (m_t if tb.rigid else 0.0, a_t, b_t)
+                self.M_eff = self.M_eff.copy()
+                self.M_eff[0, 0] += self._tow_surge[0]
+                self.get_logger().info(
+                    f"Towed load in the model ({tb.describe()}): +{self._tow_surge[0]:.1f} kg in surge, drag "
+                    f"{a_t:.1f} u + {b_t:.1f} u|u| N")
             # Full model, so the feedforward can use the nonlinear damping D(nu_d) nu_d
             self._craft = vessel_model.make_marine_craft(params)
             self.get_logger().info(
@@ -830,9 +854,17 @@ class PositionController(Node):
             damping_ff = -self._craft.damping(np.array([nu_rd[0], nu_rd[1], 0, 0, 0, nu_rd[2]]))[[0, 1, 5]]
         else:
             damping_ff = self.D_eff @ nu_rd
+        damping_ff[0] += self._tow_drag(nu_rd[0])
         tau = (self.M_eff @ nu_rd_dot + damping_ff
                + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
         return float(tau[0]), float(tau[1]), float(tau[2])
+
+    def _tow_drag(self, u_r):
+        """Drag of a towed load at surge speed u_r through the water (0 without one)."""
+        if getattr(self, '_tow_surge', None) is None:
+            return 0.0
+        _, a, b = self._tow_surge
+        return a * u_r + b * u_r * abs(u_r)
 
     def _reset_ref_filter(self, eta, eta_dot):
         f = self.ref_filter
@@ -861,6 +893,7 @@ class PositionController(Node):
             d, d_r = dmp[0], dmp[5]
         else:
             d, d_r = self.D_eff[0, 0] * u_r, self.D_eff[2, 2] * r_d
+        d += self._tow_drag(u_r)
         X = self.M_eff[0, 0] * u_ref_dot + d + self.Kd_mb[0] * (self._u_ref - nu[0])
         N = self.Kp_mb[2] * wrap_to_pi(psi_d - psi) + self.Kd_mb[2] * (r_d - nu[2]) + d_r
         if self.get_parameter('control.bias_feedforward').value and self.bias_hat is not None:
@@ -945,7 +978,7 @@ class PositionController(Node):
             G = lambda n: self.get_parameter(f'guidance.{n}').value
             self._ocp = trajectory_planner.OCPPlanner.from_vessel_config(
                 self._vessel_cfg, self._vessel_params, u_max=G('forward_speed'), u_min=-G('reverse_speed'),
-                r_max_deg=G('max_turn_rate_deg_s'), **weights)
+                r_max_deg=G('max_turn_rate_deg_s'), tow=getattr(self, '_tow_surge', None), **weights)
             self._ocp_weights = weights
         return self._ocp
 
@@ -1236,7 +1269,39 @@ class PositionController(Node):
             if abs(step) < 1e-3:
                 self._final_turn = False
             return np.array([self.target_x, self.target_y, self._guidance_heading])
+        if self.get_parameter('guidance.weathervane').value:
+            return np.array([self.target_x, self.target_y, self._weathervane_heading()])
         return goal
+
+    def _weathervane_heading(self):
+        """
+        Weather-optimal heading while holding position (Fossen, L6 / Ch. 12.1: align the vessel against the
+        mean resulting environmental force). The bow turns slowly into the current estimated by the observer,
+        or, without current, against the bias force (wind, waves, a towline); the heading is otherwise free.
+        With a towed load this keeps the load downstream, so the line stays taut instead of going slack and
+        jerking. Small changes inside the deadband are ignored, so the heading does not hunt.
+        """
+        g = lambda n: self.get_parameter(f'guidance.{n}').value
+        if getattr(self, '_wv_heading', None) is None:
+            self._wv_heading, self._wv_turning = self.target_yaw, False
+        target = None
+        vc = self.current_hat
+        b = self.bias_hat
+        if vc is not None and np.hypot(vc[0], vc[1]) > g('weathervane_min_current'):
+            target = np.arctan2(-vc[1], -vc[0])                       # bow towards where the current comes from
+        elif b is not None and np.hypot(b[0], b[1]) > g('weathervane_min_force'):
+            target = np.arctan2(-b[1], -b[0])                         # bow against the mean force
+        if target is not None:
+            err = wrap_to_pi(target - self._wv_heading)
+            if abs(err) > np.radians(g('weathervane_deadband_deg')):
+                self._wv_turning = True
+            if self._wv_turning:
+                step = np.radians(g('weathervane_rate_deg_s')) * self.dt
+                self._wv_heading = wrap_to_pi(self._wv_heading + np.clip(err, -step, step))
+                if abs(err) < np.radians(1.0):
+                    self._wv_turning = False
+        self.target_yaw = self._wv_heading       # the goal's heading becomes the weather heading
+        return self._wv_heading
 
     def _crab_feedforward(self, pi_h):
         """
@@ -1428,6 +1493,7 @@ class PositionController(Node):
         self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
         self._traj, self._yaw_traj = None, None
         self._ocp_failed = False
+        self._wv_heading = None
         self._final_turn = False
 
         self.get_logger().info(

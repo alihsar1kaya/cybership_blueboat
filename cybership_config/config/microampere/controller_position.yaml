@@ -162,6 +162,15 @@
       # target) with the yaw rate fed forward, instead of the reference filter: 166 deg took 15.8 s with the
       # filter, 7.5 s like this. 42 short goals: pivot / reverse goals 35.1 -> 30.6 s (calm).
       turn_trajectory: true
+      # Weather-optimal heading while holding position (Fossen L6, Ch. 12.1): the bow turns slowly into the
+      # estimated current, or against the mean environmental force, and the goal heading is given up. Off
+      # by default; useful with a towed load, which then stays downstream (line taut, no jerks). Live:
+      # ros2 param set /microampere/position_controller guidance.weathervane true
+      weathervane: false
+      weathervane_rate_deg_s: 3.0
+      weathervane_deadband_deg: 10.0
+      weathervane_min_current: 0.03   # [m/s] estimated current that decides the heading
+      weathervane_min_force: 3.0      # [N] else the bias force, if larger than this
       turn_accel_deg_s2: 20.0
       # los, alos or ilos (ilos_kappa): with the crab angle fed forward from the current estimate they are
       # within 1 s of each other; ilos with kappa 1.0 was worse (3 s slower, 2.2 m off the path in current)

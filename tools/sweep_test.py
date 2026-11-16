@@ -15,6 +15,7 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Wrench
+from std_msgs.msg import Float64
 from nav_msgs.msg import Odometry
 
 from cybership_interfaces.msg import ThrusterState
@@ -37,7 +38,7 @@ def main():
     a = ap.parse_args()
     rclpy.init()
     n = rclpy.create_node("sweep_probe")
-    log = {"odom": [], "tau": [], "slack": [], **{k: [] for k in THRUSTERS}}
+    log = {"odom": [], "tau": [], "slack": [], "tow": [], **{k: [] for k in THRUSTERS}}
     now = time.time
     n.create_subscription(Odometry, f"{a.ns}/sim/odom_true", lambda m: log["odom"].append(
         (now(), m.pose.pose.position.x, m.pose.pose.position.y, yaw(m.pose.pose.orientation),
@@ -46,6 +47,7 @@ def main():
         (now(), m.force.x, m.force.y, m.torque.z)), 50)
     n.create_subscription(Wrench, f"{a.ns}/control/allocation/slack", lambda m: log["slack"].append(
         (now(), m.force.x, m.force.y, m.torque.z)), 50)
+    n.create_subscription(Float64, f"{a.ns}/sim/tow/tension", lambda m: log["tow"].append((now(), m.data)), 50)
     for k in THRUSTERS:
         n.create_subscription(ThrusterState, f"{a.ns}/thruster/{k}/state", lambda m, k=k: log[k].append(
             (now(), m.force.x, m.force.y, m.angle)), 50)

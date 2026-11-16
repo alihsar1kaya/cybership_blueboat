@@ -123,3 +123,16 @@ def test_azimuth_turns_for_a_small_demand_only_it_can_give():
     assert abs(slack[1]) > 0.5
     _, alpha, _ = a.allocate([0.0, -1.6, 0.0], ahead)
     assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(90, abs=1.0)
+
+
+def test_frozen_azimuth_does_not_fight_the_stern_thrusters():
+    # holding position with the azimuth left at 179 deg after braking: a 0.5 N sway correction is below the
+    # threshold, so it does not turn; it must not make the sway by pushing 25 N along x against the stern
+    with open(os.path.join(REPO, "cybership_config", "config", "microampere", "vessel.yaml")) as f:
+        a = ConstrainedAllocator(yaml.safe_load(f)["thrusters"], angle_threshold=3.0)
+    aft = {"bow_azimuth": math.radians(179.0)}
+    a.allocate([-30.0, 0.0, 0.0], aft)
+    f, alpha, slack = a.allocate([0.0, 0.5, 0.0], aft)
+    assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(180, abs=1.0)  # did not turn
+    assert np.abs(f).max() <= 0.5 + 3.0 + 1e-6                                  # demand + threshold
+    assert abs(slack[0]) < 0.05 and abs(slack[2]) < 0.05                        # surge and yaw still met

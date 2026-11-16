@@ -75,7 +75,8 @@ def _launch_setup(context, *args, **kwargs):
                  "sensors.gnss_profile": gnss,
                  "environment.waves.Hs": wave_hs if use_waves else 0.0,
                  "environment.waves.Tp": wave_tp, "environment.waves.direction_deg": wave_dir,
-                 "environment.wind.speed": wind_speed, "environment.wind.direction_deg": wind_dir},
+                 "environment.wind.speed": wind_speed, "environment.wind.direction_deg": wind_dir,
+                 "tow.enabled": lc("tow").lower() == "true"},
             ],
         ),
         launch_ros.actions.Node(
@@ -98,7 +99,8 @@ def _launch_setup(context, *args, **kwargs):
     ]
     if use_dp:
         web_port = int(lc("web_port")) if lc("web").lower() == "true" else 0
-        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss, web_port)
+        tow_model = lc("tow").lower() == "true" and lc("tow_model").lower() == "true"
+        actions += _dp_actions(vessel, vessel_name, use_observer, wave_filter_w0, gnss, web_port, tow_model)
     if lc("gazebo").lower() == "true":
         actions += _gazebo_actions(vessel, vessel_name, lc("gz_world"), [float(v) for v in lc("gz_origin").split()])
     if use_gui:
@@ -145,7 +147,8 @@ def _gazebo_actions(vessel, vessel_name, world, origin):
     ]
 
 
-def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard", web_port=0):
+def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gnss="standard", web_port=0,
+                tow_model=False):
     """Allocation, force mux, position controller and goal client (the DP stack), optionally the observer."""
     config_dir = os.path.join(get_package_share_directory("cybership_config"), "config")
     controller_params = os.path.join(config_dir, vessel, "controller_position.yaml")
@@ -199,7 +202,8 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gns
             output="screen",
             # vessel_model: mass/added mass from vessel.yaml, the same model the simulator uses
             parameters=[controller_params, {"vessel_model": vessel,
-                                            "control.bias_feedforward": use_observer}],
+                                            "control.bias_feedforward": use_observer,
+                                            "tow.enabled": tow_model}],
             remappings=[("control/force/command", "control/force/command/position")]
             # with the observer the controller sees the estimate (Fossen 13.4.6), not the true state
             + ([("measurement/odom", "navigation/odom")] if use_observer else []),
@@ -227,7 +231,8 @@ def _dp_actions(vessel, vessel_name, use_observer=False, wave_filter_w0=0.0, gns
             namespace=vessel_name,
             name="dp_observer",
             output="screen",
-            parameters=[{"vessel_model": vessel, "wave_filter.omega0": wave_filter_w0, "gnss_profile": gnss}],
+            parameters=[{"vessel_model": vessel, "wave_filter.omega0": wave_filter_w0, "gnss_profile": gnss,
+                         "tow.enabled": tow_model}],
         ))
     return actions
 
@@ -275,6 +280,12 @@ def generate_launch_description():
             "web", default_value="true",
             description="With dp:=true: simple web GUI (map, goals, STOP, sea state) on http://localhost:<web_port>"),
         launch.actions.DeclareLaunchArgument("web_port", default_value="8080", description="Port of the web GUI"),
+        launch.actions.DeclareLaunchArgument(
+            "tow", default_value="false",
+            description="Tow a load behind the boat (vessel.yaml 'tow'; bar force on sim/tow/tension)"),
+        launch.actions.DeclareLaunchArgument(
+            "tow_model", default_value="true",
+            description="With tow:=true: DP law and OCP planner use the load's mass and drag in surge, the observer the load cell (sensor/tow_force)"),
         launch.actions.DeclareLaunchArgument(
             "gazebo", default_value="false",
             description="Also show the boat in a VRX Gazebo world (needs ros_gz and vrx_gz); physics stays ours"),

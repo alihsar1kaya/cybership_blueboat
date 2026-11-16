@@ -206,6 +206,28 @@ ros2 param set /microampere/sim environment.current.direction_deg 90
 
 The controller is not told about the voltage, so it has to make up for the weaker thrusters through its bias estimate. At 14.8 V in a 0.2 m/s side current the boat held within 6 cm, against 2 cm at full voltage, with the bow thruster close to its limit.
 
+### 10. Towing a load
+
+Another BlueBoat group is going to tow something, so the simulator can pull a load behind the boat. Towing is off by default. Turn it on with `tow:=true`:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true
+# the same in waves
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true waves:=true wave_hs:=0.2
+```
+
+With `tow:=false` (or without the argument) none of what follows runs. There is no load, no load cell and no change to the controller, so the boat behaves as it always has.
+
+The default load is a 30 kg float on a 2 m towbar fixed to the stern. The float is a point mass with the drag, added mass and wave forces of a half-submerged sphere of the same displacement (radius 0.24 m). The bar is pinned at both ends, so it pulls and pushes but swings freely to the sides. In RViz the load is an orange ball, and the bar is red while it pulls, blue while it pushes and grey when it carries almost nothing. The bar force is published on `sim/tow/tension`, negative while the bar pushes.
+
+When the load is on, the DP stack knows about it too (`tow_model:=true`, the default). The trajectory planner and the controller add the load's 45 kg (mass plus added mass) and its drag in surge, so plans brake earlier and the gains match the heavier boat. A simulated 2-axis load cell at the tow point publishes the bar force on `sensor/tow_force`, and the Kalman filter takes it as a known force. Before the load cell was added, the sideways pull of the bar in a turn ended up in the bias estimate (up to 24 N) and held the boat 20–70 cm off the goal for half a minute.
+
+Add `tow_model:=false` to watch the boat tow without any of this. In our tests it overshot a 4 m move by about a metre and kept surging back and forth; with the model on, the overshoot was 20 cm and it held within a few centimetres.
+
+The controller does not cancel the load cell force directly. We tried that and it went unstable in yaw. Seen from the stern, the load has more rotational inertia than the boat itself (45 kg × 0.6² m² ≈ 16 kg m², against 9.4 kg m²), and a filtered measurement always arrives a little too late to cancel it.
+
+Everything about the load is in the `tow` section of `vessel.yaml`. There you can swap the float for a 1.2 × 0.5 m hull with a heading of its own (`body.type: hull`), use a rope that only pulls (`line.rigid: false`), or change the bar length, the mass, the tow point and the load cell noise. All of these are guesses until we know what the towing group tows and how they attach it.
+
 ### Switching the controller off and on
 
 ```bash
@@ -234,6 +256,8 @@ Add them to the end of the `ros2 launch` line as `name:=value`. They are read on
 | `wave_dir` | `0` | deg | direction the waves travel towards |
 | `wind_speed` | `0` | m/s | mean wind speed |
 | `wind_dir` | `0` | deg | direction the wind blows towards |
+| `tow` | `false` | | tow a load behind the boat (`vessel.yaml` `tow`: a 30 kg point mass on a 2 m towbar by default) |
+| `tow_model` | `true` | | with `tow`: the DP controller and the trajectory planner use the load's mass and drag in surge, and the observer takes the simulated load cell's force (`sensor/tow_force`) as a known input. Without `tow` none of this runs |
 | `use_gui` | `true` | | start RViz |
 | `gazebo` | `false` | | also show the boat in a Gazebo world (needs `ros_gz`; our model stays the physics, Gazebo only draws it) |
 | `gz_world` | `small_harbour` | | `small_harbour` (light, with a dock) or a VRX world such as `sydney_regatta` |
@@ -275,6 +299,7 @@ All boat data is in [`cybership_config/config/microampere/vessel.yaml`](cybershi
 | `sensors` | rate and noise for GNSS, compass and gyro |
 | `thruster_model` | battery voltage, thrust-voltage curve and how fast thrust drops with speed |
 | `latency` | delays of GNSS, IMU and thruster commands, in seconds |
+| `tow` | the towed load: point mass or a hull with heading, towbar or rope, its length and stiffness, where it attaches |
 | `allocation` | how the total force is split between the thrusters, when the azimuth is allowed to turn (`angle_threshold`) and whether the thrust lost at speed is compensated (`inflow_compensation`) |
 
 Each value has a comment saying where it came from. The ones marked ESTIMATE still need measuring on the real boat; [`tools/identification.md`](tools/identification.md) describes the tests and `tools/identify.py` turns the logs into values for this file.
@@ -363,6 +388,43 @@ The controller then follows the plan. It works out the force the model says is n
 
 Last, the thrust allocation splits the requested forces and turning moment between the three thrusters. It solves a small quadratic program that respects each thruster's limit and the slow rotation of the azimuth. When the request is more than the thrusters can give, it keeps the heading and gives up some surge and sway first.
 
+### The trajectory planner
+
+The planner in `cybership_dp/trajectory_planner.py` solves one optimal control problem per goal. Its model is the 3-DOF version of the boat that the rest of the DP stack uses, with the thrust from each thruster as the input:
+
+```
+η̇ = R(ψ) ν                           η = [x, y, ψ]   position and heading
+M ν̇ + C(ν) ν + D(ν) ν = B f          ν = [u, v, r]   surge, sway and yaw rate
+                                     f = thrust from each thruster
+```
+
+M and D come from `vessel.yaml`, so the planner and the simulator agree on how heavy the boat is and how much the water holds it back. B turns the thruster forces into surge force, sway force and yaw moment. That is how the planner knows the stern thrusters cannot push sideways and the bow azimuth can.
+
+The move is split into N = 40 steps of length T/N, and the planner looks for the states, thrusts and total time T that minimise
+
+```
+J = w_T T + Σ Δt ( w_v v² + w_r r² + w_rev min(u, 0)² + w_f |f / f_max|² + w_df |Δf / f_max|² )
+```
+
+subject to
+
+```
+the model between the steps            (Runge-Kutta 4, multiple shooting)
+start = the boat now,  end = the goal pose with ν = 0
+−0.8 f_max ≤ f_port, f_starboard ≤ f_max,   f_x² + f_y² ≤ f_max²   (bow azimuth, f_max = 67 N)
+−0.35 ≤ u ≤ 0.6 m/s,   |v| ≤ 0.3 m/s,   |r| ≤ 25°/s
+```
+
+Because T is one of the unknowns, the planner also decides how fast to go. The first term pays for time. The next three make sideways motion, turning and backing up expensive, and the last two charge for thrust and for changing it quickly, which keeps the thrusters calm. With the default weights (w_T 1, w_v 30, w_r 5, w_rev 8, w_f 2, w_df 20) the boat mostly turns while it drives and only crabs or backs up when that saves real time. For a turn on the spot there is one extra term that keeps the boat on its start point. With a towed load, the planner adds the load's mass and drag in surge.
+
+IPOPT solves the problem in 0.2–3 s, in its own thread, while the boat keeps holding position. The controller then follows the planned pose, velocity and acceleration with model feedforward:
+
+```
+τ = M ν̇_d + D(ν_d) ν_d + K_p e + K_d ė − R(ψ)ᵀ b̂
+```
+
+Here e is the error to the plan and b̂ the bias force from the Kalman filter. Fossen (2021, section 12.1.3) describes the same scheme, an optimal guidance system with J = min{power, time} in front of the controller. His example plans for a kinematic model that can only drive forward and turn. Ours plans the thrusters of a boat that can also move sideways, which is why it can crab and turn on the spot.
+
 <details>
 <summary>Topics</summary>
 
@@ -381,6 +443,8 @@ All topics are under the vessel name, for example `/microampere/sensor/gnss`. A 
 | `control/allocation/slack` | `geometry_msgs/Wrench` | allocation to the observer: the part of the commanded force the thrusters could not give |
 | `sim/odom_true` | `nav_msgs/Odometry` | true state from the simulator, for evaluation |
 | `sim/path_lf` | `nav_msgs/Path` | the track without wave motion, for RViz |
+| `sensor/tow_force` | `geometry_msgs/WrenchStamped` | simulated load cell to the observer: the bar force on the boat in the body frame (N), only with `tow:=true` |
+| `sim/tow/tension`, `sim/tow/odom`, `sim/tow/marker` | `std_msgs/Float64`, `nav_msgs/Odometry`, `visualization_msgs/Marker` | the towed load, for logging and RViz |
 
 To drive manually through the mux: `ros2 service call /microampere/force_mux/select topic_tools_interfaces/srv/MuxSelect "{topic: control/force/command/manual}"`
 </details>
@@ -399,6 +463,7 @@ To drive manually through the mux: `ros2 service call /microampere/force_mux/sel
 | Optimal-control trajectory planner (CasADi/IPOPT) | `cybership_dp/trajectory_planner.py` | ch. 12.1; Bitar et al. 2020 (milliAmpere) |
 | Thrust allocation (QP) | `cybership_dp/constrained_allocation.py` | ch. 11.2.3 |
 | Dubins paths, followed with ALOS | `cybership_dp/dubins.py`, `cybership_dp/los.py` | ch. 12.4–12.5 |
+| Towed load, towbar and load cell | `marine_craft/tow.py` | own model; wave forces on the load as in ch. 10 |
 </details>
 
 ---
@@ -421,6 +486,7 @@ The unit tests check the boat model, the weather, the sensors, the Kalman filter
 - There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.
 - Only one goal at a time; there are no waypoint routes yet.
 - The planner does not know about the dock or other obstacles yet, so the boat can plan straight through them. The dock in the Gazebo world is only drawn.
+- The towed load and how it is attached are guesses (a 30 kg float on a 2 m towbar). The planner and the controller only model it in surge, so in sharp turns the boat depends on the load cell and on feedback, and it settles a few seconds later than without the load.
 - The plan is made once per goal. On the way the boat lies up to about 20 cm behind it; planning again during the move (MPC) is the next step.
 
 ---

@@ -15,6 +15,10 @@ Constrained thrust allocation with slack (Fossen 2021, Sec. 11.2.3), in two stag
 
                  s is the slack: the part of tau the thrusters cannot give. Q >> W, and Q per DOF
                  sets the priority when the demand is too large (e.g. keep heading, give up sway).
+                 An azimuth whose set-point did not move (demand below angle_threshold) gives at most
+                 its demand plus the threshold: else Q >> W made it push hard along a nearly useless
+                 direction and the other thrusters cancel that (0.5 N sway from an azimuth at 179 deg
+                 took 25 N against the stern thrusters while holding position).
 
 Thrust loss at speed (compensate_inflow): a propeller gives less thrust when the water already flows
 into it (actuators.py, linear K_T(J)). The forces from stage 2 are what the thrusters should deliver; the
@@ -60,6 +64,7 @@ class ConstrainedAllocator:
         self.Q = np.asarray(slack_weights, dtype=float)
         self.angle_threshold = float(angle_threshold)
         self._short = False      # the last allocation could not deliver the demand (slack)
+        self._frozen = {}        # thruster index -> unconstrained demand [N] of an azimuth that did not turn
 
         cols_e, w_e = [], []
         self.lb, self.ub, self.w = [], [], []
@@ -100,12 +105,15 @@ class ConstrainedAllocator:
         """
         u_e = self.T_e_pinv @ tau
         k = 0
-        for t in self.thrusters:
+        self._frozen = {}
+        for i, t in enumerate(self.thrusters):
             if t["type"] == "fixed":
                 k += 1
                 continue
             fx, fy = u_e[k], u_e[k + 1]
-            if math.hypot(fx, fy) >= self.angle_threshold or self._short:
+            if not (math.hypot(fx, fy) >= self.angle_threshold or self._short):
+                self._frozen[i] = math.hypot(fx, fy)
+            else:
                 a = math.atan2(fy, fx)
                 current = (angles or {}).get(t["name"], self.alpha_cmd[t["name"]])
                 flipped = _wrap(a + math.pi)
@@ -124,10 +132,14 @@ class ConstrainedAllocator:
         tau = np.asarray(tau, dtype=float).reshape(3)
         alpha_cmd = self.desired_angles(tau, angles)
         T = self.T(angles)
+        lb, ub = self.lb.copy(), self.ub.copy()
+        for i, demand in self._frozen.items():
+            cap = demand + self.angle_threshold
+            lb[i], ub[i] = max(lb[i], -cap), min(ub[i], cap)
         # min |sqrt(Q) (T f - tau)|^2 + |sqrt(W) f|^2  subject to bounds  (= the QP above)
         A = np.vstack([np.sqrt(self.Q)[:, None] * T, np.diag(np.sqrt(self.w))])
         b = np.concatenate([np.sqrt(self.Q) * tau, np.zeros(len(self.thrusters))])
-        f = lsq_linear(A, b, bounds=(self.lb, self.ub), method="bvls").x
+        f = lsq_linear(A, b, bounds=(lb, ub), method="bvls").x
         slack = T @ f - tau
         self._short = bool(np.any(np.abs(slack) > 0.5))
         return f, alpha_cmd, slack

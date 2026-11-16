@@ -15,7 +15,8 @@ moving, sideways, backing up or turning on the spot) from one cost instead of a 
          speed limits on u, v, r;  start = current state;  end = goal pose with nu = 0;  T free
 
 Model (NED, x north, y east, psi from north): M = diag(M_eff), D(nu) = diag(a_i + b_i |nu_i|) fitted to the
-vessel's own damping, C(nu) nu = [-m22 v r, m11 u r, (m22 - m11) u v]. Thrust lost at speed is left to the
+vessel's own damping, C(nu) nu = [-m22 v r, m11 u r, (m22 - m11) u v]. A load on a towbar (tow = (m, a, b)) adds
+its mass and drag a u + b u|u| in surge only; the bar does not carry it sideways. Thrust lost at speed is left to the
 allocation (it compensates for it), so the planner works with the force the thrusters deliver.
 
     planner = OCPPlanner.from_vessel_config(cfg, params)
@@ -36,13 +37,15 @@ def wrap(a):
 class OCPPlanner:
     def __init__(self, M, damping_coeffs, thrusters, *, N=40, substeps=2,
                  u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0,
-                 w_T=1.0, w_v=30.0, w_r=5.0, w_rev=8.0, w_xte=0.0, w_hold=40.0, w_f=2.0, w_df=20.0, max_iter=300):
+                 w_T=1.0, w_v=30.0, w_r=5.0, w_rev=8.0, w_xte=0.0, w_hold=40.0, w_f=2.0, w_df=20.0, max_iter=300,
+                 tow=None):
         """
         M: (m11, m22, m33) incl. added mass. damping_coeffs: ((a_u, b_u), (a_v, b_v), (a_r, b_r)) for
         d_i(x) = a_i x + b_i x|x|. thrusters: vessel.yaml thruster entries (position, type, max_force,
-        reverse_ratio, direction_deg).
+        reverse_ratio, direction_deg). tow: (mass, a, b) of a towed load in surge, or None.
         """
         self.M = np.asarray(M, float)
+        self.tow = (0.0, 0.0, 0.0) if tow is None else tuple(float(t) for t in tow)
         self.dc = np.asarray(damping_coeffs, float)
         self.N, self.substeps = int(N), int(substeps)
         self.bounds = dict(u_max=u_max, u_min=u_min, v_max=v_max, r_max=math.radians(r_max_deg))
@@ -94,9 +97,12 @@ class OCPPlanner:
         d = [self.dc[0, 0] * u + self.dc[0, 1] * u * sabs(u),
              self.dc[1, 0] * v + self.dc[1, 1] * v * sabs(v),
              self.dc[2, 0] * r + self.dc[2, 1] * r * sabs(r)]
+        m_t, a_t, b_t = self.tow
+        d[0] += a_t * u + b_t * u * sabs(u)
         cor = [-m22 * v * r, m11 * u * r, (m22 - m11) * u * v]
         tau = ca.mtimes(ca.DM(self.B), f)
-        nu_dot = ca.vertcat(*[(tau[i] - cor[i] - d[i]) / self.M[i] for i in range(3)])
+        inertia = [m11 + m_t, m22, m33]
+        nu_dot = ca.vertcat(*[(tau[i] - cor[i] - d[i]) / inertia[i] for i in range(3)])
         eta_dot = ca.vertcat(ca.cos(psi) * u - ca.sin(psi) * v, ca.sin(psi) * u + ca.cos(psi) * v, r)
         return ca.vertcat(eta_dot, nu_dot)
 

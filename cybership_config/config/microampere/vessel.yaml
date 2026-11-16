@@ -177,6 +177,36 @@ latency:
   imu: 0.005
   thrusters: 0.05
 
+# Towing (cybership_utilities/marine_craft/tow.py): a load behind the boat, launch with tow:=true. Default is a
+# point mass (a float without heading) on a rigid towbar pinned at both ends: it pulls and pushes and keeps the load
+# 2 m from the tow point. All values are ESTIMATES until the towing team says what they tow and how it is connected.
+# The vessel's own model does not change: the bar force enters at tow_point. Bar force on sim/tow/tension (negative
+# = pushing).
+tow:
+  enabled: false
+  tow_point: [-0.6, 0.0, -0.1]   # [m] BODY (x fwd, y stbd, z down): stern, centre line, 0.1 m above the water
+  body:
+    type: point                  # point: half-submerged sphere of the same displacement (r 0.24 m for 30 kg);
+                                 # hull: 1.2 x 0.5 m body with heading and strip drag (TowedBody, keys length,
+                                 # beam, cd_x, cd_y)
+    mass: 30.0                   # [kg]
+    cd: 0.5                      # drag coefficient on the submerged frontal area (sphere)
+    added_mass: 0.5              # fraction of the displaced water mass (sphere)
+  line:
+    rigid: true                  # towbar: pulls and pushes; false = rope, pulls only when taut
+    length: 2.0                  # [m] tow point to the load's centre (point) or bow (hull)
+    stiffness: 20000.0           # [N/m] towbar: 1-2 mm stretch at 30-40 N, stable at the sim's 0.01 s step;
+                                 # rope: ~EA/L, 2000 for a few-mm rope, 100-500 for shock cord
+    damping: 1000.0              # [N s/m] towbar 1000, rope ~100
+  # 2-axis load cell at the tow point (sim: sensor/tow_force, BODY, force on the boat). With tow_model:=true the
+  # observer takes it as a known input; the DP law and the OCP planner use the load's mass and drag in surge.
+  # Without tow nothing of this runs.
+  load_cell:
+    rate: 50.0                   # [Hz]
+    sigma: 0.3                   # [N] white noise per axis
+    latency: 0.01                # [s]
+    filter: 0.1                  # [s] low-pass in the observer, against the noise
+
 allocation:
   # Fossen 11.2.3: min f'Wf + s'Qs  s.t.  T(alpha) f = tau + s,  -0.8*67 <= F1,F2,F3 <= 67
   # (cybership_dp/constrained_allocation.py). W = thruster 'weight' (effort), Q = slack weights per

@@ -186,6 +186,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /microampere/sim/environment/current_marker
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Tauet last (sim/tow)
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /microampere/sim/tow/marker
+      Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
       Filter (blacklist): ""

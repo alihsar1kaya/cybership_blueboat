@@ -48,6 +48,7 @@ from cybership_simulator.base import BaseSimulator
 from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster, voltage_factor
 from cybership_utilities.marine_craft.environment import OceanCurrent, Wind
+from cybership_utilities.marine_craft.tow import TowedPointMass, tow_wrench, towed_from_config
 from cybership_utilities.marine_craft.sensors import Gnss, gnss_config, make_sensors
 from cybership_utilities.marine_craft.waves import make_waves
 from cybership_utilities import hydro
@@ -63,6 +64,7 @@ class ConfigurableSimulator(BaseSimulator):
             # Thrusters give only X, Y, N (as in Fossen's Otter): drop the roll/pitch rows of tau = B u
             self.allocator._b_matrix[3:5, :] = 0.0
         self._setup_environment()
+        self._setup_tow()
         self._setup_sensors()
         self._setup_thruster_model()
 
@@ -139,6 +141,115 @@ class ConfigurableSimulator(BaseSimulator):
                 self._hydro = data
         self._waves, self._waves_dirty = None, True
         self._pub_wave = self.create_publisher(Float64, "sim/environment/wave_elevation", 10)
+
+    # ------------------------------------------------------------------------
+    # Towing: a load on a towbar or a line (vessel.yaml 'tow', launch tow:=true)
+    # ------------------------------------------------------------------------
+
+    def _setup_tow(self):
+        cfg = self.config.get("tow") or {}
+        self.declare_parameter("tow.enabled", bool(cfg.get("enabled", False)))
+        self._tow = None
+        self._pub_tow = self.create_publisher(Marker, "sim/tow/marker", 1)
+        self._pub_tow_tension = self.create_publisher(Float64, "sim/tow/tension", 10)
+        self._pub_tow_odom = self.create_publisher(Odometry, "sim/tow/odom", 10)
+        self._pub_load_cell = self.create_publisher(geometry_msgs.msg.WrenchStamped, "sensor/tow_force", 10)
+        if not self.get_parameter("tow.enabled").value:
+            return
+        lc = cfg.get("load_cell") or {}
+        self._load_cell = (float(lc.get("rate", 50.0)), float(lc.get("sigma", 0.3)), float(lc.get("latency", 0.0)))
+        self._tow_force_body = np.zeros(2)
+        self._tow = towed_from_config(cfg)
+        self._tow_point = np.asarray(cfg.get("tow_point", [-0.6, 0.0, -0.1]), float)
+        # the vessel's footprint for contact with the body: circles along the centre line (x, y, radius), BODY
+        self._tow_circles = [tuple(c) for c in cfg.get("contact_circles", [[-0.3, 0.0, 0.47], [0.0, 0.0, 0.47], [0.3, 0.0, 0.47]])]
+        eta = self.vessel.eta
+        self._tow.place_behind(self._tow_ned(eta), eta[5])
+        self.get_logger().info(f"Towing: {self._tow.describe()}, tow point {self._tow_point.tolist()}")
+
+    def _tow_ned(self, eta):
+        """Tow point in NED (horizontal)."""
+        c, s = math.cos(eta[5]), math.sin(eta[5])
+        x, y = self._tow_point[0], self._tow_point[1]
+        return np.array([eta[0] + c * x - s * y, eta[1] + s * x + c * y])
+
+    def _step_tow(self, publish):
+        """
+        Step the towed body over this sim step and return the wrench of the line and of any contact on the
+        vessel (BODY, 6). The tow point follows the vessel's total motion (LF + the WF motion from the
+        waves), and the body moves in the waves' particle velocity at its own position.
+        """
+        eta, nu = self.vessel.eta, self.vessel.nu
+        psi = eta[5]
+        c, s = math.cos(psi), math.sin(psi)
+        vel = (c * nu[0] - s * nu[1], s * nu[0] + c * nu[1], nu[5])
+        waves, wf = None, None
+        if self._waves is not None:
+            t = self._step_count * self.dt - self._wave_t0
+            waves = lambda dx, dy, t=t: self._waves.particle_motion(t, dx, dy)
+            e_wf = getattr(self.vessel, "eta_wf", np.zeros(6))
+            n_wf = getattr(self.vessel, "nu_wf", np.zeros(6))
+            wf = (c * e_wf[0] - s * e_wf[1], s * e_wf[0] + c * e_wf[1], e_wf[5],
+                  c * n_wf[0] - s * n_wf[1], s * n_wf[0] + c * n_wf[1], n_wf[5])
+        F_line, F_cont, M_cont = self._tow.step_with_vessel(
+            self.dt, (eta[0], eta[1], psi), vel, self._tow_point[:2], self.vessel.current_ned[:2],
+            waves=waves, vessel_circles=self._tow_circles, wf=wf)
+        if publish:
+            self._publish_tow(self._tow_ned(eta))
+        w = tow_wrench(F_line, psi, self._tow_point)
+        self._tow_force_body = w[:2].copy()          # what a load cell at the tow point measures
+        w[0] += c * F_cont[0] + s * F_cont[1]
+        w[1] += -s * F_cont[0] + c * F_cont[1]
+        w[5] += M_cont
+        return w
+
+    def _publish_load_cell(self):
+        """2-axis load cell at the tow point: the bar force on the boat, BODY axes, with noise and latency."""
+        rate, sigma, latency = self._load_cell
+        if self._step_count % max(1, int(round(1.0 / (rate * self.dt)))):
+            return
+        m = geometry_msgs.msg.WrenchStamped()
+        m.header.stamp, m.header.frame_id = self.get_clock().now().to_msg(), self._frame(self.body_frame_id)
+        fx, fy = self._tow_force_body + sigma * self._noise_rng.standard_normal(2)
+        m.wrench.force.x, m.wrench.force.y = float(fx), float(fy)
+        self._later(latency, lambda m=m: self._pub_load_cell.publish(m))
+
+    def _publish_tow(self, p_tow):
+        tb, stamp = self._tow, self.get_clock().now().to_msg()
+        self._pub_tow_tension.publish(Float64(data=float(tb.tension)))
+        q = Rotation.from_euler("z", tb.eta[2]).as_quat()
+        od = Odometry()
+        od.header.frame_id, od.header.stamp = self.world_frame_id, stamp
+        od.pose.pose.position.x, od.pose.pose.position.y = float(tb.eta[0]), float(tb.eta[1])
+        od.pose.pose.orientation.x, od.pose.pose.orientation.y, od.pose.pose.orientation.z, od.pose.pose.orientation.w = (float(v) for v in q)
+        od.twist.twist.linear.x, od.twist.twist.linear.y, od.twist.twist.angular.z = (float(v) for v in tb.nu)
+        self._pub_tow_odom.publish(od)
+        body = Marker()
+        body.header.frame_id, body.header.stamp = self.world_frame_id, stamp
+        body.pose = od.pose.pose
+        if isinstance(tb, TowedPointMass):
+            body.ns, body.id, body.type, body.action = "tow", 0, Marker.SPHERE, Marker.ADD
+            body.scale.x = body.scale.y = body.scale.z = 2 * tb.radius
+        else:
+            body.ns, body.id, body.type, body.action = "tow", 0, Marker.CUBE, Marker.ADD
+            body.scale.x, body.scale.y, body.scale.z = tb.L, tb.B, 0.2
+        body.color.r, body.color.g, body.color.b, body.color.a = 1.0, 0.55, 0.1, 0.9
+        self._pub_tow.publish(body)
+        line = Marker()
+        line.header = body.header
+        line.ns, line.id, line.type, line.action = "tow", 1, Marker.LINE_STRIP, Marker.ADD
+        bow = tb.bow()
+        line.points = [geometry_msgs.msg.Point(x=float(p_tow[0]), y=float(p_tow[1]), z=-0.1),
+                       geometry_msgs.msg.Point(x=float(bow[0]), y=float(bow[1]), z=-0.1)]
+        line.scale.x = 0.04 if tb.rigid else 0.02
+        # red while it pulls, blue while a towbar pushes, grey when (nearly) unloaded
+        if tb.tension > 0.5:
+            line.color.r, line.color.g, line.color.b, line.color.a = 1.0, 0.2, 0.2, 1.0
+        elif tb.tension < -0.5:
+            line.color.r, line.color.g, line.color.b, line.color.a = 0.2, 0.4, 1.0, 1.0
+        else:
+            line.color.r, line.color.g, line.color.b, line.color.a = 0.6, 0.6, 0.6, 0.8
+        self._pub_tow.publish(line)
 
     def _on_environment_change(self, params):
         for param in params:
@@ -511,10 +622,15 @@ class ConfigurableSimulator(BaseSimulator):
         self._run_due()
         self._current.step(self.dt)
         self.vessel.current_ned = self._current.velocity_ned()
+        tau_ext = np.zeros(6)
         if self._wind is not None:
             # wind loads on the LF state (Fossen 10.1), relative to the boat's velocity over ground
             self._wind.step(self.dt)
-            self.vessel.tau_ext = self._wind.loads(self.vessel.eta, self.vessel.nu)
+            tau_ext = tau_ext + self._wind.loads(self.vessel.eta, self.vessel.nu)
+        if self._tow is not None:
+            tau_ext = tau_ext + self._step_tow(publish_state)
+            self._publish_load_cell()
+        self.vessel.tau_ext = tau_ext
         if self._waves_dirty:
             self._update_waves()
         if self._waves is not None:

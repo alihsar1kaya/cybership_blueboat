@@ -13,7 +13,9 @@ H are the force RAOs from Capytaine (capytaine_hydro.py: force_rao, rao_freqs, r
 axes at CO, per metre wave amplitude; Re and Im are interpolated linearly in frequency and direction
 (as MSS, avoids phase unwrapping). beta = beta_wave - psi + mu is the propagation direction relative
 to the bow (0 following, 180 head sea), beta_wave the main direction the waves travel towards in NED
-(0 north, 90 east). w_e = |w - w^2 U cos(beta) / g| is the frequency of encounter.
+(0 north, 90 east). w_e = |w - w^2 U cos(beta) / g| is the frequency of encounter. When the speed or the
+heading changes, the encounter phase is the integral of w_e over time, not w_e t (which jumped by
+t w^2 cos(beta) dU / g: after 100 s, 0.01 m/s more speed moved the WF surge as if at 3 m/s).
 
 Motion RAOs (optional, hydro.motion_raos): the wave-frequency (WF) motion
     eta_WF(t) = sum A Re(X(w, beta) e^{i(w_e t + eps)}),   nu_WF = d/dt eta_WF
@@ -68,6 +70,7 @@ class WaveModel:
         S = jonswap(self.Omega, Hs, w0, gamma, g)
         self.Amp = np.sqrt(2.0 * np.outer(S, M) * dw * dmu)            # n_freq x n_dir
         self.phase = 2 * math.pi * rng.random(self.Amp.shape)
+        self._enc_t, self._enc_ph = None, None           # encounter phase: integral of w_e dt (see _encounter)
         # RAO table, closed in direction (append 2 pi) for interpolation
         self.rao_headings = np.r_[np.asarray(rao_headings, dtype=float), 2 * math.pi]
         F = np.asarray(force_rao)
@@ -102,23 +105,55 @@ class WaveModel:
         cols = np.arange(T.shape[1])[:, None]
         return T[:, cols, idx] * (1 - f) + T[:, cols, idx + 1] * f
 
+    def _encounter(self, t, beta, U):
+        """Frequency of encounter and the phase of each component at time t: the encounter phase is
+        integrated from the last call (forward in time), so a change of speed or heading changes how fast
+        the phase turns, not the phase itself. A call at the same t reuses it; an earlier t starts over."""
+        w_e = np.abs(self.Omega[:, None] - self.Omega[:, None] ** 2 / self.g * U * np.cos(beta))
+        if self._enc_t is None or t < self._enc_t:
+            self._enc_ph = w_e * t
+        elif t > self._enc_t:
+            self._enc_ph = self._enc_ph + w_e * (t - self._enc_t)
+        self._enc_t = t
+        return w_e, self._enc_ph + self.phase
+
     def motion(self, t, psi, U=0.0):
         """WF motion (eta_WF, nu_WF), 6 each, BODY axes (positions along the body axes) at CO."""
         beta = np.broadcast_to(self.beta_wave - psi + self.mu[None, :], self.Amp.shape)
-        w_e = np.abs(self.Omega[:, None] - self.Omega[:, None] ** 2 / self.g * U * np.cos(beta))
-        ph = w_e * t + self.phase
+        w_e, ph = self._encounter(t, beta, U)
         c, s = np.cos(ph), np.sin(ph)
         X = self._rao(beta, self.X)
         eta = np.sum(self.Amp * (X.real * c - X.imag * s), axis=(1, 2))
         nu = np.sum(self.Amp * w_e * (-X.real * s - X.imag * c), axis=(1, 2))
         return eta, nu
 
+    def particle_motion(self, t, dx, dy):
+        """
+        Horizontal water particle velocity and acceleration at the surface (NED, m/s and m/s^2) at the
+        offset (dx, dy) [m, NED] from the vessel's CO, deep water (Fossen 2021 Ch. 10.2, linear theory):
+
+            zeta = sum A cos(theta),  theta = w t - k (dx cos(beta) + dy sin(beta)) + phase,  k = w^2 / g
+            u = w A cos(theta) along beta,   u_dot = -w^2 A sin(theta)
+
+        The phase is relative to the CO, where motion() and loads() are evaluated, so a towed body half a
+        wavelength astern moves against the vessel. No Doppler shift: for slow objects only.
+        """
+        beta = self.beta_wave + self.mu[None, :]
+        w = self.Omega[:, None]
+        k = w * w / self.g
+        th = w * t - k * (dx * np.cos(beta) + dy * np.sin(beta)) + self.phase
+        c, s = np.cos(th), np.sin(th)
+        v = w * self.Amp * c
+        a = -w * w * self.Amp * s
+        cb, sb = np.cos(beta), np.sin(beta)
+        cb, sb = np.broadcast_to(cb, self.Amp.shape), np.broadcast_to(sb, self.Amp.shape)
+        return (np.array([np.sum(v * cb), np.sum(v * sb)]), np.array([np.sum(a * cb), np.sum(a * sb)]))
+
     def loads(self, t, psi, U=0.0):
         """First-order wave loads tau_wave1 (6, BODY at CO) and wave elevation at CO, at time t."""
         beta = self.beta_wave - psi + self.mu[None, :]                # n_freq x n_dir (broadcast)
         beta = np.broadcast_to(beta, self.Amp.shape)
-        w_e = np.abs(self.Omega[:, None] - self.Omega[:, None] ** 2 / self.g * U * np.cos(beta))
-        ph = w_e * t + self.phase
+        _, ph = self._encounter(t, beta, U)
         c, s = np.cos(ph), np.sin(ph)
         H = self._rao(beta)
         tau = np.sum(self.Amp * (H.real * c - H.imag * s), axis=(1, 2))

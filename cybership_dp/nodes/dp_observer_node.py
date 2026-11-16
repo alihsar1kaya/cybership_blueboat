@@ -27,13 +27,14 @@ import math
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Vector3Stamped, Wrench
+from geometry_msgs.msg import Vector3Stamped, Wrench, WrenchStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, NavSatFix
 
 from cybership_utilities import vessel_model
+from cybership_utilities.marine_craft.tow import LoadCell
 from cybership_utilities.marine_craft.sensors import gnss_config, llh2flat
 from cybership_utilities.observer import AsyncObserver, DPKalmanFilter, remove_lever_arm
 
@@ -63,10 +64,15 @@ class DPObserverNode(Node):
         self.declare_parameter("current.p0", 0.04)              # [(m/s)^2] initial variance (0.2 m/s)
         self.declare_parameter("delay_compensation", True)
         self.declare_parameter("gnss_timeout", 1.0)            # [s] warn and dead-reckon after this
+        # towed load (launch tow:=true tow_model:=true): the load cell's force (sensor/tow_force) is a known
+        # input; else the filter puts the load's pull and inertia into the bias, and the bias feedforward
+        # pushes the boat off the goal after a turn
+        self.declare_parameter("tow.enabled", False)
 
         config, path = vessel_model.load_vessel_config(self.get_parameter("vessel_model").value)
         params = vessel_model.model_parameters(config)
         craft = vessel_model.make_marine_craft(params)
+        M = vessel_model.M_eff_3dof(params)
         damping = lambda nu: -craft.damping(np.array([nu[0], nu[1], 0, 0, 0, nu[2]]))[IDX]
         w0 = self.get_parameter("wave_filter.omega0").value
         wf = None if w0 <= 0 else {"omega0": w0, "zeta": self.get_parameter("wave_filter.zeta").value,
@@ -74,7 +80,7 @@ class DPObserverNode(Node):
         current = None
         if self.get_parameter("current.estimate").value:
             current = {"q": self.get_parameter("current.q").value, "p0": self.get_parameter("current.p0").value}
-        self.kf = DPKalmanFilter(vessel_model.M_eff_3dof(params), vessel_model.D_3dof(params),
+        self.kf = DPKalmanFilter(M, vessel_model.D_3dof(params),
                                  q_bias=self.get_parameter("q_bias").value,
                                  q_nu=self.get_parameter("q_nu").value, damping=damping, wave_filter=wf,
                                  current=current)
@@ -106,12 +112,20 @@ class DPObserverNode(Node):
         self.pub_bias = self.create_publisher(Vector3Stamped, "navigation/bias", 10)
         self.pub_current = self.create_publisher(Vector3Stamped, "navigation/current", 10)
         self.create_timer(self.h, self.step)
+        self.load_cell = None
+        if self.get_parameter("tow.enabled").value and config.get("tow"):
+            self.load_cell = LoadCell.from_config(config["tow"])
+            self.create_subscription(WrenchStamped, "sensor/tow_force", self.on_tow_force, 10)
+            self.get_logger().info(f"Towing: load cell force (sensor/tow_force, filter {self.load_cell.T} s) as a known input")
         self.get_logger().info(f"DP Kalman filter (Fossen 13.4.6, wave filter {wf}, current {current}) from {path}: "
                                f"GNSS sigma {self.sigma_gnss:.2f} m, "
                                f"compass {math.degrees(self.sigma_psi):.1f} deg, lever arm {self.lever_arm.tolist()}")
 
     def on_tau(self, msg):
         self.tau = np.array([msg.force.x, msg.force.y, msg.torque.z])
+
+    def on_tow_force(self, msg):
+        self.load_cell.update(self.now(), msg.wrench.force.x, msg.wrench.force.y)
 
     def on_slack(self, msg):
         # saturated thrusters: the boat gets tau + slack, and the filter should be told the same,
@@ -152,7 +166,8 @@ class DPObserverNode(Node):
             self.get_logger().warn("No GNSS: dead reckoning on the model and the compass")
         self.publish()
         slack = self.slack if now - self.t_slack < 0.5 else 0.0
-        self.observer.step(now, self.tau + slack)
+        tow = self.load_cell.wrench() if self.load_cell is not None else 0.0
+        self.observer.step(now, self.tau + slack + tow)
 
     def publish(self):
         stamp = self.get_clock().now().to_msg()

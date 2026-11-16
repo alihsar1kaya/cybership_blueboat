@@ -114,3 +114,19 @@ def test_motion_raos_follow_long_waves():
     i = int(np.argmin(np.abs(w - 2.0)))
     assert abs(X[4, i, k0]) == pytest.approx(w[i] ** 2 / 9.81, rel=0.1)
     assert np.all(np.isfinite(X)) and np.abs(X[3]).max() < 5.0    # roll resonance limited by damping
+
+
+def test_speed_change_does_not_jump_the_wave_phase():
+    """The encounter phase is the integral of w_e dt: a small speed change after a long time changes how fast
+    the phase turns, not the phase itself (w_e t jumped by t w^2 cos(beta) dU / g)."""
+    w, hdg, F = flat_rao()
+    waves = WaveModel(0.3, 2.7, 0.0, w, hdg, F, spreading=False, seed=0)
+    _, z0 = waves.loads(200.0, 0.0, U=0.0)
+    _, z1 = waves.loads(200.01, 0.0, U=0.05)
+    _, z2 = waves.loads(200.01 + 1e-9, 0.0, U=0.0)
+    assert abs(z1 - z0) < 0.02 and abs(z2 - z1) < 1e-6        # m: as with constant speed over one step
+    # constant speed from t = 0 is still w_e t
+    fresh = WaveModel(0.3, 2.7, 0.0, w, hdg, F, spreading=False, seed=0)
+    w_e = np.abs(fresh.Omega[:, None] - fresh.Omega[:, None] ** 2 / fresh.g * 0.3)
+    _, z = fresh.loads(50.0, 0.0, U=0.3)
+    assert z == pytest.approx(float(np.sum(fresh.Amp * np.cos(w_e * 50.0 + fresh.phase))))
