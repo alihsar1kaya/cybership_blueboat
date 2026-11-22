@@ -13,6 +13,13 @@ moving, sideways, backing up or turning on the spot) from one cost instead of a 
     s.t. eta_dot = R(psi) nu,   M nu_dot + C(nu) nu + D(nu) nu = B f       (RK4, multiple shooting)
          stern thrusters  -reverse_ratio f_max <= f_i <= f_max,  azimuth  f_x^2 + f_y^2 <= f_max^2
          speed limits on u, v, r;  start = current state;  end = goal pose with nu = 0;  T free
+         circular obstacles (x_o, y_o, r_o): every footprint circle (centre p_c, radius r_c) at every step
+             |p_c - (x_o, y_o)|^2 >= (r_o + r_c + margin)^2
+
+Obstacles make the problem non-convex: IPOPT finds the best plan near its initial guess, so which side to
+pass an obstacle on is decided by the guesses. When obstacles block the straight line, the planner solves
+from a guess that detours to port and one to starboard and keeps the cheaper plan (milliAmpere, Bitar et
+al. 2020, uses a hybrid A* search for this step; two guesses suffice for a few obstacles).
 
 Model (NED, x north, y east, psi from north): M = diag(M_eff), D(nu) = diag(a_i + b_i |nu_i|) fitted to the
 vessel's own damping, C(nu) nu = [-m22 v r, m11 u r, (m22 - m11) u v]. A load on a towbar (tow = (m, a, b)) adds
@@ -26,6 +33,8 @@ allocation (it compensates for it), so the planner works with the force the thru
 import math
 import time
 
+from types import SimpleNamespace
+
 import casadi as ca
 import numpy as np
 
@@ -38,12 +47,17 @@ class OCPPlanner:
     def __init__(self, M, damping_coeffs, thrusters, *, N=40, substeps=2,
                  u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0,
                  w_T=1.0, w_v=30.0, w_r=5.0, w_rev=8.0, w_xte=0.0, w_hold=40.0, w_f=2.0, w_df=20.0, max_iter=300,
-                 tow=None):
+                 tow=None, footprint=((-0.3, 0.0, 0.47), (0.0, 0.0, 0.47), (0.3, 0.0, 0.47)), max_obstacles=8,
+                 obstacle_margin=0.5):
         """
         M: (m11, m22, m33) incl. added mass. damping_coeffs: ((a_u, b_u), (a_v, b_v), (a_r, b_r)) for
         d_i(x) = a_i x + b_i x|x|. thrusters: vessel.yaml thruster entries (position, type, max_force,
         reverse_ratio, direction_deg). tow: (mass, a, b) of a towed load in surge, or None.
+        footprint: circles (x, y, radius) [m] in BODY that cover the hull. max_obstacles: how many circular
+        obstacles one plan can take. obstacle_margin [m]: extra clearance on top of hull and obstacle radius.
         """
+        self.footprint = np.asarray(footprint, float).reshape(-1, 3)
+        self.max_obstacles, self.margin = int(max_obstacles), float(obstacle_margin)
         self.M = np.asarray(M, float)
         self.tow = (0.0, 0.0, 0.0) if tow is None else tuple(float(t) for t in tow)
         self.dc = np.asarray(damping_coeffs, float)
@@ -52,11 +66,15 @@ class OCPPlanner:
         self.w = dict(T=w_T, v=w_v, r=w_r, rev=w_rev, xte=w_xte, hold=w_hold, f=w_f, df=w_df)
         self.max_iter = max_iter
         self._thrusters(thrusters)
-        self._build()
+        # one problem per number of obstacle slots: unused slots slowed the free problem down (median 0.45 ->
+        # 1.7 s) and made it fail more often (25 -> 22 of 25 short moves with the boat under way)
+        sizes = sorted({0, min(3, self.max_obstacles), self.max_obstacles})
+        self._problems = {m: self._build(m) for m in sizes}
 
-    @classmethod
-    def from_vessel_config(cls, cfg, params, **kw):
-        """Mass and damping from the same model the simulator uses (vessel_model), thrusters from vessel.yaml."""
+    @staticmethod
+    def model_from_params(params):
+        """(M diag incl. added mass, damping coefficients (a_i, b_i) of d_i = a_i x + b_i x|x|) fitted to the
+        simulator's model (vessel_model) over the speeds a DP manoeuvre uses."""
         from cybership_utilities import vessel_model
         M = np.diag(vessel_model.M_eff_3dof(params))
         craft = vessel_model.make_marine_craft(params)
@@ -70,6 +88,14 @@ class OCPPlanner:
                 ys.append(-craft.damping(nu)[idx])
             A = np.column_stack([xs, xs * xs])
             coeffs.append(np.linalg.lstsq(A, np.array(ys), rcond=None)[0])
+        return M, np.array(coeffs)
+
+    @classmethod
+    def from_vessel_config(cls, cfg, params, **kw):
+        """Mass and damping from the same model the simulator uses (vessel_model), thrusters from vessel.yaml."""
+        M, coeffs = cls.model_from_params(params)
+        if cfg.get("footprint") and "footprint" not in kw:
+            kw["footprint"] = cfg["footprint"]
         return cls(M, coeffs, cfg["thrusters"], **kw)
 
     def _thrusters(self, thrusters):
@@ -106,7 +132,8 @@ class OCPPlanner:
         eta_dot = ca.vertcat(ca.cos(psi) * u - ca.sin(psi) * v, ca.sin(psi) * u + ca.cos(psi) * v, r)
         return ca.vertcat(eta_dot, nu_dot)
 
-    def _build(self):
+    def _build(self, n_obs):
+        """The NLP with n_obs obstacle slots; returns its variables and parameters."""
         N, ns = self.N, self.substeps
         opti = ca.Opti()
         X = opti.variable(6, N + 1)
@@ -115,6 +142,7 @@ class OCPPlanner:
         x0 = opti.parameter(6)
         goal = opti.parameter(3)
         line = opti.parameter(4)        # unit direction start -> goal (n_x, n_y), 1 for a turn on the spot, weight
+        obs = opti.parameter(4, n_obs) if n_obs else None   # x, y, radius + margin, active (1) or not (0)
         dt = T / N
         h = dt / ns
         for k in range(N):
@@ -142,6 +170,15 @@ class OCPPlanner:
         opti.subject_to(ca.sin(X[2, N]) == ca.sin(goal[2]))
         opti.subject_to(X[3:, N] == 0)
         opti.subject_to(opti.bounded(1.0, T, 300.0))
+        # obstacles: each footprint circle stays outside each active obstacle (inactive: 0 <= 0). A soft version
+        # (slack with a large cost) solved fewer cases and took longer
+        for k in range(1, N + 1):
+            c, sn = ca.cos(X[2, k]), ca.sin(X[2, k])
+            for cx, cy, rc in self.footprint:
+                px, py = X[0, k] + c * cx - sn * cy, X[1, k] + sn * cx + c * cy
+                for m in range(n_obs):
+                    d2 = (px - obs[0, m]) ** 2 + (py - obs[1, m]) ** 2
+                    opti.subject_to(obs[3, m] * ((obs[2, m] + rc) ** 2 - d2) <= 0)
         w, fs = self.w, ca.DM(self.fmax)
         J = w["T"] * T
         for k in range(N):
@@ -155,8 +192,73 @@ class OCPPlanner:
                 J += dt * w["df"] * ca.sumsqr(fn - F[:, k - 1] / fs)
         opti.minimize(J)
         opti.solver("ipopt", {"print_time": False, "expand": True},
-                    {"print_level": 0, "max_iter": self.max_iter, "sb": "yes", "tol": 1e-4})
-        self.opti, self.X, self.F, self.T, self.x0, self.goal, self.J, self.line = opti, X, F, T, x0, goal, J, line
+                    {"print_level": 0, "max_iter": self.max_iter, "sb": "yes", "tol": 1e-4,
+                     "max_cpu_time": 6.0})          # s per guess: a hopeless guess gave up after 20 s
+        return SimpleNamespace(opti=opti, X=X, F=F, T=T, x0=x0, goal=goal, J=J, line=line, obs=obs, n_obs=n_obs)
+
+    def _detour(self, start, goal, obstacles, side):
+        """Waypoints start -> past the obstacles that block the straight line, on one side (+1 starboard, -1
+        port), -> goal; None when nothing blocks. All blocking obstacles are passed at one lateral offset, so a
+        gap too narrow for the boat is not taken."""
+        p0, p1 = np.asarray(start[:2], float), np.asarray(goal[:2], float)
+        d = p1 - p0
+        L = float(np.hypot(*d))
+        if L < 1e-6:
+            return None
+        e = d / L
+        n = np.array([-e[1], e[0]])                      # NED (x north, y east): to starboard of start -> goal
+        r_hull = float(np.max(np.hypot(self.footprint[:, 0], self.footprint[:, 1]) + self.footprint[:, 2]))
+        rel = [(float((np.array([ox, oy]) - p0) @ e), float((np.array([ox, oy]) - p0) @ n),
+                r + self.margin + r_hull + 0.2) for ox, oy, r in obstacles]
+        offset, block = 0.0, []
+        for _ in range(len(rel) + 1):                    # grow the offset until no obstacle is in the way
+            block = [o for o in rel if -o[2] < o[0] < L + o[2] and abs(o[1] - offset) < o[2]]
+            if not block:
+                break
+            offset = (max if side > 0 else min)(o[1] + side * o[2] for o in block)
+        if offset == 0.0:
+            return None
+        hit = [o for o in rel if -o[2] < o[0] < L + o[2] and (o[1] - offset) * side < 0 < o[1] * side + o[2]]
+        s0 = min(o[0] for o in hit) - 0.5
+        s1 = max(o[0] for o in hit) + 0.5
+        via = [p0 + max(s0, 0.1 * L) * e + offset * n, p0 + min(s1, 0.9 * L) * e + offset * n]
+        return [p0] + via + [p1]
+
+    def _guess_path(self, start, goal, points):
+        """Bow-first guess along the polyline 'points', heading changes limited to the turn rate and the
+        velocities consistent with the motion (a guess that jumped 145 degrees in one step did not solve)."""
+        N = self.N
+        pts = np.asarray(points, float)
+        seg = np.hypot(*np.diff(pts, axis=0).T)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        heads, prev = [], float(start[2])
+        for h in np.arctan2(np.diff(pts[:, 1]), np.diff(pts[:, 0])):     # segment headings, unwrapped from start
+            prev = prev + wrap(h - prev)
+            heads.append(prev)
+        heads = np.array(heads)
+        end = heads[-1] + wrap(goal[2] - heads[-1])
+        turns = float(np.sum(np.abs(np.diff(np.concatenate([[start[2]], heads, [end]])))))
+        # about the optimum: a guess twice as long left IPOPT at its iteration limit for most detours
+        T = cum[-1] / 0.8 + turns / 0.6 + 2.0
+        dt = T / N
+        s = np.linspace(0.0, cum[-1], N + 1)
+        xy = np.array([np.interp(s, cum, pts[:, 0]), np.interp(s, cum, pts[:, 1])])
+        idx = np.clip(np.searchsorted(cum, s, side="right") - 1, 0, len(heads) - 1)
+        target = heads[idx]
+        target[-4:] = end
+        psi = np.empty(N + 1)
+        psi[0] = start[2]
+        step = self.bounds["r_max"] * dt
+        for k in range(1, N + 1):
+            psi[k] = psi[k - 1] + np.clip(target[k] - psi[k - 1], -step, step)
+        X = np.zeros((6, N + 1))
+        X[0], X[1], X[2] = xy[0], xy[1], psi
+        vx, vy = np.gradient(xy[0], dt), np.gradient(xy[1], dt)
+        c, sn = np.cos(psi), np.sin(psi)
+        X[3], X[4], X[5] = c * vx + sn * vy, -sn * vx + c * vy, np.gradient(psi, dt)
+        X[3:, -1] = 0.0
+        X[:, 0] = start
+        return X, T
 
     def _guess(self, start, goal, mode):
         """Initial guesses: 'direct' (heading turns evenly, straight line) or 'forward' (bow first)."""
@@ -185,43 +287,106 @@ class OCPPlanner:
         X[3:, 0] = start[3:]
         return X, T
 
-    def plan(self, start, goal, guesses=None):
-        """Best plan over the initial guesses. Returns a dict with t, eta, nu, nu_dot, f, T, cost, ok, solve_time."""
+    def _active_obstacles(self, start, goal, obstacles):
+        """
+        Obstacles (x, y, radius) the plan can respect, the nearest max_obstacles, each with its margin. Near the
+        start or the goal pose the margin shrinks to what the hull has there (else a goal 0.8 m behind an
+        obstacle dropped it, and a wall next to the boat was planned through); only an obstacle the hull
+        overlaps at the start is left out (the boat has to get away from it), and one it would overlap at the
+        goal makes the goal unreachable. Returns (used, margins, ignored, blocked).
+        """
+        def gap(pose, ox, oy, r):
+            x, y, psi = pose[:3]
+            c, s = math.cos(psi), math.sin(psi)
+            return min(math.hypot(x + c * cx - s * cy - ox, y + s * cx + c * cy - oy) - r - rc
+                       for cx, cy, rc in self.footprint)
+        used, ignored, blocked = [], [], []
+        for ox, oy, r in obstacles or []:
+            g_start, g_goal = gap(start, ox, oy, r), gap(goal, ox, oy, r)
+            m = min(self.margin, g_start - 0.05, g_goal - 0.05)
+            if g_goal < 0.05:
+                blocked.append((ox, oy, r))
+            elif m < 0.0:
+                ignored.append((ox, oy, r))
+            else:
+                used.append(((float(ox), float(oy), float(r)), m))
+        mid = (np.asarray(start[:2]) + np.asarray(goal[:2])) / 2
+        used.sort(key=lambda o: math.hypot(o[0][0] - mid[0], o[0][1] - mid[1]) - o[0][2])
+        ignored += [o for o, _ in used[self.max_obstacles:]]
+        used = used[:self.max_obstacles]
+        return [o for o, _ in used], [m for _, m in used], ignored, blocked
+
+    def plan(self, start, goal, guesses=None, obstacles=None):
+        """
+        Best plan over the initial guesses. obstacles: [(x, y, radius)] circles in NED [m]. Returns a dict with
+        t, eta, nu, nu_dot, f, T, cost, ok, solve_time, obstacles (the ones respected), margins (their
+        clearance, smaller near the start or the goal), ignored and blocked (obstacles the hull would overlap at
+        the goal; then nothing is planned).
+        """
         start = np.asarray(start, float)
         goal = np.asarray(goal, float)
         best, t0 = None, time.time()
+        used, margins, ignored, blocked = self._active_obstacles(start, goal, obstacles)
+        if blocked:                                       # the hull would overlap an obstacle at the goal
+            return dict(ok=False, solve_time=time.time() - t0, obstacles=used, margins=margins, ignored=ignored,
+                        blocked=blocked)
+        pr = self._problems[min(m for m in self._problems if m >= len(used))]
+        if pr.n_obs:
+            P = np.zeros((4, pr.n_obs))
+            P[:2] = 1e3                                   # inactive ones far away as well
+            for m, ((ox, oy, r), mg) in enumerate(zip(used, margins)):
+                P[:, m] = (ox, oy, r + mg, 1.0)
+            pr.opti.set_value(pr.obs, P)
+        detours = {}
+        if guesses is None and used:
+            for name, side in (('port', -1.0), ('starboard', 1.0)):
+                pts = self._detour(start, goal, used, side)
+                if pts is not None:
+                    detours[name] = pts
+            if detours:
+                # shorter detour first, the other side if it fails, the plain guesses only when no detour
+                # solves; stop at the first plan (each failed solve costs 1-3 s)
+                length = {k: float(np.sum(np.hypot(*np.diff(np.asarray(p), axis=0).T))) for k, p in detours.items()}
+                guesses = sorted(detours, key=length.get) + ['forward', 'direct']
         d = np.asarray(goal[:2]) - np.asarray(start[:2])
         dist = float(np.hypot(*d))
         line = [d[0] / dist, d[1] / dist, 0.0, self.w['xte']] if dist > 0.5 else [1.0, 0.0, 1.0, self.w['hold']]
         if guesses is None:
             guesses = ['forward', 'direct']
+            if dist > 1.0:
+                # turn to the goal, drive, turn: with velocities that match the path. Without it a goal behind
+                # the boat ended in the local optimum of backing all the way in 14 of 30 cases
+                detours['turn_drive'] = [start[:2], goal[:2]]
+                guesses.append('turn_drive')
             if abs(wrap(goal[2] - start[2])) > np.radians(150):      # near 180 deg: try both ways round
                 guesses.append('direct_alt')
         for mode in guesses:
-            self.opti.set_value(self.line, line)
-            X0, T0 = self._guess(start, goal, mode)
-            self.opti.set_value(self.x0, start)
-            self.opti.set_value(self.goal, goal)
-            self.opti.set_initial(self.X, X0)
-            self.opti.set_initial(self.F, 0.0)
-            self.opti.set_initial(self.T, T0)
+            pr.opti.set_value(pr.line, line)
+            X0, T0 = self._guess_path(start, goal, detours[mode]) if mode in detours else self._guess(start, goal, mode)
+            pr.opti.set_value(pr.x0, start)
+            pr.opti.set_value(pr.goal, goal)
+            pr.opti.set_initial(pr.X, X0)
+            pr.opti.set_initial(pr.F, 0.0)
+            pr.opti.set_initial(pr.T, T0)
             try:
-                sol = self.opti.solve()
+                sol = pr.opti.solve()
                 st = sol
                 ok = True
             except RuntimeError:
-                st = self.opti.debug
+                st = pr.opti.debug
                 ok = False
-            X, F, T, J = np.array(st.value(self.X)), np.array(st.value(self.F)), float(st.value(self.T)), float(st.value(self.J))
+            X, F, T, J = np.array(st.value(pr.X)), np.array(st.value(pr.F)), float(st.value(pr.T)), float(st.value(pr.J))
             if ok and (best is None or J < best["cost"]):
                 best = dict(X=X, F=F, T=T, cost=J, ok=True, guess=mode)
+            if best is not None and used:
+                break                                         # with obstacles: the first plan found
         if best is None:
-            return dict(ok=False, solve_time=time.time() - t0)
+            return dict(ok=False, solve_time=time.time() - t0, obstacles=used, margins=margins, ignored=ignored)
         N, X, F, T = self.N, best["X"], best["F"], best["T"]
         t = np.linspace(0.0, T, N + 1)
         nu_dot = np.gradient(X[3:], t, axis=1)
         return dict(ok=True, t=t, eta=X[:3].T, nu=X[3:].T, nu_dot=nu_dot.T, f=F.T, T=T, cost=best["cost"],
-                    guess=best["guess"], solve_time=time.time() - t0)
+                    guess=best["guess"], solve_time=time.time() - t0, obstacles=used, margins=margins, ignored=ignored)
 
 
 def sample(plan, t):

@@ -1,0 +1,24 @@
+# Quays and berths for docking (cybership_dp/docking.py load_harbour), in the simulator's NED frame [m]:
+# x north, y east. The position controller docks to a berth (guidance/dock), the obstacle manager draws the quays
+# and gives them to the planner as circles. Keep in step with the Gazebo world (cybership_simulator/worlds).
+#
+# On the real boat the frame is the LEKF's NED, whose origin is the first fix unless ned_reference_ecef is pinned:
+# survey the quay corners with RTK in that frame.
+
+quays:
+  dock:                     # small_harbour.sdf: 6 x 1.5 m box centred 8 m north (ENU 0 8)
+    corners: [[7.25, -3.0], [8.75, -3.0], [8.75, 3.0], [7.25, 3.0]]
+
+berths:
+  dock_south:               # alongside the south face, port side to it
+    quay: dock
+    facing: south           # the face whose outward normal points south (north, south, east, west or [n, e])
+    side: port              # the boat's side against the quay
+    gap: 0.10               # [m] hull to quay face (the fenders)
+    along: 0.5              # where along the face, 0..1
+  dock_south_stb:
+    quay: dock
+    facing: south
+    side: starboard
+    gap: 0.10
+    along: 0.5

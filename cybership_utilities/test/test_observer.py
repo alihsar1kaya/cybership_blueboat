@@ -208,3 +208,71 @@ def test_current_estimate_in_a_cross_current():
     last = log[log[:, 0] > 120]
     assert np.sqrt(np.mean((last[:, 10:12] - last[:, 4:6]) ** 2)) < 0.05      # velocity over ground
     assert kf.nu_r[:2] == pytest.approx(kf.nu[:2] - Rzyx(0, 0, kf.eta[2])[:2, :2].T @ kf.current)
+
+
+def test_line_measurement_corrects_only_across_the_line():
+    """A quay face along east (normal north): the lidar distance fixes north, east stays as it was."""
+    M, D = np.diag([33.0, 170.8, 9.36]), np.diag([6.6, 170.8, 9.36])
+    kf = DPKalmanFilter(M, D, q_bias=[0.2, 0.2, 0.02], q_nu=[0.05, 0.05, 0.005])
+    kf.x[kf.i_eta] = [1.0, 2.0, 0.0]
+    kf.P[kf.i_eta, kf.i_eta] = np.eye(3) * 0.5
+    for _ in range(20):
+        kf.correct_line([1.0, 0.0], 1.3, 0.02)
+    assert kf.eta[0] == pytest.approx(1.3, abs=0.01)
+    assert kf.eta[1] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_lidar_line_wins_across_the_face_against_gnss():
+    """
+    GNSS (2 cm, 0.1 s late) puts the CO at north 1.0; the lidar's face, from a map 10 cm off, says 1.1. With GNSS only
+    along the face the estimate goes to the lidar's 1.1 (the replay after each late fix keeps the lines); with GNSS
+    on both axes it ends in between. East (along the face) follows GNSS either way.
+    """
+    from cybership_utilities.observer import AsyncObserver
+    M, D = np.diag([33.0, 170.8, 9.36]), np.diag([6.6, 170.8, 9.36])
+    result = {}
+    for along_only in (True, False):
+        kf = DPKalmanFilter(M, D, q_bias=[0.2, 0.2, 0.02], q_nu=[0.05, 0.05, 0.005])
+        obs = AsyncObserver(kf, 0.02, math.radians(1.0), gnss_along_only=along_only)
+        obs.heading(0.0, 0.0)
+        obs.gnss(0.0, 0.0, 1.0, 2.0, 0.02)
+        for i in range(1, 1500):                                   # 30 s
+            t = 0.02 * i
+            obs.step(t, np.zeros(3))
+            if i % 5 == 0:
+                obs.heading(t, 0.0)
+            if i % 5 == 2:                                         # 10 Hz lidar: n = north, z = 1.1
+                obs.line(t, [1.0, 0.0], 1.1, 0.015)
+            if i % 10 == 0:                                        # 5 Hz GNSS, taken 0.1 s earlier
+                obs.gnss(t, t - 0.1, 1.0, 2.0, 0.02)
+        result[along_only] = kf.eta.copy()
+    assert result[True][0] == pytest.approx(1.1, abs=0.005)
+    assert 1.02 < result[False][0] < 1.095
+    assert result[True][1] == pytest.approx(2.0, abs=0.005)
+
+
+def test_estimate_stays_out_of_the_quay_when_a_fender_stops_the_boat():
+    """
+    The boat runs north at 0.1 m/s into a quay face at north 1.0 and stops there (GNSS 5 Hz, 2 cm, says so). The
+    model does not know the fender's force: without the constraint the estimate goes on into the quay; with it the
+    estimate stays on the face and its velocity into the quay is zero.
+    """
+    M, D = np.diag([33.0, 170.8, 9.36]), np.diag([6.6, 170.8, 9.36])
+    worst = {}
+    for constrain in (False, True):
+        kf = DPKalmanFilter(M, D, q_bias=[0.2, 0.2, 0.02], q_nu=[0.05, 0.05, 0.005])
+        kf.x[kf.i_eta] = [0.5, 0.0, 0.0]
+        kf.x[kf.i_nu] = [0.1, 0.0, 0.0]
+        kf.x[kf.i_b] = [-0.66, 0.0, 0.0]              # the bias holds the surge damping at 0.1 m/s
+        north, depth = 0.5, []
+        for i in range(1000):                         # 20 s at 50 Hz
+            north = min(north + 0.1 * 0.02, 1.0)
+            kf.predict(np.array([0.66 + 8.0 * (north >= 1.0), 0.0, 0.0]), 0.02)   # + 8 N push at the face
+            if i % 10 == 0:
+                kf.correct_gnss(north, 0.0, 0.02)
+            if constrain:
+                kf.constrain_halfplane([-1.0, 0.0], -1.0)    # n out of the quay = south: -north >= -1
+            depth.append(kf.eta[0] - 1.0)
+        worst[constrain] = max(depth)
+    assert worst[False] > 0.03
+    assert worst[True] < 0.005

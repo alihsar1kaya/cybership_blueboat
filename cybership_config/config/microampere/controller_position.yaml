@@ -78,6 +78,7 @@
         w_hold: 40.0               # off the start point during a turn on the spot (0: slid 16-22 cm, 40: 2 cm)
         w_f: 2.0
         w_df: 20.0
+        obstacle_margin: 0.5       # [m] clearance to obstacles on top of hull and obstacle radius (the boat lags the plan up to ~0.4 m in tight turns)
       turn_then_go: true
       # [m] goals closer than this: plain DP (small corrections, crab with the azimuth); farther goals:
       # turn the bow to the goal and drive. 5 m made the boat crab sideways for normal moves.

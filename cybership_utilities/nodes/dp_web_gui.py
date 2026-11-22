@@ -25,6 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
+from std_msgs.msg import Bool, String
 from topic_tools_interfaces.srv import MuxSelect
 from websockets.asyncio.server import serve
 
@@ -64,6 +65,9 @@ class DpWebGui(Node):
                                      lambda m, n=name: self._on_force(n, m), 10)
         self.pub_goal = self.create_publisher(PoseStamped, "/goal_pose", 10)
         self.pub_stop = self.create_publisher(Wrench, STOP_INPUT, 10)
+        # with boat_interface:=true STOP is the operation mode, as Foxglove's STOP OPERATION
+        self.pub_operation = self.create_publisher(Bool, "/start_operation", 10)
+        self.pub_dock = self.create_publisher(String, "guidance/dock", 10)     # "" = the first berth
         self.mux = self.create_client(MuxSelect, "force_mux/select")
         ns = self.get_namespace().rstrip("/")
         self.sim = AsyncParameterClient(self, f"{ns}/sim")
@@ -136,11 +140,16 @@ class DpWebGui(Node):
             self.send_goal(float(c["x"]), float(c["y"]), psi)
         elif kind == "hold" and pose:
             self.send_goal(*pose)
+        elif kind == "dock":
+            self.pub_dock.publish(String(data=str(c.get("berth", ""))))
+            self.get_logger().info("Docking from web GUI")
         elif kind == "stop":
             self.stopped = True
             self.select(STOP_INPUT)
+            self.pub_operation.publish(Bool(data=False))
             self.get_logger().warn("STOP from web GUI: zero thrust")
         elif kind == "resume":
+            self.pub_operation.publish(Bool(data=True))
             if pose:
                 self.send_goal(*pose)    # hold where it is now, no jump back to the old goal
             self.select(DRIVE_INPUT)

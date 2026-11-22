@@ -117,7 +117,8 @@ class ConstrainedAllocator:
                 a = math.atan2(fy, fx)
                 current = (angles or {}).get(t["name"], self.alpha_cmd[t["name"]])
                 flipped = _wrap(a + math.pi)
-                if abs(_wrap(flipped - current)) < abs(_wrap(a - current)):
+                # reverse only if the propeller can push backwards (the real boat's azimuth cannot: thrust >= 0)
+                if float(t.get("reverse_ratio", 1.0)) > 0.0 and abs(_wrap(flipped - current)) < abs(_wrap(a - current)):
                     a = flipped
                 self.alpha_cmd[t["name"]] = a
             k += 2

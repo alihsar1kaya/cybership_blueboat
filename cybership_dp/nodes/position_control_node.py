@@ -11,6 +11,7 @@
 # Licensed under GPL-3.0-or-later
 # ---------------------------------------------------------------------------
 
+import json
 import threading
 import time
 import numpy as np
@@ -18,8 +19,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rcl_interfaces.msg import SetParametersResult
-from geometry_msgs.msg import Wrench, Pose2D, PoseStamped, TwistStamped, Vector3Stamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Wrench, WrenchStamped, Pose2D, PoseStamped, TwistStamped, Vector3Stamped
+from nav_msgs.msg import Odometry, Path
 import math
 from scipy.spatial.transform import Rotation as R
 from nav2_msgs.action import NavigateToPose
@@ -28,14 +29,17 @@ from rclpy.executors import MultiThreadedExecutor
 from cybership_tests.go_to_client import NavigateToPoseClient
 from shoeboxpy.model3dof import Shoebox
 from cybership_utilities import vessel_model
+from cybership_utilities import blueboat_io
 from cybership_utilities.marine_craft.tow import towed_from_config
-from visualization_msgs.msg import Marker
-from std_msgs.msg import Float32MultiArray
+from visualization_msgs.msg import Marker, MarkerArray
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 from std_srvs.srv import SetBool, Trigger, Empty
 from cybership_controller.position.reference_filter import ThirdOrderReferenceFilter
 from cybership_dp.los import ALOS
 from cybership_dp.dubins import DubinsPath
 from cybership_dp import trajectory_planner
+from cybership_dp import docking
 from rclpy.duration import Duration
 from rclpy.task import Future
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -165,6 +169,22 @@ class PositionController(Node):
                 ('guidance.ocp.w_hold', 40.0),
                 ('guidance.ocp.w_f', 2.0),
                 ('guidance.ocp.w_df', 20.0),
+                ('guidance.ocp.obstacle_margin', 0.5),   # [m] clearance to obstacles on top of hull and radius
+                # Docking (cybership_dp/docking_mpc.py, results/docking_mpc_plan.md): berths from a harbour YAML,
+                # started with guidance/dock (berth name) or the ~/dock service (the first berth)
+                ('docking.harbour_file', ''),
+                ('docking.harbour_shift', [0.0, 0.0]),   # [m] NED: a map error, for tests
+                ('docking.standoff', 2.0),               # [m] out from the berth: where docking starts from
+                ('docking.max_start_distance', 10.0),    # [m] further from the berth: go to the stand-off first
+                ('docking.gap_margin', 0.02),            # [m] the plan keeps berth gap - this from the face
+                ('docking.corridor', [0.15, 0.5, 1.5]),  # approach funnel w0 + k1 gap + k2 gap^2 [m]
+                ('docking.heading_funnel_deg', [5.0, 30.0]),   # [deg, deg/m] lined up before close
+                ('docking.replan_error', [0.25, 10.0]),  # [m, deg] off the plan by this much: plan again
+                ('docking.replan_min_interval', 2.0),    # [s]
+                ('docking.lock_gap', 1.0),               # [m] no new plans closer than this to the face
+                # alongside: push this hard towards the quay, so the boat rests on its fenders (0 = hold the berth
+                # 10 cm off with DP). Surge and yaw stay DP; across the face the force is max(push, DP's own)
+                ('docking.push_force', 8.0),             # [N]
                 ('guidance.max_path_turn_deg', 270.0),
                 ('guidance.max_path_ratio', 0.0),
                 ('guidance.time_model.path', [6.0, 1.667, 3.82]),
@@ -202,6 +222,11 @@ class PositionController(Node):
                 # Towed load (vessel.yaml 'tow', launch tow:=true tow_model:=true): the load's mass and drag in
                 # surge in the DP law and the OCP planner
                 ('tow.enabled', False),
+                # The team's pose controller interface (launch boat_interface:=true, blueboat_io.py): drive only in
+                # AUTONOMOUS (/control/opmode), goals from /goal_pose and /control/pose/setpoint, the force on
+                # /control/tau, debug on /control/pose/* (the Foxglove DP tab)
+                ('blueboat.interface', False),
+                ('blueboat.state_timeout', 0.5),       # [s] older state makes the DP inactive
                 ('vessel.length', 1.0),
                 ('vessel.beam', 0.3),
                 ('vessel.draft', 0.02),
@@ -288,6 +313,11 @@ class PositionController(Node):
         self.integral_error_pos = np.zeros(2)
         self.integral_error_yaw = 0.0
         self.integral_mb = np.zeros(3)  # model-based law: integral of [x, y, yaw] error
+        # obstacles for the OCP planner: CYLINDER markers (centre, scale.x = diameter) from the obstacle manager
+        self._obstacles = []
+        self.create_subscription(MarkerArray, 'guidance/obstacles', self._on_obstacles,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._plan_pub = self.create_publisher(Path, 'guidance/plan', 1)
         self.bias_hat = None            # observer bias b_hat in NED [N, N, N m] (navigation/bias)
         self.create_subscription(Vector3Stamped, 'navigation/bias', self._on_bias, 10)
         self.current_hat = None         # observer current velocity in NED [m/s, m/s] (navigation/current)
@@ -296,12 +326,31 @@ class PositionController(Node):
         self.error_pos = np.zeros(2)
         self.error_yaw = 0.0
 
+        self._bb = None
+        self._tau_parts = None          # (feedforward, feedback) of the last model-based tau, for /control/pose/*
+        if self.get_parameter('blueboat.interface').value:
+            self._setup_blueboat()
+
         self.get_logger().info(
             "Goto Point Controller (Reference Filter Version) Initialized with parameters."
         )
 
         # Timer for periodic control updates
-        self.timer = self.create_timer(self.dt, self.control_loop)
+        # build the OCP planner now: building the CasADi problem is plain Python (~1 s) and would stop the
+        # 10 Hz loop if it happened at the first goal
+        if self.get_parameter('guidance.planner').value == 'ocp' and getattr(self, 'model_based', False) \
+                and getattr(self, '_vessel_cfg', None) is not None:
+            t = time.time()
+            self._ocp_planner()
+            self.get_logger().info(f"OCP planner built in {time.time() - t:.1f} s")
+        self._dock = None
+        self._setup_docking()
+        # compute time and period on /diagnostics (step 6: will it keep up on the boat's computer?)
+        from cybership_utilities.loop_timing import LoopTimer
+        self._timing = dict(loop=LoopTimer(self, "control loop", period=self.dt),
+                            dock=LoopTimer(self, "docking OCP solve", report=5.0),
+                            ocp=LoopTimer(self, "transit OCP solve", report=5.0))
+        self.timer = self.create_timer(self.dt, self._timed_control_loop)
 
         # --- Action Server using nav2_msgs/NavigateToPose ---
         self._action_server = ActionServer(
@@ -447,10 +496,13 @@ class PositionController(Node):
                 self.dt = param.value
                 # Recreate the timer with new dt
                 self.timer.cancel()
-                self.timer = self.create_timer(self.dt, self.control_loop)
+                self.timer = self.create_timer(self.dt, self._timed_control_loop)
+                self._timing['loop'].period = self.dt
 
         self.get_logger().info(f"Parameters updated: {updated_params}")
         self._snapshot_parameters()  # Ensure configuration is updated after parameters change
+        if self._bb is not None:
+            self._bb_publish_gains()
 
     def odom_callback(self, msg: Odometry):
         current_x = msg.pose.pose.position.x
@@ -464,6 +516,8 @@ class PositionController(Node):
 
         # Always store latest odom
         self.latest_odom = msg
+        if self._bb is not None:
+            self._bb['gate'].on_state(time.monotonic())
 
         if self.ref_filter is None:
             # Initialize the filter to CURRENT pose (not the target)
@@ -653,6 +707,10 @@ class PositionController(Node):
         if done is not None and not done.done():
             done.set_result(how)
 
+    def _timed_control_loop(self):
+        with self._timing['loop']:
+            self.control_loop()
+
     def control_loop(self):
         """
         Periodic control loop to update reference filter and publish control commands.
@@ -667,6 +725,10 @@ class PositionController(Node):
 
         if self.ref_filter is None:
             return
+
+        if self._bb is not None and not self._bb_tick():
+            return
+        self._tau_parts = None
 
         # Check goal progress (non-blocking)
         self.check_goal_progress()
@@ -697,6 +759,7 @@ class PositionController(Node):
             eta = np.array([current_x, current_y, current_yaw])
             self._reset_ref_filter(eta, Rz(current_yaw) @ nu)
             psi_d, u_d, kappa = self._path_command
+            self._reference = None
             self.process_performance_metrics(eta, np.zeros(3), np.zeros(2), np.zeros(2),
                                              wrap_to_pi(psi_d - current_yaw))
             self._publish_wrench(*self._path_following_tau(current_yaw, nu, psi_d, u_d, kappa))
@@ -715,6 +778,8 @@ class PositionController(Node):
             desired_vel = self.ref_filter.eta_d_dot  # velocity
             # acceleration (feedforward term)
             desired_acc = self.ref_filter.eta_d_ddot
+
+        self._reference = np.asarray(desired_pose, dtype=float)
 
         # Compute errors (position and yaw) between the filtered desired state and current state.
         error_pos = np.array(
@@ -737,6 +802,7 @@ class PositionController(Node):
                 current_yaw, np.array([error_pos[0], error_pos[1], error_yaw]),
                 desired_vel, desired_acc,
                 np.array([current_vx, current_vy, current_yaw_rate]))
+            control_x, control_y = self._dock_push(current_yaw, control_x, control_y)
             self._publish_wrench(control_x, control_y, control_yaw)
             return
 
@@ -784,18 +850,8 @@ class PositionController(Node):
         # control_y = saturate(control_y, self.saturation_pos)
         # control_yaw = saturate(control_yaw, self.saturation_yaw)
 
-        wrench_msg = Wrench()
-
-        # Publish these instead
-        wrench_msg.force.x = control_x
-        wrench_msg.force.y = control_y
-        wrench_msg.force.z = 0.0  # No vertical force
-        wrench_msg.torque.x = 0.0
-        wrench_msg.torque.y = 0.0
-        wrench_msg.torque.z = control_yaw
-
         # Publish the control command.
-        self.control_pub.publish(wrench_msg)
+        self._publish_wrench(control_x, control_y, control_yaw)
 
         # Debug logging.
         self.get_logger().debug(
@@ -855,9 +911,27 @@ class PositionController(Node):
         else:
             damping_ff = self.D_eff @ nu_rd
         damping_ff[0] += self._tow_drag(nu_rd[0])
-        tau = (self.M_eff @ nu_rd_dot + damping_ff
-               + self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i)
+        tau_ff = self.M_eff @ nu_rd_dot + damping_ff
+        tau_fb = self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i
+        self._tau_parts = (tau_ff, tau_fb)
+        tau = tau_ff + tau_fb
         return float(tau[0]), float(tau[1]), float(tau[2])
+
+    def _on_obstacles(self, msg):
+        self._obstacles = [(m.pose.position.x, m.pose.position.y, m.scale.x / 2.0) for m in msg.markers
+                           if m.action == Marker.ADD and m.type == Marker.CYLINDER]
+
+    def _publish_plan(self, plan):
+        """The planned track as a Path in 'world' for RViz (guidance/plan)."""
+        path = Path()
+        path.header.frame_id, path.header.stamp = 'world', self.get_clock().now().to_msg()
+        for x, y, psi in plan['eta']:
+            p = PoseStamped()
+            p.header = path.header
+            p.pose.position.x, p.pose.position.y = float(x), float(y)
+            p.pose.orientation.z, p.pose.orientation.w = math.sin(psi / 2), math.cos(psi / 2)
+            path.poses.append(p)
+        self._plan_pub.publish(path)
 
     def _tow_drag(self, u_r):
         """Drag of a towed load at surge speed u_r through the water (0 without one)."""
@@ -973,7 +1047,7 @@ class PositionController(Node):
 
     def _ocp_planner(self):
         g = lambda n: self.get_parameter(f'guidance.ocp.{n}').value
-        weights = {k: g(k) for k in ('w_T', 'w_v', 'w_r', 'w_rev', 'w_xte', 'w_hold', 'w_f', 'w_df')}
+        weights = {k: g(k) for k in ('w_T', 'w_v', 'w_r', 'w_rev', 'w_xte', 'w_hold', 'w_f', 'w_df', 'obstacle_margin')}
         if getattr(self, '_ocp', None) is None or self._ocp_weights != weights:
             G = lambda n: self.get_parameter(f'guidance.{n}').value
             self._ocp = trajectory_planner.OCPPlanner.from_vessel_config(
@@ -994,7 +1068,9 @@ class PositionController(Node):
             goal = [self.target_x, self.target_y, self.target_yaw]
             self._ocp_id = getattr(self, '_ocp_id', 0) + 1
             self._ocp_result, self._ocp_hold = None, np.array([x, y, yaw])
-            job = lambda i=self._ocp_id: setattr(self, '_ocp_result', (i, self._ocp_planner().plan(start, goal)))
+            obstacles = list(self._obstacles)
+            job = lambda i=self._ocp_id: setattr(self, '_ocp_result', (
+                i, self._ocp_planner().plan(start, goal, obstacles=obstacles)))
             if self.get_parameter('guidance.ocp_threaded').value:
                 threading.Thread(target=job, daemon=True).start()
             else:
@@ -1006,13 +1082,35 @@ class PositionController(Node):
             if res is None or res[0] != self._ocp_id:
                 return self._ocp_hold                            # still planning: hold where we were
             plan = res[1]
+            for ox, oy, r in plan.get('ignored', []):
+                self.get_logger().warn(f"Guidance: obstacle at ({ox:.1f}, {oy:.1f}) ignored (the boat overlaps it at the "
+                                       f"start or the goal, or too many obstacles)")
+            for (ox, oy, r), mg in zip(plan.get('obstacles', []), plan.get('margins', [])):
+                if mg < self.get_parameter('guidance.ocp.obstacle_margin').value - 1e-6:
+                    self.get_logger().info(f"Guidance: obstacle at ({ox:.1f}, {oy:.1f}) close to the start or the goal, "
+                                           f"clearance {mg:.2f} m there")
+            for ox, oy, r in plan.get('blocked', []):
+                self.get_logger().error(f"Guidance: the boat would overlap the obstacle at ({ox:.1f}, {oy:.1f}) at "
+                                        f"the goal, pick a goal further from it")
+            if not plan.get('ok') and (plan.get('obstacles') or plan.get('blocked')):
+                # the manoeuvre rules do not know about obstacles: stay put instead of driving through one
+                self.get_logger().error("Guidance: no collision-free plan found, holding position")
+                self.target_x, self.target_y, self.target_yaw = self._ocp_hold
+                self._reset_ref_filter(self._ocp_hold.copy(), np.zeros(3))
+                self._guidance_phase, self._final_turn = 'station', False
+                self._finish_goal("abort")
+                return self._ocp_hold
             if not plan.get('ok'):
                 self.get_logger().warn("Guidance: OCP planner failed, falling back to the manoeuvre rules")
                 self._ocp_failed, self._guidance_phase = True, None
                 return self._ocp_hold
             self._ocp_plan, self._ocp_t = plan, 0.0
+            self._timing['ocp'].record(plan['solve_time'])
+            self._publish_plan(plan)
+            n_obs = len(plan.get('obstacles', []))
             self.get_logger().info(
-                f"Guidance: OCP plan {plan['T']:.1f} s, solved in {plan['solve_time']:.2f} s ({plan['guess']} guess)")
+                f"Guidance: OCP plan {plan['T']:.1f} s, solved in {plan['solve_time']:.2f} s ({plan['guess']} guess)"
+                + (f", around {n_obs} obstacle{'s' if n_obs > 1 else ''}" if n_obs else ""))
             self._guidance_phase = phase = 'ocp'
         self._ocp_t += self.dt
         eta_d, eta_dot, eta_ddot, done = trajectory_planner.sample(self._ocp_plan, self._ocp_t)
@@ -1025,6 +1123,232 @@ class PositionController(Node):
             return goal
         self._traj = (eta_d, eta_dot, eta_ddot)
         return eta_d
+
+    # ------------------------------------------------------------------------
+    # Docking (results/docking_mpc_plan.md): plan with the docking OCP, track with the DP law
+    # ------------------------------------------------------------------------
+
+    def _setup_docking(self):
+        """Berths from docking.harbour_file and one docking OCP per berth gap, built now: compiled to C the first
+        time (~30 s, more on the boat's computer), then loaded from ~/.cache/cybership_dp."""
+        path = self.get_parameter('docking.harbour_file').value
+        self._berths = {}
+        if not path:
+            return
+        if not (getattr(self, 'model_based', False) and getattr(self, '_vessel_cfg', None) is not None):
+            self.get_logger().warn("Docking needs control.model_based and vessel_model: docking is off")
+            return
+        from cybership_dp.docking_mpc import DockingOCP
+        cfg = self._vessel_cfg
+        self._hull = (float(cfg['hull']['length']), float(cfg['hull']['beam']))
+        self._quays, self._berths = docking.load_harbour(path, self._hull,
+                                                         self.get_parameter('docking.harbour_shift').value)
+        self._dock_solver_busy = False
+        g = lambda n: self.get_parameter(f'docking.{n}').value
+        hf = g('heading_funnel_deg')
+        t = time.time()
+        # the plan's minimum gap is fixed when the problem is built: one problem per berth gap
+        self._dock_ocps = {gap: DockingOCP.from_vessel_config(
+            cfg, self._vessel_params, free_time=True, gap_min=gap - g('gap_margin'), corridor=tuple(g('corridor')),
+            heading_funnel=(math.radians(hf[0]), math.radians(hf[1])), max_cpu_time=8.0,
+            # replans warm with the multipliers too: 18 instead of 52 iterations (tools/docking_ocp_speed.py)
+            dual_warm=True)
+            for gap in {b['gap'] for b in self._berths.values()}}
+        self.create_subscription(String, 'guidance/dock', lambda m: self._start_dock(m.data), 10)
+        self.create_service(Trigger, f'{self.get_name()}/dock', self._on_dock_service)
+        self._dock_status_pub = self.create_publisher(String, 'guidance/dock_status', 10)
+        self.get_logger().info(f"Docking: berths {list(self._berths)} from {path}, planners built in "
+                               f"{time.time() - t:.1f} s")
+
+    def _on_dock_service(self, request, response):
+        response.success, response.message = self._start_dock('')
+        return response
+
+    def _berth_for_goal(self, x, y, yaw):
+        """A goal within 1 m of a berth means: dock there (an RViz click next to the quay). Of berths at the same
+        place, the one whose heading is closest to the goal's (so the arrow picks the side). None otherwise."""
+        if self.latest_odom is not None:
+            px, py, psi = self._odom_pose()
+            if math.hypot(px - x, py - y) < 0.3 and abs(wrap_to_pi(psi - yaw)) < math.radians(10):
+                return None                                # a goal where the boat already is: "hold here"
+        near = [(abs(wrap_to_pi(b['pose'][2] - yaw)), name) for name, b in getattr(self, '_berths', {}).items()
+                if math.hypot(b['pose'][0] - x, b['pose'][1] - y) < 1.0]
+        return min(near)[1] if near else None
+
+    def _start_dock(self, name):
+        """Dock at berth `name` ('' = the first in the harbour file)."""
+        if not self._berths:
+            return False, "no berths (docking.harbour_file)"
+        name = name.strip() or next(iter(self._berths))
+        if name not in self._berths:
+            self.get_logger().error(f"Docking: no berth '{name}' (have {list(self._berths)})")
+            return False, f"no berth '{name}'"
+        if self._bb is not None and not self._bb['gate'].active:
+            self.get_logger().warn(f"Docking refused: not active ({self._bb['gate'].reason})")
+            return False, f"not active ({self._bb['gate'].reason})"
+        if self.latest_odom is None:
+            return False, "no state yet"
+        if self._dock is not None and self._dock['name'] == name:
+            return True, f"already docking to {name} ({self._dock['stage']})"     # e.g. the button pressed twice
+        b = self._berths[name]
+        self._finish_goal("abort")
+        self._set_target(*b['pose'])                       # also ends a docking in progress
+        self._dock = dict(name=name, berth=np.array(b['pose'], float), hp=b['halfplane'], gap=b['gap'],
+                          quay=b['quay'], face=b['face'], stage=None, plan=None, t_plan=None, result=None,
+                          solving=False, last_solve=-math.inf, failures=0, hold=None, retry_at=0.0)
+        self.get_logger().info(f"Docking: to {name} at ({b['pose'][0]:.2f}, {b['pose'][1]:.2f}), heading "
+                               f"{math.degrees(b['pose'][2]):.0f} deg, {b['side']} side {b['gap']:.2f} m off the face")
+        return True, f"docking to {name}"
+
+    def _dock_stage(self, stage):
+        d = self._dock
+        if d['stage'] != stage:
+            d['stage'] = stage
+            self._dock_status_pub.publish(String(data=f"{d['name']}: {stage}"))
+        if stage != 'transit':
+            self._guidance_phase = f'dock_{stage}'
+
+    def _dock_solve(self, x, y, yaw, warm):
+        """Solve the docking OCP in a thread from the current state (velocity through the water, the observer's
+        current and bias in the model); the result is picked up by _dock_reference."""
+        d, now = self._dock, time.monotonic()
+        tw = self.latest_odom.twist.twist
+        vc = np.zeros(2) if self.current_hat is None else np.asarray(self.current_hat, float)
+        c, s = math.cos(yaw), math.sin(yaw)
+        x0 = np.array([x, y, yaw, tw.linear.x - (c * vc[0] + s * vc[1]), tw.linear.y - (-s * vc[0] + c * vc[1]),
+                       tw.angular.z])
+        bias = (np.asarray(self.bias_hat, float) if self.get_parameter('control.bias_feedforward').value
+                and self.bias_hat is not None else np.zeros(3))
+        elapsed = (now - d['t_plan']) if (warm and d['plan'] is not None) else None
+        ocp = self._dock_ocps[d['gap']]
+        d['solving'], d['last_solve'] = True, now
+        self._dock_solver_busy = True
+
+        def job():
+            try:
+                res = ocp.solve(x0, d['berth'], d['hp'], vc=vc, bias=bias, elapsed=elapsed)
+            except Exception as e:                        # a failed solve must not kill the control loop
+                res = dict(ok=False, status=str(e), solve_time=time.monotonic() - now)
+            finally:
+                self._dock_solver_busy = False
+            res['t0'] = now
+            d['result'], d['solving'] = res, False
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _dock_push(self, psi, fx, fy):
+        """
+        Alongside, push on the fenders: across the face the force towards the quay is at least docking.push_force;
+        along it, and in yaw, the DP law is unchanged. Not a position target inside the quay: the observer would
+        take the fender's push for a disturbance and the bias feedforward would squeeze the fender ever harder.
+        Clamping instead, the observer sees the force actually sent, so it settles. If wind or current pull the
+        boat off harder than the push, the DP's own force towards the quay is larger and it holds the berth.
+        """
+        d = getattr(self, '_dock', None)
+        push = self.get_parameter('docking.push_force').value
+        if d is None or d['stage'] != 'alongside' or push <= 0.0:
+            return fx, fy
+        a = np.asarray(d['hp'][0], float)
+        a = a / np.linalg.norm(a)                            # NED direction into the quay
+        c, s = math.cos(psi), math.sin(psi)
+        into = np.array([c * a[0] + s * a[1], -s * a[0] + c * a[1]])     # the same in BODY
+        f = np.array([fx, fy])
+        f_into = float(f @ into)
+        f = f + (max(push, f_into) - f_into) * into
+        return float(f[0]), float(f[1])
+
+    def _dock_reference(self, x, y, yaw):
+        """
+        Docking phases: transit to a stand-off pose (the OCP planner, the quay as obstacles) if the boat starts far
+        off or behind the face; plan with the docking OCP (holding position meanwhile); track the plan, replanning
+        only when the boat is off it (and not in the last metre: the DP's); alongside: hold the berth.
+        """
+        d, now = self._dock, time.monotonic()
+        g = lambda n: self.get_parameter(f'docking.{n}').value
+        a, b = np.asarray(d['hp'][0], float), float(d['hp'][1])
+        berth = d['berth']
+        gap_co = b - float(a @ np.array([x, y])) - self._hull[1] / 2      # CO's distance to the face - half beam
+        if d['stage'] is None:
+            out = -a / np.linalg.norm(a)
+            along = float(np.array([-out[1], out[0]]) @ (np.array([x, y]) - berth[:2]))
+            face_len = self._quays[d['quay']].face(d['face'])[3]
+            near = math.hypot(x - berth[0], y - berth[1]) <= g('max_start_distance')
+            if gap_co >= 0.5 and near and abs(along) <= face_len / 2 + 4.0:
+                self._dock_stage('plan')
+            else:
+                d['standoff'] = np.array([*(berth[:2] + out * g('standoff')), berth[2]])
+                self.target_x, self.target_y, self.target_yaw = d['standoff']
+                self._guidance_phase, self._ocp_failed = None, False
+                self._dock_stage('transit')
+                self.get_logger().info(f"Docking: to the stand-off pose {g('standoff'):.1f} m out first")
+        if d['stage'] == 'transit':
+            so = d['standoff']
+            if getattr(self, '_ocp_failed', False):
+                self.get_logger().error("Docking: no plan to the stand-off pose, holding position")
+                self._dock = None
+                self.target_x, self.target_y, self.target_yaw = x, y, yaw
+                return np.array([x, y, yaw])
+            if not (self._guidance_phase == 'station' and math.hypot(x - so[0], y - so[1]) < 0.3
+                    and abs(wrap_to_pi(yaw - so[2])) < math.radians(10)):
+                return self._ocp_reference(x, y, yaw, self._guidance_phase)
+            self.target_x, self.target_y, self.target_yaw = berth
+            self._dock_stage('plan')
+        # one solve at a time: the CasADi solver is not thread safe, and two at once (a new docking while the last
+        # one's solve still ran) crashed the node
+        if d['stage'] == 'plan' and not d['solving'] and now >= d['retry_at'] and not self._dock_solver_busy:
+            d['hold'] = np.array([x, y, yaw])
+            self._dock_solve(x, y, yaw, warm=False)
+            self._dock_stage('planning')
+        res = d['result']
+        if res is not None:
+            d['result'] = None
+            if 'solve_time' in res:
+                self._timing['dock'].record(res['solve_time'])
+            if res['ok']:
+                d['plan'] = dict(t=res['t'], eta=res['eta'], nu=res['nu'], nu_dot=res['nu_dot'], T=res['T'])
+                d['t_plan'], d['failures'] = res['t0'], 0
+                self._publish_plan(d['plan'])
+                self.get_logger().info(f"Docking: plan {res['T']:.1f} s, solved in {res['solve_time']:.2f} s "
+                                       f"({res.get('guess', '')})")
+                self._dock_stage('track')
+            elif d['plan'] is None:
+                d['failures'] += 1
+                if d['failures'] >= 3:
+                    self.get_logger().error(f"Docking: no plan after 3 tries ({res.get('status', '')}), holding")
+                    self._dock = None
+                    self.target_x, self.target_y, self.target_yaw = d['hold']
+                    return d['hold']
+                self.get_logger().warn(f"Docking: plan failed ({res.get('status', '')}), trying again in 2 s")
+                d['retry_at'] = now + 2.0
+                self._dock_stage('plan')
+            else:
+                # a failed replan: keep following the last plan (the shifted last plan is still a good one, L5)
+                self.get_logger().warn(f"Docking: replan failed ({res.get('status', '')}), keeping the last plan")
+        if d['plan'] is None:
+            self._traj = None
+            return d['hold'] if d['hold'] is not None else np.array([x, y, yaw])
+        if d['stage'] == 'track':
+            eta_d, eta_dot, eta_ddot, done = trajectory_planner.sample(d['plan'], now - d['t_plan'])
+            if done:
+                self._traj = None
+                self._reset_ref_filter(berth.copy(), np.zeros(3))
+                self._dock_stage('alongside')
+                push = self.get_parameter('docking.push_force').value
+                self.get_logger().info(f"Docking: alongside {d['name']}" + (f", pushing {push:.0f} N on the fenders"
+                                                                            if push > 0 else ""))
+                return berth.copy()
+            err = math.hypot(eta_d[0] - x, eta_d[1] - y), abs(wrap_to_pi(eta_d[2] - yaw))
+            lim = g('replan_error')
+            if (not d['solving'] and not self._dock_solver_busy and now - d['last_solve'] >= g('replan_min_interval')
+                    and gap_co >= g('lock_gap')
+                    and (err[0] > lim[0] or err[1] > math.radians(lim[1]))):
+                self.get_logger().info(f"Docking: {err[0]:.2f} m / {math.degrees(err[1]):.0f} deg off the plan, "
+                                       f"planning again")
+                self._dock_solve(x, y, yaw, warm=True)
+            self._traj = (eta_d, eta_dot, eta_ddot)
+            return eta_d
+        self._traj = None                                  # alongside: hold the berth
+        return berth.copy()
 
     def _plan_dubins(self, x, y, heading, mode='path', first_turn=0.0):
         """
@@ -1154,6 +1478,8 @@ class PositionController(Node):
 
     def _guidance_reference(self, x, y, yaw):
         """Reference eta_r = [x, y, psi] for the reference filter (guidance block)."""
+        if getattr(self, '_dock', None) is not None:
+            return self._dock_reference(x, y, yaw)
         goal = np.array([self.target_x, self.target_y, self.target_yaw])
         if not self.get_parameter('guidance.turn_then_go').value:
             return goal
@@ -1167,6 +1493,9 @@ class PositionController(Node):
         if phase in ('ocp_plan', 'ocp') or (phase is None and self._use_ocp(distance, yaw)):
             return self._ocp_reference(x, y, yaw, phase)
         if phase is None:
+            if self._obstacles:
+                self.get_logger().warn("Guidance: the manoeuvre rules (moves over ocp_max_distance or after a failed "
+                                       "plan) do not avoid obstacles")
             self._manoeuvre, times = self._choose_manoeuvre(distance, bearing, yaw, x, y)
             self.get_logger().info(
                 f"Guidance: {self._manoeuvre} to the goal {distance:.1f} m away"
@@ -1418,14 +1747,218 @@ class PositionController(Node):
         return np.array([x, y, h])
 
     def _publish_wrench(self, fx, fy, mz):
+        if self._bb is not None:
+            self._bb_publish(np.array([fx, fy, mz], dtype=float))
+            return
         wrench_msg = Wrench()
         wrench_msg.force.x = fx
         wrench_msg.force.y = fy
         wrench_msg.torque.z = mz
         self.control_pub.publish(wrench_msg)
 
+    # ------------------------------------------------------------------------
+    # The team's pose controller interface (blueboat.interface)
+    # ------------------------------------------------------------------------
+
+    def _setup_blueboat(self):
+        """Topics and services as blueboat_core_control's pose_controller has them (see blueboat_io.py)."""
+        from blueboat_interfaces.msg import OperationMode, Waypoint
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        debug = '/control/pose'
+        self._bb = {
+            'gate': blueboat_io.DPGate(self.get_parameter('blueboat.state_timeout').value),
+            'autonomous': False, 'last_tick': None, 'Waypoint': Waypoint, 'warned': set(),
+            'AUTONOMOUS': blueboat_io.byte_value(OperationMode.AUTONOMOUS),
+            'tau': self.create_publisher(WrenchStamped, '/control/tau', 10),
+            'gains': self.create_publisher(String, f'{debug}/gains', latched),
+        }
+        for name, kind in [('active', Bool), ('status', String), ('target', Waypoint), ('reference', Waypoint),
+                           ('state', Waypoint), ('target_pose', PoseStamped), ('reference_pose', PoseStamped),
+                           ('error', Vector3Stamped), ('integral', Vector3Stamped), ('tau_feedforward', WrenchStamped),
+                           ('tau_feedback', WrenchStamped), ('period', Float64)]:
+            self._bb[name] = self.create_publisher(kind, f'{debug}/{name}', 10)
+        self.create_subscription(OperationMode, '/control/opmode', self._bb_on_opmode, latched)
+        self.create_subscription(PoseStamped, '/goal_pose', self._bb_on_goal_pose, 10)
+        self.create_subscription(Waypoint, f'{debug}/setpoint', self._bb_on_setpoint, 10)
+        self.create_service(Trigger, f'{debug}/reset', self._bb_on_reset)
+        self.create_service(Trigger, f'{debug}/reset_integral', self._bb_on_reset_integral)
+        self.create_service(Trigger, f'{debug}/hold', self._bb_on_hold)
+        self._bb_publish_gains()
+        self.get_logger().info("Team interface: drives in AUTONOMOUS only; goals from /goal_pose and "
+                               f"{debug}/setpoint; force on /control/tau, debug on {debug}/*")
+
+    def _bb_on_opmode(self, msg):
+        self._bb['autonomous'] = blueboat_io.byte_value(msg.mode) == self._bb['AUTONOMOUS']
+
+    def _odom_pose(self):
+        """(x, y, psi) NED of the latest odometry."""
+        p, q = self.latest_odom.pose.pose.position, self.latest_odom.pose.pose.orientation
+        return np.array([p.x, p.y, math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))])
+
+    def _bb_tick(self):
+        """The gate, once per control step: True when the DP may drive."""
+        bb, now = self._bb, time.monotonic()
+        if bb['last_tick'] is not None:
+            bb['period'].publish(Float64(data=now - bb['last_tick']))
+        bb['last_tick'] = now
+        event = bb['gate'].step(now, bb['autonomous'])
+        if event == 'activated':
+            self._bb_hold()
+            self.get_logger().info("Team interface: active, holding the current pose")
+        elif event == 'deactivated':
+            self._finish_goal("abort")
+            self._guidance_phase, self._traj, self._dock = None, None, None
+            self._bb_publish(np.zeros(3), debug=False)          # stop at once, before the allocator notices
+            self.get_logger().info(f"Team interface: inactive ({bb['gate'].reason})")
+        active = bb['gate'].active
+        bb['active'].publish(Bool(data=active))
+        bb['status'].publish(String(data=f"active: {getattr(self, '_guidance_phase', None) or 'station'}"
+                                    if active else f"inactive: {bb['gate'].reason}"))
+        return active
+
+    def _bb_hold(self):
+        """Hold the current pose: the target is where the boat is, the filter and the integral start over there."""
+        eta = self._odom_pose()
+        tw = self.latest_odom.twist.twist
+        self._reset_ref_filter(eta, Rz(eta[2]) @ np.array([tw.linear.x, tw.linear.y, tw.angular.z]))
+        self.integral_mb = np.zeros(3)
+        self.integral_error_pos, self.integral_error_yaw = np.zeros(2), 0.0
+        self._set_target(*eta)
+
+    def _bb_target(self, target, source):
+        """A target (x, y, psi) NED from /goal_pose or the setpoint: accepted only while active."""
+        if not np.all(np.isfinite(target)):
+            self.get_logger().warn(f"Target {target} from {source} ignored: not finite")
+        elif not self._bb['gate'].active:
+            self.get_logger().warn(f"Target from {source} ignored: not active ({self._bb['gate'].reason})")
+        elif self._berth_for_goal(*target) is not None:
+            berth = self._berth_for_goal(*target)
+            self.get_logger().info(f"Target from {source} next to berth {berth}: {self._start_dock(berth)[1]}")
+        else:
+            self._finish_goal("abort")                           # replaces a NavigateToPose goal in progress
+            self._set_target(*target)
+            self.get_logger().info(f"Target from {source}: x {target[0]:.2f} m, y {target[1]:.2f} m, "
+                                   f"heading {math.degrees(target[2]):.1f} deg NED")
+
+    def _bb_on_goal_pose(self, msg):
+        q, p = msg.pose.orientation, msg.pose.position
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        frame = msg.header.frame_id.lstrip('/')
+        pose = self._odom_pose() if self.latest_odom is not None else None
+        target = blueboat_io.goal_in_ned(frame, p.x, p.y, yaw, pose)
+        if target is None:
+            if frame not in self._bb['warned']:
+                self._bb['warned'].add(frame)
+                self.get_logger().warn(f"/goal_pose in frame '{frame}' ignored: expected ned, world, enu or base_link")
+            return
+        self._bb_target(target, f"/goal_pose ({frame})")
+
+    def _bb_on_setpoint(self, msg):
+        self._bb_target(np.array([msg.xn, msg.yn, msg.psi_n]), "/control/pose/setpoint")
+
+    def _bb_on_reset(self, request, response):
+        if self.latest_odom is not None:
+            eta, tw = self._odom_pose(), self.latest_odom.twist.twist
+            self._reset_ref_filter(eta, Rz(eta[2]) @ np.array([tw.linear.x, tw.linear.y, tw.angular.z]))
+        self.integral_mb = np.zeros(3)
+        self.integral_error_pos, self.integral_error_yaw = np.zeros(2), 0.0
+        response.success, response.message = True, "integral cleared, filter seeded on the current state"
+        return response
+
+    def _bb_on_reset_integral(self, request, response):
+        self.integral_mb = np.zeros(3)
+        self.integral_error_pos, self.integral_error_yaw = np.zeros(2), 0.0
+        response.success = True
+        response.message = "integral cleared" + (" (unused: the observer's bias is fed forward)"
+                                                 if self.get_parameter('control.bias_feedforward').value else "")
+        return response
+
+    def _bb_on_hold(self, request, response):
+        response.success = self._bb['gate'].active and self.latest_odom is not None
+        if response.success:
+            self._finish_goal("abort")
+            self._bb_hold()
+        response.message = "holding the current pose" if response.success else \
+            f"not active ({self._bb['gate'].reason})"
+        return response
+
+    def _bb_publish_gains(self):
+        gains = {'law': 'model_based' if self.model_based else 'pid',
+                 'planner': self.get_parameter('guidance.planner').value,
+                 'bias_feedforward': self.get_parameter('control.bias_feedforward').value,
+                 'filter_omega': list(self.get_parameter('filter.omega').value),
+                 'filter_delta': list(self.get_parameter('filter.delta').value)}
+        if self.model_based:
+            gains.update(Kp=np.round(self.Kp_mb, 3).tolist(), Kd=np.round(self.Kd_mb, 3).tolist(),
+                         Ki=np.round(self.Ki_mb, 4).tolist(),
+                         omega_n=list(self.get_parameter('control.omega_n').value),
+                         zeta=list(self.get_parameter('control.zeta').value))
+        self._bb['gains'].publish(String(data=json.dumps(gains)))
+
+    def _bb_publish(self, tau, debug=True):
+        """/control/tau and, with debug, the pose controller's debug topics for this step."""
+        bb, stamp = self._bb, self.get_clock().now().to_msg()
+
+        def wrench(v):
+            m = WrenchStamped()
+            m.header.stamp, m.header.frame_id = stamp, 'base_link'
+            m.wrench.force.x, m.wrench.force.y, m.wrench.torque.z = (float(x) for x in v)
+            return m
+
+        def waypoint(eta):
+            m = bb['Waypoint']()
+            m.header.stamp, m.header.frame_id = stamp, 'ned'
+            m.xn, m.yn, m.psi_n = float(eta[0]), float(eta[1]), float(wrap_to_pi(eta[2]))
+            return m
+
+        def pose(eta):
+            m = PoseStamped()
+            m.header.stamp, m.header.frame_id = stamp, 'ned'
+            m.pose.position.x, m.pose.position.y = float(eta[0]), float(eta[1])
+            m.pose.orientation.z, m.pose.orientation.w = math.sin(eta[2] / 2.0), math.cos(eta[2] / 2.0)
+            return m
+
+        def vector(v):
+            m = Vector3Stamped()
+            m.header.stamp, m.header.frame_id = stamp, 'ned'
+            m.vector.x, m.vector.y, m.vector.z = (float(x) for x in v)
+            return m
+
+        bb['tau'].publish(wrench(tau))
+        if not debug or self.latest_odom is None or self.target_x is None:
+            return
+        eta = self._odom_pose()
+        target = np.array([self.target_x, self.target_y, self.target_yaw])
+        bb['state'].publish(waypoint(eta))
+        bb['target'].publish(waypoint(target))
+        bb['target_pose'].publish(pose(target))
+        ref = getattr(self, '_reference', None)
+        if ref is not None:
+            bb['reference'].publish(waypoint(ref))
+            bb['reference_pose'].publish(pose(ref))
+            err = ref - eta
+            err[2] = wrap_to_pi(err[2])
+            bb['error'].publish(vector(err))
+        bb['integral'].publish(vector(self.integral_mb))
+        if self._tau_parts is not None:
+            bb['tau_feedforward'].publish(wrench(self._tau_parts[0]))
+            bb['tau_feedback'].publish(wrench(self._tau_parts[1]))
+
+    def _set_target(self, x, y, yaw):
+        """A new target (NED): guidance decides turn/transit/station again. A new goal ends docking."""
+        self._dock = None
+        self.target_x, self.target_y, self.target_yaw = float(x), float(y), float(yaw)
+        self._guidance_phase = None
+        self._traj, self._yaw_traj = None, None
+        self._ocp_failed = False
+        self._wv_heading = None
+        self._final_turn = False
+
     def action_goal_callback(self, goal_request):
         self.get_logger().info("Received NavigateToPose goal request")
+        if self._bb is not None and not self._bb['gate'].active:
+            self.get_logger().warn(f"NavigateToPose goal rejected: not active ({self._bb['gate'].reason})")
+            return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
     def action_cancel_callback(self, goal_handle):
@@ -1454,8 +1987,7 @@ class PositionController(Node):
         else:
             self.enabled = False
             # Publish zero forces and torques to reset the controller
-            zero_wrench = Wrench()
-            self.control_pub.publish(zero_wrench)
+            self._publish_wrench(0.0, 0.0, 0.0)
 
             response.success = True
             response.message = "Controller disabled."
@@ -1488,17 +2020,6 @@ class PositionController(Node):
             goal_handle.abort()
             return NavigateToPose.Result()
 
-        self.target_x = target_in_odom.pose.position.x
-        self.target_y = target_in_odom.pose.position.y
-        self._guidance_phase = None  # new goal: guidance decides turn/transit/station again
-        self._traj, self._yaw_traj = None, None
-        self._ocp_failed = False
-        self._wv_heading = None
-        self._final_turn = False
-
-        self.get_logger().info(
-            f"Target position: ({self.target_x}, {self.target_y})")
-
         # Convert quaternion to yaw angle
         orientation = target_in_odom.pose.orientation
         rot = R.from_quat([
@@ -1507,7 +2028,17 @@ class PositionController(Node):
             orientation.z,
             orientation.w]
         )
-        _, _, self.target_yaw = rot.as_euler("xyz", degrees=False)
+        _, _, yaw = rot.as_euler("xyz", degrees=False)
+        berth = self._berth_for_goal(target_in_odom.pose.position.x, target_in_odom.pose.position.y, yaw)
+        if berth is not None:
+            ok, msg = self._start_dock(berth)
+            self.get_logger().info(f"Goal next to berth {berth}: {msg}")
+            (goal_handle.succeed if ok else goal_handle.abort)()
+            return NavigateToPose.Result()
+        self._set_target(target_in_odom.pose.position.x, target_in_odom.pose.position.y, yaw)
+
+        self.get_logger().info(
+            f"Target position: ({self.target_x}, {self.target_y})")
 
         # Publish target pose marker
         self.publish_target_pose_marker(target_in_odom)

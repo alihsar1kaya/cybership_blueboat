@@ -191,6 +191,42 @@ class DPKalmanFilter:
             C[0, 5] = 1.0
         return self.correct([psi], C, np.array([[sigma**2]]), angle_rows=(0,))
 
+    def correct_line(self, normal, z, sigma):
+        """
+        A distance to a known straight line, such as a quay face fitted in the lidar: z = n . [N, E] of the CO
+        (+ the WF position), n the line's unit normal in NED [m]. Only the position across the line is corrected,
+        so near a quay the boat's distance to the face comes from the lidar and the position along it from GNSS.
+        """
+        C = np.zeros((1, self.n))
+        C[0, self.nw + 0], C[0, self.nw + 1] = normal[0], normal[1]
+        if self.nw:
+            C[0, 3], C[0, 4] = normal[0], normal[1]
+        return self.correct([z], C, np.array([[sigma**2]]))
+
+    def constrain_halfplane(self, normal, d_min, sigma=0.005, sigma_v=0.01):
+        """
+        An inequality the boat cannot break: n . [N, E] >= d_min for the CO (+ the WF position), n a unit normal in
+        NED, such as out of a quay face with d_min = the face's offset + the hull's extent towards it. If the
+        estimate breaks it, two pseudo-measurements (the active set of a constrained Kalman filter, Simon 2010):
+        the position on the boundary and, if it moves into the face, no velocity over ground into it. A fender
+        stops the boat, the model does not know that force, and without this the estimate went on 5-9 cm into the
+        quay and took 10 s to come back. Returns True when it acted.
+        """
+        n = np.asarray(normal, dtype=float)
+        p = self.x[self.nw:self.nw + 2] + (self.x[3:5] if self.nw else 0.0)
+        if n @ p >= d_min:
+            return False
+        self.correct_line(n, d_min, sigma)
+        psi = self.x[self.nw + 2]
+        c, s = math.cos(psi), math.sin(psi)
+        C = np.zeros((1, self.n))
+        C[0, self.i_nu.start], C[0, self.i_nu.start + 1] = n[0] * c + n[1] * s, -n[0] * s + n[1] * c
+        if self.nc:
+            C[0, self.i_c] = n
+        if float((C @ self.x)[0]) < 0.0:
+            self.correct([0.0], C, np.array([[sigma_v ** 2]]))
+        return True
+
     # --- outputs ----------------------------------------------------------------------------------
     @property
     def eta(self):
@@ -236,17 +272,25 @@ class AsyncObserver:
     Runs a DPKalmanFilter the way the observer node does, without ROS (the node and the offline tests
     share it): predict at a fixed rate, correct with every heading, and apply a delayed GNSS fix at
     the time it was taken. For a delayed fix the filter goes back to the stored state at that time,
-    corrects, and predicts forward again with the stored inputs and headings.
+    corrects, and predicts forward again with the stored inputs, headings and lidar lines.
+
+    Lidar lines (a quay face): for line_hold seconds after one, GNSS only corrects the position along
+    the line (gnss_along_only). Across it the lidar alone: GNSS and the lidar disagree there by the
+    map's error and GNSS multipath, and with both the estimate ends in between (half of a 10 cm map
+    error with RTK).
 
     All times are in seconds on one clock (the node uses ROS time).
     """
 
-    def __init__(self, kf, h, sigma_psi, delay_compensation=True, history=1.0):
+    def __init__(self, kf, h, sigma_psi, delay_compensation=True, history=1.0, line_hold=1.0,
+                 gnss_along_only=True):
         self.kf, self.h, self.sigma_psi = kf, float(h), float(sigma_psi)
         self.delay_compensation = delay_compensation
-        # states before each prediction and the headings in between
+        self.line_hold, self.gnss_along_only = float(line_hold), gnss_along_only
+        # states before each prediction and the headings and lines in between
         self.history = deque(maxlen=int(history / self.h))
         self.headings = deque(maxlen=int(2.0 * history / self.h))
+        self.lines = deque(maxlen=int(2.0 * history / self.h))
         self.initialized = {"gnss": False, "psi": False}
 
     @property
@@ -266,21 +310,48 @@ class AsyncObserver:
         if not self.initialized["gnss"]:
             self.kf.x[self.kf.nw:self.kf.nw + 2] = north, east
             self.initialized["gnss"] = True
+        normal = None
+        if self.gnss_along_only and self.lines and t - self.lines[-1][0] <= self.line_hold:
+            normal = self.lines[-1][1]
         hist = list(self.history)
         k = None
         if self.delay_compensation and t - t_meas > 0.5 * self.h:
             k = next((i for i in range(len(hist) - 1, -1, -1) if hist[i][0] <= t_meas), None)
         if k is None:                       # not delayed, or older than the history: use it as new
-            self.kf.correct_gnss(north, east, sigma)
+            self._correct_gnss(north, east, sigma, normal)
             return
         self.kf.x, self.kf.P = hist[k][1].copy(), hist[k][2].copy()
-        self.kf.correct_gnss(north, east, sigma)
+        self._correct_gnss(north, east, sigma, normal)
         times = [h[0] for h in hist[k:]] + [t]
         for j, (t_j, _, _, tau_j) in enumerate(hist[k:]):
             self.kf.predict(tau_j, self.h)
             for t_psi, psi in self.headings:
                 if t_j < t_psi <= times[j + 1]:
                     self.kf.correct_compass(psi, self.sigma_psi)
+            for t_l, n, z, sigma_l, psi, sigma_psi in self.lines:
+                if t_j < t_l <= times[j + 1]:
+                    self._correct_line(n, z, sigma_l, psi, sigma_psi)
+
+    def _correct_gnss(self, north, east, sigma, normal=None):
+        """The fix, or with a line's normal only its component along the line."""
+        if normal is None:
+            self.kf.correct_gnss(north, east, sigma)
+            return
+        t = np.array([-normal[1], normal[0]])
+        self.kf.correct_line(t, float(t @ [north, east]), sigma)
+
+    def _correct_line(self, normal, z, sigma, psi=None, sigma_psi=None):
+        self.kf.correct_line(normal, z, sigma)
+        if psi is not None:
+            self.kf.correct_compass(psi, sigma_psi)
+
+    def line(self, t, normal, z, sigma, psi=None, sigma_psi=None):
+        """
+        A distance z [m] to a known straight line, n . [N, E] = z with n the unit normal in NED (a quay face
+        from the lidar), received at t; with psi [rad] also the heading the face gives (sigma_psi [rad]).
+        """
+        self._correct_line(normal, z, sigma, psi, sigma_psi)
+        self.lines.append((t, np.asarray(normal, dtype=float), float(z), float(sigma), psi, sigma_psi))
 
     def step(self, t, tau):
         """One filter step at time t with the input tau = [X, Y, N]: store the state, then predict."""

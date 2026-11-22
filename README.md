@@ -228,6 +228,257 @@ The controller does not cancel the load cell force directly. We tried that and i
 
 Everything about the load is in the `tow` section of `vessel.yaml`. There you can swap the float for a 1.2 × 0.5 m hull with a heading of its own (`body.type: hull`), use a rope that only pulls (`line.rigid: false`), or change the bar length, the mass, the tow point and the load cell noise. All of these are guesses until we know what the towing group tows and how they attach it.
 
+### 11. Obstacles
+
+The trajectory planner can steer around round obstacles. Start the simulator as usual, pick the 2D Pose Estimate tool in RViz's toolbar and click in the water: each click drops an obstacle with a radius of 0.5 m (a red cylinder). The RViz config sends that tool to the obstacle manager instead of `/initialpose`, which nothing here uses. Publish Point works too, but only when you click on something that is drawn, such as a grid line. Then set a goal behind the obstacle with 2D Goal Pose. The planned track shows up as a green line before the boat starts moving.
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk
+# remove the clicked obstacles again, all or the last one
+ros2 service call /microampere/obstacle_manager/clear std_srvs/srv/Trigger
+ros2 service call /microampere/obstacle_manager/undo std_srvs/srv/Trigger
+# bigger obstacles from the next click on
+ros2 param set /microampere/obstacle_manager radius 1.0
+```
+
+Fixed obstacles, a dock for example, go in a YAML file that you pass with `obstacles:=<file>`:
+
+```yaml
+obstacles:
+  - [8.0, 0.0, 0.8]     # x north, y east, radius [m]
+  - [8.0, 1.5, 0.8]
+```
+
+The boat keeps its hull at least 0.5 m away from every obstacle in the plan (`guidance.ocp.obstacle_margin`). In tight turns it falls up to about 0.4 m behind the plan, so the real gap is smaller; in our tests it never got closer than 0.14 m. Planning takes 1–3 s for most goals and up to about 10 s for awkward ones, and the boat holds position meanwhile. If no plan is found, the boat stays where it is and the controller logs an error. Then try a goal a bit further from the obstacles. Near the start and the goal the margin shrinks to whatever room the hull has there, so you can put a goal close behind an obstacle (the log says how close). A goal where the hull would overlap an obstacle is refused, and an obstacle dropped on top of the boat is left out so the boat can get away from it.
+
+### 12. The real boat's topics and Foxglove
+
+The real Microampere talks through TURLab's `blueboat_interfaces` messages, not through this suite's own topics. With `boat_interface:=true` the simulator speaks that language too, so the boat's software can run against it unchanged and our DP can drive the real boat later without rewriting:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk boat_interface:=true foxglove:=true
+```
+
+The simulator then takes the aft thrust on `/control/thrust` and the azimuth on `/actuator/azimuth_cmd`, as the boat's drivers do. The azimuth turns to an absolute, unwrapped angle like the stepper on the boat. Out come `/navigation/odometry/ned` (what the boat's LEKF filter publishes), `/sensors/imu` in the STIM300's frame and units, the u-blox messages `/sensors/nav_pvt`, `/sensors/ecef`, `/sensors/nav_cov` and `/sensors/rel_pos` from the two antennas, `/control/opmode`, `/azimuth/state` and `/battery`. Antenna and IMU positions, noise and the PWM map come from the boat's own configuration files and sit in the `boat_interface` section of `vessel.yaml`. Our allocation publishes on the boat's topics in this mode and keeps the azimuth within 1.5 turns of zero, as the cable allows.
+
+Our DP also speaks the interface of the team's own pose controller (`blueboat_core_control`) in this mode, so either side can be swapped for the other:
+
+| Topic or service | Type | What |
+|---|---|---|
+| `/control/opmode` | `OperationMode` (in, latched) | the DP drives only in AUTONOMOUS. When it becomes active it holds the pose it has; when it stops being active it drops the target |
+| `/start_operation` | `Bool` (in, simulator) | START / STOP OPERATION: switches the simulated boat to AUTONOMOUS or STOPPED |
+| `/goal_pose` | `PoseStamped` (in) | target in frame `ned` or `world` (the same thing here), `enu`, or `base_link` (relative to the boat) |
+| `/control/pose/setpoint` | `Waypoint` (in) | target `xn`, `yn` [m], `psi_n` [rad], NED |
+| `/control/tau` | `WrenchStamped` (out) | the demanded force in BODY: surge `force.x`, sway `force.y`, yaw `torque.z` |
+| `/control/pose/{target, reference, state}` | `Waypoint` | goal, the reference the DP follows (filter or OCP plan) and the estimate, NED |
+| `/control/pose/{error, integral}` | `Vector3Stamped` | reference minus state, and the integral (x, y, yaw) |
+| `/control/pose/{tau_feedforward, tau_feedback}` | `WrenchStamped` | the model part (M and D) and the gain part (P, D, and the integral or the observer's bias) |
+| `/control/pose/{active, status, gains, period}` | `Bool`, `String`, `String` (JSON), `Float64` | gate state, why it is inactive, gains, loop period [s] |
+| `/control/pose/{hold, reset, reset_integral}` | `Trigger` services | hold the current pose; seed the filter on the current state and clear the integral; clear the integral |
+| `/control/allocator/tau_allocated` | `WrenchStamped` (out) | the force the sent thrusts give (the observer uses this as its input) |
+| `/control/allocator/unwinding` | `Bool` (out) | the azimuth is swinging the long way round, without thrust |
+
+The allocation reads `/control/tau` in this mode and sends thrust only in AUTONOMOUS. When the mode changes it sends one zero command and then stays quiet, so it never fights the joystick. If no force has come for 0.5 s it sends zero. The goal client is not started, because the controller reads `/goal_pose` itself. RViz's 2D Goal Pose and the web GUI therefore still work, and the web GUI's STOP sends STOP OPERATION. Our own extras (the OCP plan, obstacles, the observer's current and bias) stay under `/microampere/...`.
+
+`foxglove:=true` starts `foxglove_bridge` on `ws://localhost:8765`. Open it in Foxglove Studio (the desktop app or app.foxglove.dev) and import the team's layout with Layouts, then Import from file. The file is `microAmpere.json` in TURLab's `blueboat_foxglove` repository. In its DP tab the operation mode, active indicator, hold and reset buttons, setpoint panel, target and reference plots, the demanded against allocated force and the azimuth indicator all work. The simulator publishes static transforms from `world` to `ned`, from `ned` to `enu`, and from the boat to `base_link` (the IMU), so the 3D panel can show the poses and you can drag a goal there. The LEKF, LiDAR, timing and radio tabs stay empty, since they need the boat's own nodes.
+
+#### The observer on the boat's navigation
+
+In this mode the observer reads the boat's LEKF odometry, `/navigation/odometry/ned`, instead of the simulator's
+`sensor/gnss` and `sensor/imu`. That is the input it will have on the real boat. The boat has no compass: the
+STIM300 gives rates and accelerations only, and the LEKF's heading comes from the two GNSS antennas. The LEKF
+publishes the IMU's pose. The observer moves it to the boat's centre with `boat_interface.imu_position` and uses
+the position (`lekf.sigma_position`, 2 cm) and the heading (`lekf.sigma_heading_deg`, 0.5 deg) as measurements.
+The lidar's quay faces come on top, as in example 14.
+
+On the boat every `/sensors/*` and `/navigation/*` stamp is SentiBoard time. That clock counts from 2000-01-01
+and restarts with its node, so it is 26 years from the computer's clock. The observer never compares such a stamp
+with `now()`. It maps the stamps to its own clock with the shortest delay it has seen
+(`blueboat_io.StampClock`), which keeps the time between measurements right for the delay compensation. Try it
+in the simulator, which then stamps the boat's topics the same way:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk boat_interface:=true boat_clock:=sentiboard x0:=1 y0:=-2 yaw0_deg:=100
+```
+
+The quays in `harbour.yaml` are in the map's NED frame, which starts at the origin in `vessel.yaml`
+(`sensors.gnss`). The LEKF starts its NED frame at its first fix unless `ned_reference_ecef` pins it. The
+observer compares `/navigation/ned_origin` with the map's origin and logs an error when they are more than
+0.5 m apart. On the boat, pin the LEKF's origin to the map's.
+
+With `multipath:=true` the simulated LEKF odometry gets the same multipath error as the GNSS fix, because the
+real LEKF follows its GNSS.
+
+Our own force topic `control/force/command/mux` is a `Wrench` with no header. To plot it in Foxglove, give the full path (`/microampere/control/force/command/mux.force.x`) and set the timestamp to receive time.
+
+`blueboat_interfaces` lives on TURLab's GitLab and has to sit next to this repository in `ros_ws/src`:
+
+```bash
+cd ~/ros_ws/src && git clone https://turlab.itk.ntnu.no/turlab/blueboat_interfaces.git
+```
+
+### 13. Docking
+
+The boat can lay itself alongside a quay. The quays and berths are in `cybership_config/config/<vessel>/harbour.yaml`.
+The launch file finds it on its own, and for small_harbour it matches the dock in the Gazebo world: 6 x 1.5 m, 8 m
+north. Start somewhere south of the dock and ask for the berth:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk x0:=1 y0:=-2 yaw0_deg:=100
+```
+
+```bash
+ros2 topic pub --once /microampere/guidance/dock std_msgs/String "data: dock_south"
+```
+
+Or click "2D Goal Pose" in RViz within 1 m of the berth: a goal next to a berth starts docking there, and the
+arrow's direction picks the side (east: port side to the quay, west: starboard). Any other goal near the quay is
+refused, because the ordinary planner keeps clear of the quay.
+
+The web GUI's "Legg til kai" button does the same. So does the service
+`ros2 service call /microampere/position_controller/dock std_srvs/srv/Trigger`, which docks at the first berth in
+the file. In Foxglove, a Publish panel on `/microampere/guidance/dock` or a Call Service panel on the service works
+too.
+
+RViz shows the quay (brown), the berth (green arrow) and the plan (`guidance/plan`). `guidance/dock_status` says
+which phase the boat is in:
+
+1. If the boat is far off, behind the quay or past its end, it first goes to a stand-off pose 2 m out from the berth
+   with the ordinary planner. The quay is given to that planner as circles.
+2. The docking planner (`cybership_dp/docking_mpc.py`) plans the approach while the boat holds its position. The
+   plan:
+   - keeps the four hull corners at least 8 cm off the face,
+   - slows the boat down as it closes in,
+   - brings it in from in front of the berth, with the heading already lined up,
+   - takes the observer's current and bias into account.
+3. The DP law tracks the plan. It plans again only if the boat gets 0.25 m or 10 deg off the plan, and never in the
+   last metre.
+4. Alongside, the boat rests on its fenders. Along the face and in heading the DP holds the berth. Across it the
+   force towards the quay is at least `docking.push_force` (8 N), so the boat lies gently against the fenders.
+   If wind or current pull it off harder than that, the DP's own force wins and it holds the berth 10 cm off. Set
+   `docking.push_force` to 0 to hold 10 cm off with DP only:
+   `ros2 param set /microampere/position_controller docking.push_force 0.0`.
+
+A new goal, STOP, or (with `boat_interface:=true`) leaving AUTONOMOUS ends docking. The design and the tests behind
+it are in `results/docking_mpc_plan.md` in the workspace. To test docking without ROS, many runs at once, there is
+`tools/docking_bench.py`. To test it through the whole ROS stack, there is `tools/docking_ros_test.py`.
+
+The quays are solid in the simulator too. Points along the hull's outline (the fender line) that get inside a quay
+are pushed out by a spring-damper that only pushes, with friction along the face. A corner touch also turns the boat.
+The fender settings are in `vessel.yaml`'s `contact` section, and they are estimates: about 3000 N/m per point, a
+soft fender that stops the boat from 0.3 m/s in about 3 cm. RViz draws the fender forces as orange arrows (1 cm per N),
+and the total force is on `sim/contact`. A strong current or wind onto the quay now presses the boat against the
+fenders instead of through the quay.
+
+### 14. Lidar and the quay detector
+
+With Gazebo the boat carries its lidar: an Ouster OS1-32 at the calibrated mounting from the real boat (`vessel.yaml`
+`lidar`), rendered by Gazebo and published on `/ouster/points` as on the boat. The water is invisible to it, as
+near-infrared mostly is. A quay detector fits the quay face in each scan and the observer uses it:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk gazebo:=true x0:=1 y0:=-2 yaw0_deg:=100
+```
+
+`quay_detector_node.py` levels the cloud with the observer's roll and pitch. It drops the water, the boat's own hull
+and points outside 0.5-15 m, and fits a straight line with RANSAC. The map and the estimated pose say where the face
+should be, so only points within 0.5 m of that are used. Its output is `perception/quay`: the distance from the
+boat's centre to the face and the angle of the face's normal, with their uncertainties. The magenta line in RViz is
+the fit. In Gazebo the distance is right to 0.8 cm on the way in (2.9 cm at most) and 0.2 cm alongside, and the angle
+to 0.3 deg. Real data will be worse: no flat walls, wake, rain and mirror images in calm water.
+
+The observer matches each face to the mapped quay (within 0.5 m and 10 deg). It then corrects the position across
+the face and the heading, so near the quay the boat's distance to it comes from the lidar and only the position along
+it from GNSS. While faces keep coming (the last second), GNSS corrects only along the face
+(`quay.gnss_along_only`). With both on that axis the estimate ended halfway between them: with RTK and a 10 cm map
+error the DP still thought it had 5 cm left.
+
+The observer also keeps its estimate out of the mapped quays (`quay.constrain`). The fenders stop the boat with a
+force the model does not know. Without the constraint the estimate went on 5-9 cm into the quay after the boat
+touched, and took 10 s to come back. When the estimated hull is behind a quay face, the filter gets two
+pseudo-measurements: the position on the face, and no velocity into it. Alongside, the estimate's error went from
+4-5 cm to about 1 cm RMS.
+
+Two launch arguments test why the lidar matters:
+
+- `map_shift:="0.1 0.0"` moves the DP's quay map 10 cm north of the real quay. The simulator and Gazebo keep the true
+  one.
+- `multipath:=true` adds 0.1 m of noise and a slow 0.15 m bias to the GNSS within 3 m of a quay, while the receiver
+  keeps reporting RTK accuracy.
+
+`gz_gui:=false` runs Gazebo without its window (rendering headless, for tests), and `lidar:=false` leaves the lidar
+out.
+
+#### Seeing what the lidar does
+
+With RTK and a correct map there is nothing for the lidar to fix, so you will not see a difference. Give the DP a
+wrong map, dock, and switch the lidar off and on while the boat lies alongside:
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk gazebo:=true x0:=1 y0:=-2 yaw0_deg:=100 map_shift:="0.10 0.0"
+```
+
+```bash
+ros2 param set /microampere/dp_observer quay.enabled false
+```
+
+```bash
+ros2 param set /microampere/dp_observer quay.enabled true
+```
+
+`docking_viz_node.py` (started with any harbour) draws the RViz display "Sant mot tenkt": the true hull and the true
+quay in white, and in orange where the DP thinks the boat lies relative to the quay (the estimate minus the map
+error). Orange on top of white means the DP knows the gap. The text over the boat gives both gaps and whether lidar
+faces went into the filter. The yellow dots are the last 50 GNSS fixes, which scatter near the quay with
+`multipath:=true`. The same numbers are on `viz/gap_true` and `viz/gap_believed` for plotting in Foxglove.
+
+Alongside, with the map 10 cm off:
+
+| | DP thinks the gap is | true gap |
+|---|---|---|
+| lidar off | 9.3-11.3 cm | 0 (on the fender) |
+| lidar on | -0.8 to 0.1 cm | 0 |
+
+### 15. Timing: will it keep up on the boat's computer?
+
+The observer, the position controller, the allocation and the quay detector report how long their loops take on
+`/diagnostics`, the topic the boat's Foxglove layout shows in its Diagnostics tab. Each loop sends the mean, 95th
+percentile and largest compute time, the longest time between two calls, and its CPU share every two seconds. The
+docking and transit OCP solves are reported the same way (`cybership_utilities/loop_timing.py`).
+
+The boat's LattePanda Delta 3 has a Celeron N5105, about half as fast per core as a recent laptop, and it also
+runs the LEKF and the sensor nodes. `dp_prefix` puts the DP nodes on fewer cores, and `tools/timing_test.py` adds
+a busy loop on each of them:
+
+```bash
+python3 tools/timing_test.py --label laptop
+python3 tools/timing_test.py --cores 1 --burn --label half1
+```
+
+Three dockings in current onto the quay, each through the boat's topics with the LEKF input:
+
+| | laptop | 2 cores at half speed | 1 core at half speed |
+|---|---|---|---|
+| docked | 3/3 | 3/3 | 3/3 |
+| control loop, largest | 6.5 ms of 100 | 14.7 ms | 14.5 ms |
+| filter step, largest | 6.3 ms of 20 | 11.3 ms | 10.1 ms |
+| docking OCP, mean / largest | 0.54 / 0.88 s | 1.76 / 2.65 s | 1.95 / 3.25 s |
+| docking OCP solves | 6 | 14 | 15 |
+
+The loops have plenty of margin. The control loop does not stall while the OCP solves in its thread, because CasADi
+releases Python's GIL. The OCP was the limit: on a slow core it took up to 3 s, the boat drifted further from each
+plan before the next one arrived, and it needed twice as many.
+
+The docking OCP is now compiled to C. The first start of the position controller compiles it (about 30 s on the
+laptop, longer on the boat's computer) and caches the library in `~/.cache/cybership_dp`; later starts load it at
+once. Replans also warm start the multipliers. On one core at half speed a plan now takes 0.29 s on average and
+0.84 s at most (it was 1.95 and 3.25 s), and three dockings needed 10 plans instead of 15. To measure the solver
+alone:
+
+```bash
+python3 tools/docking_ocp_speed.py
+```
+
 ### Switching the controller off and on
 
 ```bash
@@ -256,6 +507,16 @@ Add them to the end of the `ros2 launch` line as `name:=value`. They are read on
 | `wave_dir` | `0` | deg | direction the waves travel towards |
 | `wind_speed` | `0` | m/s | mean wind speed |
 | `wind_dir` | `0` | deg | direction the wind blows towards |
+| `boat_interface` | `false` | | the real Microampere's topics (`blueboat_interfaces`): `/control/thrust` and `/actuator/azimuth_cmd` in, `/navigation/odometry/ned` and `/sensors/*` out; our DP speaks the team's interface (`/control/opmode`, `/goal_pose`, `/control/tau`, `/control/pose/*`), and the observer reads the LEKF odometry |
+| `boat_clock` | `ros` | | with `boat_interface`: stamps of the boat's topics, `ros` or `sentiboard` (epoch 2000, as on the boat) |
+| `foxglove` | `false` | | start `foxglove_bridge` on `ws://localhost:8765` |
+| `harbour` | `auto` | YAML | quays and berths for docking; `auto` = `cybership_config/config/<vessel>/harbour.yaml` if it exists |
+| `x0`, `y0`, `yaw0_deg` | `0` | m, m, deg | start pose (north, east, heading) |
+| `lidar` | `true` | | with `gazebo:=true`: the Ouster on `/ouster/points` and the quay detector |
+| `gz_gui` | `true` | | with `gazebo:=true`: the Gazebo window; `false` = server only, headless rendering |
+| `map_shift` | `0.0 0.0` | m, m | test: the DP's harbour map moved north, east from the true quay |
+| `multipath` | `false` | | test: GNSS multipath within 3 m of a quay |
+| `obstacles` | (none) | | YAML file with fixed round obstacles for the planner (`obstacles: [[x, y, r], ...]`); more can be clicked in RViz |
 | `tow` | `false` | | tow a load behind the boat (`vessel.yaml` `tow`: a 30 kg point mass on a 2 m towbar by default) |
 | `tow_model` | `true` | | with `tow`: the DP controller and the trajectory planner use the load's mass and drag in surge, and the observer takes the simulated load cell's force (`sensor/tow_force`) as a known input. Without `tow` none of this runs |
 | `use_gui` | `true` | | start RViz |
@@ -417,6 +678,14 @@ start = the boat now,  end = the goal pose with ν = 0
 
 Because T is one of the unknowns, the planner also decides how fast to go. The first term pays for time. The next three make sideways motion, turning and backing up expensive, and the last two charge for thrust and for changing it quickly, which keeps the thrusters calm. With the default weights (w_T 1, w_v 30, w_r 5, w_rev 8, w_f 2, w_df 20) the boat mostly turns while it drives and only crabs or backs up when that saves real time. For a turn on the spot there is one extra term that keeps the boat on its start point. With a towed load, the planner adds the load's mass and drag in surge.
 
+Obstacles are circles with centre (x_o, y_o) and radius r_o. The hull is covered by three circles along the centre line (`footprint` in `vessel.yaml`), and at every step each of them has to stay clear:
+
+```
+(x_c − x_o)² + (y_c − y_o)² ≥ (r_o + r_c + margin)²
+```
+
+This makes the problem non-convex, and IPOPT only finds the best plan near the guess it starts from. Which side to pass on therefore has to be decided before the solve. When an obstacle blocks the straight line, the planner builds one guess that swings out to port and one to starboard, tries the shorter one first and keeps the first plan that solves. It manages about 17 of 20 random cases with one to three obstacles. The ones it misses have obstacles packed close together at an angle to the course, and a proper search for the initial path (hybrid A*, as on milliAmpere) would fix those.
+
 IPOPT solves the problem in 0.2–3 s, in its own thread, while the boat keeps holding position. The controller then follows the planned pose, velocity and acceleration with model feedforward:
 
 ```
@@ -443,6 +712,8 @@ All topics are under the vessel name, for example `/microampere/sensor/gnss`. A 
 | `control/allocation/slack` | `geometry_msgs/Wrench` | allocation to the observer: the part of the commanded force the thrusters could not give |
 | `sim/odom_true` | `nav_msgs/Odometry` | true state from the simulator, for evaluation |
 | `sim/path_lf` | `nav_msgs/Path` | the track without wave motion, for RViz |
+| `guidance/obstacles` | `visualization_msgs/MarkerArray` | obstacle manager (or a future lidar node) to the controller and RViz: CYLINDER markers, centre in `world`, `scale.x` = diameter |
+| `guidance/plan` | `nav_msgs/Path` | the planned track, for RViz |
 | `sensor/tow_force` | `geometry_msgs/WrenchStamped` | simulated load cell to the observer: the bar force on the boat in the body frame (N), only with `tow:=true` |
 | `sim/tow/tension`, `sim/tow/odom`, `sim/tow/marker` | `std_msgs/Float64`, `nav_msgs/Odometry`, `visualization_msgs/Marker` | the towed load, for logging and RViz |
 
@@ -485,7 +756,7 @@ The unit tests check the boat model, the weather, the sensors, the Kalman filter
 - The wind areas come from the CAD model. The real boat's antennas and electronics are not in it.
 - There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.
 - Only one goal at a time; there are no waypoint routes yet.
-- The planner does not know about the dock or other obstacles yet, so the boat can plan straight through them. The dock in the Gazebo world is only drawn.
+- Obstacles are only round, and only moves up to 25 m avoid them; the Dubins/ALOS guidance for longer moves does not. The dock in the Gazebo world is only drawn, so put it in an `obstacles:=` file if you want the planner to respect it. A towed load is not part of the footprint either.
 - The towed load and how it is attached are guesses (a 30 kg float on a 2 m towbar). The planner and the controller only model it in surge, so in sharp turns the boat depends on the load cell and on feedback, and it settles a few seconds later than without the load.
 - The plan is made once per goal. On the way the boat lies up to about 20 cm behind it; planning again during the move (MPC) is the next step.
 

@@ -13,6 +13,7 @@
   <depend>foxglove_bridge</depend>
   <depend>topic_tools_interfaces</depend>
   <depend>std_srvs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>lifecycle_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>

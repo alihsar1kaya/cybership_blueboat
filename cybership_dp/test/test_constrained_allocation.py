@@ -136,3 +136,16 @@ def test_frozen_azimuth_does_not_fight_the_stern_thrusters():
     assert abs(math.degrees(alpha["bow_azimuth"])) == pytest.approx(180, abs=1.0)  # did not turn
     assert np.abs(f).max() <= 0.5 + 3.0 + 1e-6                                  # demand + threshold
     assert abs(slack[0]) < 0.05 and abs(slack[2]) < 0.05                        # surge and yaw still met
+
+
+def test_forward_only_azimuth_turns_around_instead_of_reversing():
+    """The real boat's azimuth only pushes forward (thrust >= 0): pointing the wrong way it must turn, not reverse."""
+    with open(os.path.join(REPO, "cybership_config", "config", "microampere", "vessel.yaml")) as f:
+        thrusters = yaml.safe_load(f)["thrusters"]
+    for t in thrusters:
+        if t["type"] == "azimuth":
+            t["reverse_ratio"] = 0.0
+    a = ConstrainedAllocator(thrusters)
+    f, alpha, _ = a.allocate([0, 20, 20 * 0.37], {"bow_azimuth": -math.pi / 2})   # to starboard, azimuth at port
+    assert alpha["bow_azimuth"] == pytest.approx(math.pi / 2, abs=0.05)
+    assert f[2] >= 0.0

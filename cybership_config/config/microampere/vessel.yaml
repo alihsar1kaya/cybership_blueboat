@@ -177,6 +177,62 @@ latency:
   imu: 0.005
   thrusters: 0.05
 
+# The real boat's own topics (TURLab blueboat_interfaces; launch boat_interface:=true): /control/thrust and
+# /actuator/azimuth_cmd in, /navigation/odometry/ned, /sensors/imu, /sensors/nav_pvt, ecef, nav_cov, rel_pos,
+# /control/opmode, /azimuth/state, /battery out (cybership_simulator/boat_interface.py). Numbers from the
+# boat's configs (blueboat_ws_ua_lp3: sensor_extrinsics.yaml, stim300.yaml, blueboat_lekf.yaml, 2026-10-09).
+boat_interface:
+  imu_position: [0.05, 0.0, -0.10]     # [m] BODY FRD from CO; blueboat_ua_description URDF (0.05, 0, 0.10 z up). ESTIMATE
+  antennas:                            # [m] BODY FRD from the IMU (SolidWorks; IMU frame FLU there, y and z flipped)
+    port: [-0.3579, -0.3073, -0.1219]       # moving base: /sensors/nav_pvt, ecef, nav_cov
+    starboard: [-0.3579, 0.3967, -0.1219]   # rover: /sensors/rel_pos (baseline 0.704 m)
+  rates: {imu: 100.0, gnss: 5.0, odometry: 50.0, azimuth: 20.0}   # [Hz]; the real STIM300 runs at 500
+  noise:
+    gyro_density: 4.36e-5              # [rad/s/sqrt(Hz)] STIM300 datasheet (stim300.yaml)
+    accel_density: 1.1667e-3           # [m/s^2/sqrt(Hz)]
+    odometry_position: 0.01            # [m] the LEKF's position with RTK fixed (ESTIMATE)
+    odometry_heading_deg: 0.2          # [deg] (ESTIMATE)
+    baseline: 0.01                     # [m] per axis, RTK moving-base baseline
+  pwm_map:                             # aft thrusters with ThrusterInputs.pwm = true (blueboat_simulator sim.yaml)
+    zero_us: 1500
+    min_us: 1100
+    max_us: 1900
+    positive_force_per_us: 0.132       # -> 52.8 N at 1900 us
+    negative_force_per_us: 0.0668      # -> -26.72 N at 1100 us
+    starboard_contra_rotating: true
+    port_contra_rotating: false
+  thrusters: {port: port, starboard: starboard, azimuth: bow_azimuth}   # our names for the boat's
+  azimuth_state_topic: /azimuth/state
+  turn_limit: 1.5                      # [turns] of the azimuth from 0 (cable), as blueboat_core_control
+
+# Footprint for obstacle avoidance (trajectory_planner.py): circles [x, y, radius] in BODY [m] that cover the
+# 1.2 x 0.93 m hull; the planner keeps each of them obstacle radius + guidance.ocp.obstacle_margin away.
+footprint: [[-0.3, 0.0, 0.47], [0.0, 0.0, 0.47], [0.3, 0.0, 0.47]]
+
+# Lidar: Ouster OS1-32 (TURLab blueboat_ws_ua_lp3 sensor_extrinsics.yaml, Jammertest 2026 calibration, in the IMU
+# frame FLU: [-0.039, -0.039, 0.423] m, yaw 2.07 deg). Here from the CO in BODY FLU (x forward, y port, z up):
+# IMU at FRD (0.05, 0, -0.10) = FLU (0.05, 0, 0.10), plus the lidar's offset. Used by the Gazebo sensor
+# (gz_pose_bridge) and the quay detector. On the boat the raw /ouster/points frame is turned by 180 deg (the
+# calibration is for the extracted-PCD frame): orientation_flu_deg would then be [0.12, 0.03, 182.07].
+lidar:
+  position_flu: [0.011, -0.039, 0.523]
+  orientation_flu_deg: [0.12, 0.03, 2.07]   # roll, pitch, yaw
+  channels: 32
+  vertical_fov_deg: 45.0
+  horizontal_samples: 512
+  rate: 10.0
+  range: [0.5, 50.0]
+  noise: 0.01                # [m] range noise (Ouster OS1: ~1-3 cm)
+
+# Fender contact with the quays in the harbour file (simulator, marine_craft/contact.py): points along the hull's
+# outline (length x beam) inside a quay are pushed out with F = max(0, k delta + c delta_dot) each, plus friction
+# along the face. ESTIMATES: a soft fender stops the 30 kg boat at 0.3 m/s in ~3 cm; measure the real fender.
+contact:
+  stiffness: 3000.0          # [N/m] per point
+  damping: 400.0             # [N s/m] per point
+  friction: 0.3              # Coulomb, rubber fender on the quay
+  points_per_side: 7
+
 # Towing (cybership_utilities/marine_craft/tow.py): a load behind the boat, launch with tow:=true. Default is a
 # point mass (a float without heading) on a rigid towbar pinned at both ends: it pulls and pushes and keeps the load
 # 2 m from the tow point. All values are ESTIMATES until the towing team says what they tow and how it is connected.

@@ -189,6 +189,21 @@ class AzimuthThruster(ThrusterConditions):
         self.pwm_curve = pwm                       # PwmThrusterCurve or None
         self._reverse = False                      # pushing in reverse along the angle
         self.pwm = None
+        self.angle_unwrapped = self.angle          # counts turns (the boat's stepper driver, set_angle_command)
+        self._unwrapped_target = None              # absolute angle to turn to, or None: the short way
+
+    def set_angle_command(self, thrust, angle):
+        """
+        Signed thrust [N] along an ABSOLUTE, unwrapped angle [rad], as the boat's azimuth driver takes it
+        (blueboat_interfaces/AzimuthTAngle): the stepper turns to exactly that angle, counting turns, so
+        a command one turn further round makes it swing a full turn.
+        """
+        signed = float(np.clip(thrust, -self.reverse_ratio * self.max_force, self.max_force))
+        if abs(signed) < self.deadband:
+            signed = 0.0
+        self._unwrapped_target = float(angle)
+        self.command = (signed, _wrap(angle))
+        return signed * math.cos(angle), signed * math.sin(angle)
 
     def set_command(self, fx, fy):
         """
@@ -217,6 +232,7 @@ class AzimuthThruster(ThrusterConditions):
                 alpha_d, signed = alpha_fwd, magnitude
         else:
             alpha_d, signed = self.command[1], 0.0
+        self._unwrapped_target = None
         signed = float(np.clip(signed, -self.reverse_ratio * self.max_force, self.max_force))
         if self.pwm_curve is not None:
             self.pwm = self.pwm_curve.to_pwm(signed)
@@ -228,9 +244,13 @@ class AzimuthThruster(ThrusterConditions):
 
     def step(self, dt):
         f_d, alpha_d = self.command
-        turn = _wrap(alpha_d - self.angle)
+        if self._unwrapped_target is None:
+            turn = _wrap(alpha_d - self.angle)          # the short way
+        else:
+            turn = self._unwrapped_target - self.angle_unwrapped
         if math.isfinite(self.max_rate):
             turn = float(np.clip(turn, -self.max_rate * dt, self.max_rate * dt))
+        self.angle_unwrapped += turn
         self.angle = _wrap(self.angle + turn)
         self.angle_rate = turn / dt if dt > 0 else 0.0
         self.force = _first_order(self.force, f_d, self.time_constant, dt)

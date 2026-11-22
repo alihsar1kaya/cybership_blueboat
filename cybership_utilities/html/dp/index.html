@@ -64,6 +64,7 @@
       <input id="heading" type="number" step="5" placeholder="behold nåværende kurs">
       <button class="primary" id="go" disabled>Kjør dit</button>
       <button class="secondary" id="hold">Hold her</button>
+      <button class="secondary" id="dock" title="Legg til kai (første anløpspunkt i havnefilen)">Legg til kai</button>
     </div>
 
     <div class="card" id="seacard" hidden>
@@ -198,6 +199,7 @@ const headingRad = () => headingDeg() === null ? (S && S.pose ? S.pose[2] : 0) :
 $("go").onclick = () => { if (!target) return; send({ cmd: "goal", x: target.x, y: target.y, heading_deg: headingDeg() });
                           target = null; $("go").disabled = true; $("target").textContent = "Mål sendt"; };
 $("hold").onclick = () => { target = null; send({ cmd: "hold" }); };
+$("dock").onclick = () => { target = null; send({ cmd: "dock" }); };
 $("stop").onclick = () => send({ cmd: S && S.stopped ? "resume" : "stop" });
 
 // --- sea --------------------------------------------------------------------------------------------

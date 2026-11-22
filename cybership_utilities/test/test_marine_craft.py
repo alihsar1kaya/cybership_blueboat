@@ -299,3 +299,21 @@ def test_current_is_still_water_seen_from_the_water():
     run(still, np.zeros(6), T)
     assert in_current.eta[0:3] == pytest.approx(still.eta[0:3] + v_c * T, abs=1e-6)
     assert in_current.eta[3:6] == pytest.approx(still.eta[3:6], abs=1e-9)
+
+
+def test_azimuth_follows_an_unwrapped_angle_the_long_way():
+    # the boat's stepper driver: a command one turn further round makes it swing the full turn
+    from cybership_utilities.marine_craft.actuators import AzimuthThruster
+    az = AzimuthThruster(max_force=50.0, max_rate=math.pi / 2)
+    az.set_angle_command(10.0, 2.0 * math.pi)
+    for _ in range(200):                     # 2 s at 90 deg/s: half way round
+        az.step(0.01)
+    assert az.angle_unwrapped == pytest.approx(math.pi, abs=1e-6)
+    for _ in range(300):
+        az.step(0.01)
+    assert az.angle_unwrapped == pytest.approx(2.0 * math.pi, abs=1e-6) and az.angle == pytest.approx(0.0, abs=1e-6)
+    # a normal (fx, fy) command goes the short way again
+    az.set_command(0.0, 10.0)
+    for _ in range(200):
+        az.step(0.01)
+    assert az.angle == pytest.approx(math.pi / 2, abs=1e-6)

@@ -41,7 +41,7 @@ from nav_msgs.msg import Odometry, Path
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, NavSatFix, NavSatStatus
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 import skadipy
 
 from cybership_simulator.base import BaseSimulator
@@ -49,6 +49,7 @@ from cybership_utilities import vessel_model
 from cybership_utilities.marine_craft.actuators import make_thruster, voltage_factor
 from cybership_utilities.marine_craft.environment import OceanCurrent, Wind
 from cybership_utilities.marine_craft.tow import TowedPointMass, tow_wrench, towed_from_config
+from cybership_utilities.marine_craft import contact as quay_contact
 from cybership_utilities.marine_craft.sensors import Gnss, gnss_config, make_sensors
 from cybership_utilities.marine_craft.waves import make_waves
 from cybership_utilities import hydro
@@ -65,7 +66,14 @@ class ConfigurableSimulator(BaseSimulator):
             self.allocator._b_matrix[3:5, :] = 0.0
         self._setup_environment()
         self._setup_tow()
+        self._setup_contact()
         self._setup_sensors()
+        # the real Microampere's own topics (vessel.yaml 'boat_interface', launch boat_interface:=true)
+        self.declare_parameter("boat_interface.enabled", False)
+        self._boat = None
+        if self.get_parameter("boat_interface.enabled").value:
+            from cybership_simulator.boat_interface import BoatInterface
+            self._boat = BoatInterface(self, self.config, self.get_parameter("sensors.gnss_profile").value)
         self._setup_thruster_model()
 
     # ------------------------------------------------------------------------
@@ -141,6 +149,89 @@ class ConfigurableSimulator(BaseSimulator):
                 self._hydro = data
         self._waves, self._waves_dirty = None, True
         self._pub_wave = self.create_publisher(Float64, "sim/environment/wave_elevation", 10)
+
+    # ------------------------------------------------------------------------
+    # Quays: fender contact (harbour file + vessel.yaml 'contact', marine_craft/contact.py)
+    # ------------------------------------------------------------------------
+
+    def _setup_contact(self):
+        """Quays from the harbour file (launch harbour:=auto) push the hull out through its fenders."""
+        self.declare_parameter("harbour_file", "")
+        self.declare_parameter("sensors.gnss.multipath", False)
+        self.declare_parameter("sensors.gnss.multipath_range", 3.0)      # [m] from a quay
+        self._mp_bias = np.zeros(2)
+        self._mp_error = np.zeros(2)        # the last fix's multipath error (NED), also on the boat's LEKF odometry
+        self._contact = None
+        path = self.get_parameter("harbour_file").value
+        self._pub_contact = self.create_publisher(geometry_msgs.msg.WrenchStamped, "sim/contact", 10)
+        self._pub_contact_marker = self.create_publisher(MarkerArray, "sim/contact/marker", 1)
+        if not path:
+            return
+        import yaml
+        with open(path) as f:
+            harbour = yaml.safe_load(f) or {}
+        hull = self.config["hull"]
+        self._contact = quay_contact.from_config(harbour, self.config.get("contact"), float(hull["length"]),
+                                                 float(hull["beam"]))
+        self._contact_tau = np.zeros(6)
+        self._contact_peak = 0.0
+        if self._contact is not None:
+            self.get_logger().info(f"Quay contact: {len(self._contact.quays)} quays from {path}, fender stiffness "
+                                   f"{self._contact.k:.0f} N/m per point, {len(self._contact.points)} points")
+
+    def _multipath(self, m, eta):
+        """
+        GNSS near the quays (sensors.gnss.multipath): within multipath_range of a quay the fix gets extra noise and
+        a slow Gauss-Markov bias, while the receiver keeps reporting its usual accuracy. Reflections off structures do
+        this to RTK (KU Leuven 2026: float fixes and >1 m jumps near bridges); the bias here is a mild case.
+        """
+        if not self.get_parameter("sensors.gnss.multipath").value or self._contact is None:
+            return m
+        p = np.array([eta[0], eta[1]])
+        dist = min(float(np.max(n @ p - d)) for n, d in self._contact.quays)    # outside a convex quay: > 0
+        dt = 1.0 / 5.0
+        a = math.exp(-dt / 20.0)
+        self._mp_bias = a * self._mp_bias + math.sqrt(1 - a * a) * 0.15 * self._noise_rng.normal(size=2)
+        if dist > float(self.get_parameter("sensors.gnss.multipath_range").value):
+            self._mp_error = np.zeros(2)
+            return m
+        e = self._mp_bias + self._noise_rng.normal(0.0, 0.10, 2)
+        self._mp_error = e
+        m = dict(m)
+        m["lat"] += math.degrees(e[0] / 6378137.0)
+        m["lon"] += math.degrees(e[1] / (6378137.0 * math.cos(math.radians(m["lat"]))))
+        return m
+
+    def _step_contact(self, publish):
+        e, n = self.vessel.eta, self.vessel.nu
+        tau = self._contact.forces([e[0], e[1], e[5]], [n[0], n[1], n[5]])
+        self._contact_tau = tau
+        f = math.hypot(tau[0], tau[1])
+        if f > 0.0 and self._contact_peak == 0.0:
+            self.get_logger().warn(f"Contact with the quay: {f:.1f} N")
+        self._contact_peak = f
+        if publish:
+            w = geometry_msgs.msg.WrenchStamped()
+            w.header.stamp, w.header.frame_id = self.get_clock().now().to_msg(), self._frame(self.body_frame_id)
+            w.wrench.force.x, w.wrench.force.y, w.wrench.torque.z = float(tau[0]), float(tau[1]), float(tau[5])
+            self._pub_contact.publish(w)
+            arr = MarkerArray()
+            clear = Marker()
+            clear.header.frame_id, clear.action = self.world_frame_id, Marker.DELETEALL
+            arr.markers.append(clear)
+            for i, (p, fn) in enumerate(self._contact.last):
+                m = Marker()
+                m.header.frame_id, m.header.stamp = self.world_frame_id, w.header.stamp
+                m.ns, m.id, m.type, m.action = "contact", i, Marker.ARROW, Marker.ADD
+                scale = 0.01                                     # 1 cm per N
+                m.points = [geometry_msgs.msg.Point(x=float(p[0]), y=float(p[1]), z=-0.2),
+                            geometry_msgs.msg.Point(x=float(p[0] + scale * fn[0]), y=float(p[1] + scale * fn[1]),
+                                                    z=-0.2)]
+                m.scale.x, m.scale.y, m.scale.z = 0.03, 0.06, 0.08
+                m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.5, 0.0, 1.0
+                arr.markers.append(m)
+            self._pub_contact_marker.publish(arr)
+        return tau
 
     # ------------------------------------------------------------------------
     # Towing: a load on a towbar or a line (vessel.yaml 'tow', launch tow:=true)
@@ -551,6 +642,8 @@ class ConfigurableSimulator(BaseSimulator):
             rtk_lost = self._gnss_float is not None and not self.get_parameter("sensors.gnss.rtk_fix").value
             gnss = self._gnss_float if rtk_lost else self._sensors["gnss"]
             m = gnss.update(t, eta, nu)
+            if m is not None:
+                m = self._multipath(m, eta)
             if m is not None and self._gnss_available(t):
                 fix = NavSatFix()
                 fix.header.stamp, fix.header.frame_id = stamp, self._frame("gnss_link")
@@ -630,6 +723,8 @@ class ConfigurableSimulator(BaseSimulator):
         if self._tow is not None:
             tau_ext = tau_ext + self._step_tow(publish_state)
             self._publish_load_cell()
+        if self._contact is not None:
+            tau_ext = tau_ext + self._step_contact(publish_state)
         self.vessel.tau_ext = tau_ext
         if self._waves_dirty:
             self._update_waves()
@@ -644,6 +739,8 @@ class ConfigurableSimulator(BaseSimulator):
         if publish_state:
             self._publish_environment()
         self._publish_sensors()
+        if self._boat is not None:
+            self._boat.step(self._step_count * self.dt)
         # water velocity relative to the hull in BODY (u_r, v_r), plus the yaw rate times the thruster's
         # position: the inflow of each propeller
         psi = self.vessel.eta[5]
