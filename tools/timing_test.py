@@ -18,9 +18,11 @@ solves; then each docking's result. Writes ~/ros_ws/results/timing_<label>.json.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -61,7 +63,8 @@ def run(case, cores, burn, domain, extra):
         args.append(f"dp_prefix:=taskset -c {cpus}")
     burners = [subprocess.Popen(["taskset", "-c", str(c), sys.executable, "-c", "while True: pass"],
                                 start_new_session=True) for c in (range(cores) if burn and cores else [])]
-    launch = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    log = tempfile.NamedTemporaryFile(prefix="timing_launch_", suffix=".log", delete=False)
+    launch = subprocess.Popen(args, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         diag = subprocess.Popen([sys.executable, "-c", DIAG, str(case["timeout"] + 100)], env=env,
                                 stdout=subprocess.PIPE, text=True, start_new_session=True)
@@ -83,7 +86,14 @@ def run(case, cores, burn, domain, extra):
             os.killpg(launch.pid, signal.SIGKILL)
     result = drt.measure(case, data)
     result.pop("log", None)
-    return dict(case, **result, diagnostics=rows)
+    # each docking plan from the controller's log: (plan duration, solve time, guess); failed replans as None
+    text = open(log.name, errors="replace").read()
+    log.close()
+    os.unlink(log.name)
+    solves = [(float(T), float(ts), g) for T, ts, g in
+              re.findall(r"Docking: plan ([\d.]+) s, solved in ([\d.]+) s \(([^)]*)\)", text)]
+    solves += [(None, None, "failed")] * len(re.findall(r"Docking: (?:re)?plan failed", text))
+    return dict(case, **result, diagnostics=rows, solves=solves)
 
 
 def summary(results):
@@ -131,9 +141,11 @@ def main():
         r = run(c, a.cores, a.burn, a.domain, a.arg)
         results.append(r)
         clear = r["min_clear"]
+        sv = [f"{ts:.1f}{'' if g_ == 'warm' else ' ' + g_}" if ts is not None else "failed" for _, ts, g_ in r["solves"]]
         print(f"  {i + 1}/{len(cases)} {c['env']:12s} {'DOCKED' if r['docked'] else 'not docked':10s} "
               f"t {r['t_dock'] if r['t_dock'] is None else round(r['t_dock'], 1)} s, approach clearance "
-              f"{'-' if clear is None else f'{clear:.3f}'} m ({time.time() - t:.0f} s)", flush=True)
+              f"{'-' if clear is None else f'{clear:.3f}'} m ({time.time() - t:.0f} s); plans [s]: {', '.join(sv)}",
+              flush=True)
     loops = summary(results)
     docked = sum(r["docked"] for r in results)
     print(f"docked {docked}/{len(results)}")

@@ -178,13 +178,22 @@ class PositionController(Node):
                 ('docking.max_start_distance', 10.0),    # [m] further from the berth: go to the stand-off first
                 ('docking.gap_margin', 0.02),            # [m] the plan keeps berth gap - this from the face
                 ('docking.corridor', [0.15, 0.5, 1.5]),  # approach funnel w0 + k1 gap + k2 gap^2 [m]
-                ('docking.heading_funnel_deg', [5.0, 30.0]),   # [deg, deg/m] lined up before close
+                # [deg, deg/m] lined up before close: |heading error| <= 3 deg + 15 deg/m gap. (5, 30) let the plan
+                # still turn 11 deg and back at 0.13 m/s 0.3 m off the face; with the DP's yaw lag a corner came
+                # within 0-2 cm of the quay from one start in current (3, 15: 6.5 cm and more, plans ~2 s longer)
+                ('docking.heading_funnel_deg', [3.0, 15.0]),
                 ('docking.replan_error', [0.25, 10.0]),  # [m, deg] off the plan by this much: plan again
                 ('docking.replan_min_interval', 2.0),    # [s]
                 ('docking.lock_gap', 1.0),               # [m] no new plans closer than this to the face
                 # alongside: push this hard towards the quay, so the boat rests on its fenders (0 = hold the berth
                 # 10 cm off with DP). Surge and yaw stay DP; across the face the force is max(push, DP's own)
                 ('docking.push_force', 8.0),             # [N]
+                # push on the fenders only once the boat lies at the berth: within [along the face, off the face] m
+                # of it (the hull's gap to the face), or this many seconds after the plan ended. Pushing as soon as
+                # the plan's time was up left a boat that lagged the plan 0.6 m along the face pressed on the fender,
+                # and the fender's friction let it slide to the berth at 2-3 cm/s
+                ('docking.alongside_tolerance', [0.15, 0.20]),
+                ('docking.alongside_timeout', 15.0),     # [s]
                 ('guidance.max_path_turn_deg', 270.0),
                 ('guidance.max_path_ratio', 0.0),
                 ('guidance.time_model.path', [6.0, 1.667, 3.82]),
@@ -1151,7 +1160,9 @@ class PositionController(Node):
         self._dock_ocps = {gap: DockingOCP.from_vessel_config(
             cfg, self._vessel_params, free_time=True, gap_min=gap - g('gap_margin'), corridor=tuple(g('corridor')),
             heading_funnel=(math.radians(hf[0]), math.radians(hf[1])), max_cpu_time=8.0,
-            # replans warm with the multipliers too: 18 instead of 52 iterations (tools/docking_ocp_speed.py)
+            # replans try the multipliers first (30 iterations at most), then the shifted plan alone: 0.08 s for a
+            # small offset, 0.14 s from 0.3 m / 10 deg (tools/docking_ocp_speed.py). On one slow core the typical
+            # replan time is what keeps the boat from chasing plans (0.1-0.5 s with, 0.4-2.8 s without)
             dual_warm=True)
             for gap in {b['gap'] for b in self._berths.values()}}
         self.create_subscription(String, 'guidance/dock', lambda m: self._start_dock(m.data), 10)
@@ -1304,6 +1315,7 @@ class PositionController(Node):
             d['result'] = None
             if 'solve_time' in res:
                 self._timing['dock'].record(res['solve_time'])
+                d['solve_time'] = res['solve_time']
             if res['ok']:
                 d['plan'] = dict(t=res['t'], eta=res['eta'], nu=res['nu'], nu_dot=res['nu_dot'], T=res['T'])
                 d['t_plan'], d['failures'] = res['t0'], 0
@@ -1329,6 +1341,19 @@ class PositionController(Node):
             return d['hold'] if d['hold'] is not None else np.array([x, y, yaw])
         if d['stage'] == 'track':
             eta_d, eta_dot, eta_ddot, done = trajectory_planner.sample(d['plan'], now - d['t_plan'])
+            out = -a / np.linalg.norm(a)
+            along = float(np.array([-out[1], out[0]]) @ (np.array([x, y]) - berth[:2]))
+            tol = g('alongside_tolerance')
+            late = now - d['t_plan'] - d['plan']['T']
+            if done and (abs(along) > tol[0] or gap_co > tol[1]) and late < g('alongside_timeout'):
+                # the plan is over but the boat is not at the berth yet: the DP takes it there before pushing
+                if d.get('reaching') is None:
+                    d['reaching'] = now
+                    self._reset_ref_filter(np.array([x, y, yaw]), np.zeros(3))
+                    self.get_logger().info(f"Docking: plan over, {along:+.2f} m along and {gap_co:.2f} m off the "
+                                           f"face; going to the berth before pushing")
+                self._traj = None
+                return berth.copy()
             if done:
                 self._traj = None
                 self._reset_ref_filter(berth.copy(), np.zeros(3))
@@ -1339,7 +1364,10 @@ class PositionController(Node):
                 return berth.copy()
             err = math.hypot(eta_d[0] - x, eta_d[1] - y), abs(wrap_to_pi(eta_d[2] - yaw))
             lim = g('replan_error')
-            if (not d['solving'] and not self._dock_solver_busy and now - d['last_solve'] >= g('replan_min_interval')
+            # at least replan_min_interval between plans, and 3 times the last solve (the plan's rule, step 6): on a
+            # slow computer a plan that took 1 s otherwise arrived with the boat off it again, and it chased plans
+            interval = max(g('replan_min_interval'), 3.0 * d.get('solve_time', 0.0))
+            if (not d['solving'] and not self._dock_solver_busy and now - d['last_solve'] >= interval
                     and gap_co >= g('lock_gap')
                     and (err[0] > lim[0] or err[1] > math.radians(lim[1]))):
                 self.get_logger().info(f"Docking: {err[0]:.2f} m / {math.degrees(err[1]):.0f} deg off the plan, "

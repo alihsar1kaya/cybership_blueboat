@@ -33,8 +33,9 @@ The plan is solved with plain nlpsol so T, the slack and the thrust are variable
 (short turn, long turn, straight in, then a two-stage solve without the quay first) or the last plan shifted.
 
 Speed (tools/docking_ocp_speed.py, 12 starts, laptop): compiled to C (compiled=True, cached in ~/.cache/cybership_dp)
-a cold plan takes 0.19 s (0.33 s at most) instead of 0.72 (1.26) s; a replan warm with the multipliers too
-(dual_warm) 0.04 (0.13) s instead of 0.47 (0.83) s.
+a cold plan takes 0.19 s (0.33 s at most) instead of 0.72 (1.26) s, a replan 0.3 m / 10 deg off the last plan
+0.14 (0.26) s. A warm start with the multipliers too (dual_warm) is faster only for small offsets (0.04 s), which
+never trigger a replan; from 0.3 m / 10 deg off it was slower and fell back to cold guesses.
 """
 import math
 import time
@@ -63,7 +64,7 @@ class DockingOCP:
                  substeps=4, u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0, gap_min=0.03, v0=0.05,
                  k_gap=0.25, weights=None, max_iter=300, max_cpu_time=3.0, relax_first=False, terminal="soft",
                  acceptable=False, T_max=60.0, corridor=None, dual_warm=False, heading_funnel=None,
-                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1"):
+                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4):
         self.M, self.dc = np.asarray(M, float), np.asarray(coeffs, float)
         self.L, self.Bh = float(hull[0]), float(hull[1])
         self.free_time, self.N, self.horizon, self.substeps = bool(free_time), int(N), float(horizon), int(substeps)
@@ -82,6 +83,10 @@ class DockingOCP:
         # warm start with the last solution's multipliers too, and a small barrier parameter (Bitar et al. 2020:
         # mu_init 1e-6); a primal-only warm start needed as many iterations as a cold one
         self.dual_warm = bool(dual_warm)
+        # with dual_warm a replan tries the multipliers first, for at most warm_max_iter iterations (those that
+        # converge take 10-20; from 0.3 m / 10 deg off the plan some did not, one went to 350), then the shifted
+        # plan alone (a primal warm start, IPOPT's own barrier), and only then the cold guesses
+        self.warm_max_iter, self.warm_mu_init = int(warm_max_iter), float(warm_mu_init)
         # heading funnel (h0 [rad], kh [rad/m]): |psi - psi_berth| <= h0 + kh gap, so the boat has turned to the berth
         # heading before it is close. Without it the plan could still be turning in the last half metre; the DP lags
         # in yaw, and the hull corners swung into the quay in the benchmark (docking_bench_v1)
@@ -276,7 +281,7 @@ class DockingOCP:
         warm = None
         if self.dual_warm:
             warm = ca.nlpsol("dock_warm", "ipopt", nlp, {**base, "ipopt": {
-                **ipopt, "warm_start_init_point": "yes", "mu_init": 1e-4, "warm_start_bound_push": 1e-6,
+                **ipopt, "max_iter": min(self.max_iter, self.warm_max_iter), "warm_start_init_point": "yes", "mu_init": self.warm_mu_init, "warm_start_bound_push": 1e-6,
                 "warm_start_mult_bound_push": 1e-6, "warm_start_slack_bound_push": 1e-6}})
         return SimpleNamespace(solver=solver, warm=warm, lbx=lbx, ubx=ubx, lbg=np.array(lbg), ubg=np.array(ubg),
                                nx=6 * (N + 1), nF=nf * N)
@@ -491,7 +496,9 @@ class DockingOCP:
             X0, F0, T0 = self._shift(elapsed, x0)
             psi_end = self.last["X"][2, -1]
             psi_end = x0[2] + (psi_end - x0[2]) + 2 * math.pi * round((short - psi_end) / (2 * math.pi))
-            tries.append(("warm", psi_end, (X0, F0, T0, self.last.get("lam"))))
+            if self.dual_warm and self.last.get("lam") is not None:
+                tries.append(("warm_dual", psi_end, (X0, F0, T0, self.last["lam"])))
+            tries.append(("warm", psi_end, (X0, F0, T0)))
         long_ = short - math.copysign(2 * math.pi, short - x0[2]) if abs(short - x0[2]) > 1e-3 else short + 2 * math.pi
         tries += [("short", short, None), ("long", long_, None), ("direct", short, None), ("relaxed", short, None)]
         for name, psi_b, guess in tries:
