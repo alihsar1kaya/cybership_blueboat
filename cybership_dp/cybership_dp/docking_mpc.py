@@ -64,7 +64,7 @@ class DockingOCP:
                  substeps=4, u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0, gap_min=0.03, v0=0.05,
                  k_gap=0.25, weights=None, max_iter=300, max_cpu_time=3.0, relax_first=False, terminal="soft",
                  acceptable=False, T_max=60.0, corridor=None, dual_warm=False, heading_funnel=None,
-                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4):
+                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4, replan_cold=False):
         self.M, self.dc = np.asarray(M, float), np.asarray(coeffs, float)
         self.L, self.Bh = float(hull[0]), float(hull[1])
         self.free_time, self.N, self.horizon, self.substeps = bool(free_time), int(N), float(horizon), int(substeps)
@@ -87,6 +87,10 @@ class DockingOCP:
         # converge take 10-20; from 0.3 m / 10 deg off the plan some did not, one went to 350), then the shifted
         # plan alone (a primal warm start, IPOPT's own barrier), and only then the cold guesses
         self.warm_max_iter, self.warm_mu_init = int(warm_max_iter), float(warm_mu_init)
+        # a replan (solve with elapsed) that fails warm does not try the cold guesses: the caller keeps the last plan
+        # and tries again later. The cold guesses took 10-26 s on a slow core and could turn the other way round
+        # in the middle of an approach; the first plan still tries them all
+        self.replan_cold = bool(replan_cold)
         # heading funnel (h0 [rad], kh [rad/m]): |psi - psi_berth| <= h0 + kh gap, so the boat has turned to the berth
         # heading before it is close. Without it the plan could still be turning in the last half metre; the DP lags
         # in yaw, and the hull corners swung into the quay in the benchmark (docking_bench_v1)
@@ -481,7 +485,8 @@ class DockingOCP:
         """
         x0 = [north, east, psi, u_r, v_r, r] (velocity THROUGH the water), berth = (north, east, psi), halfplane =
         (a, b) of the free water, vc = current NED [m/s], bias = observer bias NED [N, N, N m]. elapsed: seconds
-        since the last solve; then that solution, moved on, is the initial guess. Without one, or if it fails, a
+        since the last solve; then that solution, moved on, is the initial guess (with dual_warm its multipliers
+        first), and if it fails the result is not ok (replan_cold: then the cold guesses too). Without one, a
         geometric guess turning the short way round and, if that fails too, one turning the long way round.
         Returns a dict: ok, X, F, T, t, slack (largest), cost, solve_time, iterations, guess, and the plan as the
         DP tracking law takes it (eta, nu over ground, nu_dot).
@@ -500,7 +505,8 @@ class DockingOCP:
                 tries.append(("warm_dual", psi_end, (X0, F0, T0, self.last["lam"])))
             tries.append(("warm", psi_end, (X0, F0, T0)))
         long_ = short - math.copysign(2 * math.pi, short - x0[2]) if abs(short - x0[2]) > 1e-3 else short + 2 * math.pi
-        tries += [("short", short, None), ("long", long_, None), ("direct", short, None), ("relaxed", short, None)]
+        if not tries or self.replan_cold:
+            tries += [("short", short, None), ("long", long_, None), ("direct", short, None), ("relaxed", short, None)]
         for name, psi_b, guess in tries:
             b = np.array([berth[0], berth[1], psi_b])
             if guess is None:

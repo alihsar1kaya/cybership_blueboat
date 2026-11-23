@@ -1315,7 +1315,8 @@ class PositionController(Node):
             d['result'] = None
             if 'solve_time' in res:
                 self._timing['dock'].record(res['solve_time'])
-                d['solve_time'] = res['solve_time']
+                if res['ok']:
+                    d['solve_time'] = res['solve_time']      # for the replan interval: successful solves only
             if res['ok']:
                 d['plan'] = dict(t=res['t'], eta=res['eta'], nu=res['nu'], nu_dot=res['nu_dot'], T=res['T'])
                 d['t_plan'], d['failures'] = res['t0'], 0
