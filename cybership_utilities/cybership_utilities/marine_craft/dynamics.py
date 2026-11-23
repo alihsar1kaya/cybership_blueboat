@@ -73,7 +73,7 @@ def hoerner(B, T):
     return float(np.interp(B / (2.0 * T), _HOERNER_B_2T, _HOERNER_CD))
 
 
-def cross_flow_drag(L, B, T, nu_r, rho=1000.0, n=20):
+def cross_flow_drag(L, B, T, nu_r, rho=1025.0, n=20):
     """
     Cross-flow drag in sway and yaw by strip theory (Fossen 2021, Ch. 6):
 
@@ -98,7 +98,7 @@ class MarineCraft:
     _MUNK = {"roll": [(3, 1), (3, 2)], "pitch": [(4, 0), (4, 2)], "yaw": [(5, 0), (5, 1)]}
 
     def __init__(self, M_RB, M_A, D_L, G, *, surge_quadratic=0.0, yaw_quadratic=0.0,
-                 cross_flow=None, cancel_munk=(), rho=1000.0, eta0=None, nu0=None,
+                 cross_flow=None, cancel_munk=(), rho=1025.0, eta0=None, nu0=None,
                  surge_linear_decay=0.0, roll_quadratic_factor=0.0):
         self.M_RB = np.asarray(M_RB, dtype=float)
         self.M_A = np.asarray(M_A, dtype=float)
@@ -113,7 +113,7 @@ class MarineCraft:
         self.surge_linear_decay = float(surge_linear_decay)
         self.yaw_quadratic = float(yaw_quadratic)
         self.roll_quadratic_factor = float(roll_quadratic_factor)  # kappa_phi: K = D44 (1 + kappa |p|) p
-        self.cross_flow = cross_flow  # dict(length, beam, draft) or None
+        self.cross_flow = cross_flow  # dict(length, beam, draft[, factor]) or None
         self.cancel_munk = tuple(cancel_munk)  # e.g. ("yaw",) as in Fossen's Otter model
         self.rho = rho
         self.current_ned = np.zeros(3)  # [m/s] current velocity in NED (set by an environment model)
@@ -170,7 +170,8 @@ class MarineCraft:
         tau[3] -= self.roll_quadratic_factor * self.D_L[3, 3] * abs(nu_r[3]) * nu_r[3]
         if self.cross_flow:
             cf = self.cross_flow
-            tau += cross_flow_drag(cf["length"], cf["beam"], cf["draft"], nu_r, self.rho)
+            # factor: hulls that take cross-flow (2 for a catamaran without shielding; default 1, as otter.m)
+            tau += cf.get("factor", 1.0) * cross_flow_drag(cf["length"], cf["beam"], cf["draft"], nu_r, self.rho)
         return tau
 
     def derivatives(self, eta, nu, tau, tau_ext):

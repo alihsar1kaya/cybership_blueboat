@@ -64,7 +64,8 @@ class DockingOCP:
                  substeps=4, u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0, gap_min=0.03, v0=0.05,
                  k_gap=0.25, weights=None, max_iter=300, max_cpu_time=3.0, relax_first=False, terminal="soft",
                  acceptable=False, T_max=60.0, corridor=None, dual_warm=False, heading_funnel=None,
-                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4, replan_cold=False):
+                 speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4, replan_cold=False, scenarios=None,
+                 scenario_weights=None, robust_horizon=1):
         self.M, self.dc = np.asarray(M, float), np.asarray(coeffs, float)
         self.L, self.Bh = float(hull[0]), float(hull[1])
         self.free_time, self.N, self.horizon, self.substeps = bool(free_time), int(N), float(horizon), int(substeps)
@@ -91,6 +92,18 @@ class DockingOCP:
         # and tries again later. The cold guesses took 10-26 s on a slow core and could turn the other way round
         # in the middle of an approach; the first plan still tries them all
         self.replan_cold = bool(replan_cold)
+        # multi-stage (Krishnamoorthy L8 S30-36): scenarios = other models (M diag, damping coefficients) the boat may
+        # have; each gets its own trajectory, thrust and slack, all must keep the quay and funnel constraints, the
+        # thrust is shared for the first robust_horizon steps (non-anticipativity: the planner does not know yet which
+        # model is true), the cost is weighted over them (equal weights by default), T is shared. The plan the DP
+        # tracks is the nominal scenario's (the first). Free final time only.
+        self.scen = [(np.asarray(M, float), np.asarray(coeffs, float))] + [
+            (np.asarray(m_, float), np.asarray(c_, float)) for m_, c_ in (scenarios or [])]
+        wts = np.ones(len(self.scen)) if scenario_weights is None else np.asarray(scenario_weights, float)
+        self.scen_w = wts / wts.sum()
+        self.robust_horizon = int(robust_horizon)
+        if len(self.scen) > 1 and not self.free_time:
+            raise ValueError("multi-stage is for free_time plans only")
         # heading funnel (h0 [rad], kh [rad/m]): |psi - psi_berth| <= h0 + kh gap, so the boat has turned to the berth
         # heading before it is close. Without it the plan could still be turning in the last half metre; the DP lags
         # in yaw, and the hull corners swung into the quay in the benchmark (docking_bench_v1)
@@ -116,25 +129,31 @@ class DockingOCP:
         self.last = None                                    # the last solution, for the next warm start
 
     @classmethod
-    def from_vessel_config(cls, cfg, params, **kw):
+    def from_vessel_config(cls, cfg, params, scenario_params=(), **kw):
+        """scenario_params: model parameter sets (vessel_model.model_parameters, changed) for multi-stage scenarios."""
         M, coeffs = OCPPlanner.model_from_params(params)
+        if scenario_params:
+            kw["scenarios"] = [OCPPlanner.model_from_params(sp) for sp in scenario_params]
         hull = (float(cfg["hull"]["length"]), float(cfg["hull"]["beam"]))
         return cls(M, coeffs, cfg["thrusters"], hull=hull, **kw)
 
     # ---- model ------------------------------------------------------------------------------------------------
 
-    def _dynamics(self, x, f, vc, bias):
+    def _dynamics(self, x, f, vc, bias, M=None, dc=None):
+        """3DOF dynamics with the nominal model, or the given M (diag) and damping coefficients (a scenario)."""
+        M = self.M if M is None else M
+        dc = self.dc if dc is None else dc
         psi, u, v, r = x[2], x[3], x[4], x[5]
-        m11, m22, m33 = self.M
+        m11, m22, m33 = M
         sabs = lambda z: ca.sqrt(z * z + 1e-4)
-        d = [self.dc[0, 0] * u + self.dc[0, 1] * u * sabs(u),
-             self.dc[1, 0] * v + self.dc[1, 1] * v * sabs(v),
-             self.dc[2, 0] * r + self.dc[2, 1] * r * sabs(r)]
+        d = [dc[0, 0] * u + dc[0, 1] * u * sabs(u),
+             dc[1, 0] * v + dc[1, 1] * v * sabs(v),
+             dc[2, 0] * r + dc[2, 1] * r * sabs(r)]
         cor = [-m22 * v * r, m11 * u * r, (m22 - m11) * u * v]
         c, s = ca.cos(psi), ca.sin(psi)
         b_body = [c * bias[0] + s * bias[1], -s * bias[0] + c * bias[1], bias[2]]
         tau = ca.mtimes(ca.DM(self.B), f)
-        nu_dot = ca.vertcat(*[(tau[i] + b_body[i] - cor[i] - d[i]) / self.M[i] for i in range(3)])
+        nu_dot = ca.vertcat(*[(tau[i] + b_body[i] - cor[i] - d[i]) / M[i] for i in range(3)])
         eta_dot = ca.vertcat(c * u - s * v + vc[0], s * u + c * v + vc[1], r)
         return ca.vertcat(eta_dot, nu_dot)
 
@@ -154,7 +173,7 @@ class DockingOCP:
             pr = self._build_mapped(compiled=True)
             if pr is not None:
                 return pr
-        elif self.mapped:
+        if self.mapped or len(self.scen) > 1:
             return self._build_mapped()
         N, ns, w, b, nf = self.N, self.substeps, self.w, self.bounds, self.nf
         X = ca.SX.sym("X", 6, N + 1)
@@ -258,15 +277,15 @@ class DockingOCP:
             p_all = ca.vertcat(P, T)                       # the horizon is a parameter
         return self._finish(wvar, p_all, J, ca.vertcat(*g), lbg, ubg)
 
-    def _finish(self, wvar, p_all, J, g, lbg, ubg, compiled=False):
+    def _finish(self, wvar, p_all, J, g, lbg, ubg, compiled=False, n_scen=1):
         """Variable bounds and the IPOPT solvers for the NLP (wvar = [vec X, vec F, S, T]); compiled: from the cached
         shared library, None when it cannot be made."""
         N, b, nf = self.N, self.bounds, self.nf
         # velocity through the water: loose boxes (the limits over ground are the constraints above), yaw rate
-        lbx = np.concatenate([np.tile([-np.inf, -np.inf, -np.inf, -1.0, -0.6, -b["r_max"]], N + 1),
-                              np.tile(self.f_lb, N), np.zeros(N + 1)])
-        ubx = np.concatenate([np.tile([np.inf, np.inf, np.inf, 1.0, 0.6, b["r_max"]], N + 1),
-                              np.tile(self.f_ub, N), np.full(N + 1, np.inf)])
+        lbx = np.tile(np.concatenate([np.tile([-np.inf, -np.inf, -np.inf, -1.0, -0.6, -b["r_max"]], N + 1),
+                                      np.tile(self.f_lb, N), np.zeros(N + 1)]), n_scen)
+        ubx = np.tile(np.concatenate([np.tile([np.inf, np.inf, np.inf, 1.0, 0.6, b["r_max"]], N + 1),
+                                      np.tile(self.f_ub, N), np.full(N + 1, np.inf)]), n_scen)
         if self.free_time:
             lbx, ubx = np.append(lbx, 1.0), np.append(ubx, self.T_max)
         ipopt = {"print_level": 0, "sb": "yes", "max_iter": self.max_iter, "tol": 1e-4,
@@ -288,7 +307,7 @@ class DockingOCP:
                 **ipopt, "max_iter": min(self.max_iter, self.warm_max_iter), "warm_start_init_point": "yes", "mu_init": self.warm_mu_init, "warm_start_bound_push": 1e-6,
                 "warm_start_mult_bound_push": 1e-6, "warm_start_slack_bound_push": 1e-6}})
         return SimpleNamespace(solver=solver, warm=warm, lbx=lbx, ubx=ubx, lbg=np.array(lbg), ubg=np.array(ubg),
-                               nx=6 * (N + 1), nF=nf * N)
+                               nx=6 * (N + 1), nF=nf * N, n_scen=n_scen, nblock=6 * (N + 1) + nf * N + N + 1)
 
     def _compiled(self, nlp):
         """
@@ -335,15 +354,17 @@ class DockingOCP:
         x, f, fp = ca.SX.sym("x", 6), ca.SX.sym("f", nf), ca.SX.sym("fp", nf)
         h, vc, bias = ca.SX.sym("h"), ca.SX.sym("vc", 2), ca.SX.sym("bias", 3)
         s, berth, hp = ca.SX.sym("s"), ca.SX.sym("berth", 3), ca.SX.sym("hp", 3)
-        # one interval: ns RK4 substeps of length h
-        xk = x
-        for _ in range(ns):
-            k1 = self._dynamics(xk, f, vc, bias)
-            k2 = self._dynamics(xk + h / 2 * k1, f, vc, bias)
-            k3 = self._dynamics(xk + h / 2 * k2, f, vc, bias)
-            k4 = self._dynamics(xk + h * k3, f, vc, bias)
-            xk = xk + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
-        step = ca.Function("step", [x, f, h, vc, bias], [xk]).map(N)
+        # one interval: ns RK4 substeps of length h, one function per scenario's model
+        steps = []
+        for j, (M_j, dc_j) in enumerate(self.scen):
+            xk = x
+            for _ in range(ns):
+                k1 = self._dynamics(xk, f, vc, bias, M_j, dc_j)
+                k2 = self._dynamics(xk + h / 2 * k1, f, vc, bias, M_j, dc_j)
+                k3 = self._dynamics(xk + h / 2 * k2, f, vc, bias, M_j, dc_j)
+                k4 = self._dynamics(xk + h * k3, f, vc, bias, M_j, dc_j)
+                xk = xk + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            steps.append(ca.Function("step" if j == 0 else f"step{j}", [x, f, h, vc, bias], [xk]).map(N))
         # one stage's constraints (k = 1..N), in the inlined build's order
         gs, lo, hi = [], [], []
 
@@ -391,45 +412,64 @@ class DockingOCP:
              + w["df"] * ca.sumsqr(fn - fpn))
         stage_l = ca.Function("stage_l", [x, f, fp, vc], [l]).map(N)
 
-        X, F, S, T = ca.MX.sym("X", 6, N + 1), ca.MX.sym("F", nf, N), ca.MX.sym("S", N + 1), ca.MX.sym("T")
+        n_s = len(self.scen)
+        name = lambda base, j: base if j == 0 else f"{base}{j}"
+        Xs = [ca.MX.sym(name("X", j), 6, N + 1) for j in range(n_s)]
+        Fs = [ca.MX.sym(name("F", j), nf, N) for j in range(n_s)]
+        Ss = [ca.MX.sym(name("S", j), N + 1) for j in range(n_s)]
+        T = ca.MX.sym("T")
         P = ca.MX.sym("P", 6 + 3 + 2 + 3 + 3 + nf)
         x0, bP, vcP, biasP, hpP, f_prev = (P[0:6], P[6:9], P[9:11], P[11:14], P[14:17], P[17:17 + nf])
         dt = T / N
-        g = [X[:, 0] - x0, ca.vec(X[:, 1:] - step(X[:, :-1], F, dt / ns, vcP, biasP))]
-        lbg, ubg = [0.0] * (6 * (N + 1)), [0.0] * (6 * (N + 1))
-        for j, fmax in self.azimuth_idx:
-            g.append((F[j, :] ** 2 + F[j + 1, :] ** 2).T)
-            lbg += [-ca.inf] * N
-            ubg += [fmax ** 2] * N
-        g.append(ca.vec(stage_g(X[:, 1:], S[1:].T, bP, hpP, vcP)))
-        lbg += lo * N
-        ubg += hi * N
-        J = w["slack"] * (ca.sum1(S) + ca.sumsqr(S))
-        J += dt * ca.sum2(stage_l(X[:, :-1], F, ca.horzcat(f_prev, F[:, :-1]), vcP))
+        g, lbg, ubg, J = [], [], [], 0
+        for j in range(n_s):
+            X, F, S = Xs[j], Fs[j], Ss[j]
+            g += [X[:, 0] - x0, ca.vec(X[:, 1:] - steps[j](X[:, :-1], F, dt / ns, vcP, biasP))]
+            lbg += [0.0] * (6 * (N + 1))
+            ubg += [0.0] * (6 * (N + 1))
+            for ja, fmax in self.azimuth_idx:
+                g.append((F[ja, :] ** 2 + F[ja + 1, :] ** 2).T)
+                lbg += [-ca.inf] * N
+                ubg += [fmax ** 2] * N
+            g.append(ca.vec(stage_g(X[:, 1:], S[1:].T, bP, hpP, vcP)))
+            lbg += lo * N
+            ubg += hi * N
+            if j > 0 and self.robust_horizon > 0:           # non-anticipativity: the first inputs are shared
+                nr = min(self.robust_horizon, N)
+                g.append(ca.vec(F[:, :nr] - Fs[0][:, :nr]))
+                lbg += [0.0] * (nf * nr)
+                ubg += [0.0] * (nf * nr)
+            Jj = w["slack"] * (ca.sum1(S) + ca.sumsqr(S))
+            Jj += dt * ca.sum2(stage_l(X[:, :-1], F, ca.horzcat(f_prev, F[:, :-1]), vcP))
+            if self.free_time:
+                ugN, vgN = self._ground(X[:, N], vcP)
+                if self.terminal == "hard":
+                    g += [X[:3, N] - bP, ca.vertcat(ugN, vgN, X[5, N])]
+                    lbg += [0.0] * 6
+                    ubg += [0.0] * 6
+                else:
+                    Jj += w.get("term", 1e3) * ((X[0, N] - bP[0]) ** 2 + (X[1, N] - bP[1]) ** 2
+                                                + 2 * (1 - ca.cos(X[2, N] - bP[2])) + ugN ** 2 + vgN ** 2
+                                                + X[5, N] ** 2)
+            else:
+                dl = w["p_delta"]
+                for k in range(1, N + 1):
+                    d2 = (X[0, k] - bP[0]) ** 2 + (X[1, k] - bP[1]) ** 2
+                    huber = dl ** 2 * (ca.sqrt(1 + d2 / dl ** 2) - 1)
+                    head = 1 - ca.cos(X[2, k] - bP[2])
+                    ugk, vgk = self._ground(X[:, k], vcP)
+                    if k < N:
+                        Jj += dt * (w["p"] * huber + w["psi"] * head + w["u"] * ugk ** 2)
+                    else:
+                        Jj += w["p_N"] * d2 + w["psi_N"] * head + w["vel_N"] * (ugk ** 2 + vgk ** 2 + X[5, k] ** 2)
+            J += (Jj if n_s == 1 else float(self.scen_w[j]) * Jj)
+        blocks = [ca.vertcat(ca.vec(Xs[j]), ca.vec(Fs[j]), Ss[j]) for j in range(n_s)]
         if self.free_time:
             J += w["T"] * T
-            ugN, vgN = self._ground(X[:, N], vcP)
-            if self.terminal == "hard":
-                g += [X[:3, N] - bP, ca.vertcat(ugN, vgN, X[5, N])]
-                lbg += [0.0] * 6
-                ubg += [0.0] * 6
-            else:
-                J += w.get("term", 1e3) * ((X[0, N] - bP[0]) ** 2 + (X[1, N] - bP[1]) ** 2
-                                           + 2 * (1 - ca.cos(X[2, N] - bP[2])) + ugN ** 2 + vgN ** 2 + X[5, N] ** 2)
-            wvar, p_all = ca.vertcat(ca.vec(X), ca.vec(F), S, T), P
+            wvar, p_all = ca.vertcat(*blocks, T), P
         else:
-            dl = w["p_delta"]
-            for k in range(1, N + 1):
-                d2 = (X[0, k] - bP[0]) ** 2 + (X[1, k] - bP[1]) ** 2
-                huber = dl ** 2 * (ca.sqrt(1 + d2 / dl ** 2) - 1)
-                head = 1 - ca.cos(X[2, k] - bP[2])
-                ugk, vgk = self._ground(X[:, k], vcP)
-                if k < N:
-                    J += dt * (w["p"] * huber + w["psi"] * head + w["u"] * ugk ** 2)
-                else:
-                    J += w["p_N"] * d2 + w["psi_N"] * head + w["vel_N"] * (ugk ** 2 + vgk ** 2 + X[5, k] ** 2)
-            wvar, p_all = ca.vertcat(ca.vec(X), ca.vec(F), S), ca.vertcat(P, T)
-        return self._finish(wvar, p_all, J, ca.vertcat(*g), lbg, ubg, compiled=compiled)
+            wvar, p_all = ca.vertcat(*blocks), ca.vertcat(P, T)
+        return self._finish(wvar, p_all, J, ca.vertcat(*g), lbg, ubg, compiled=compiled, n_scen=n_s)
 
     # ---- initial guesses --------------------------------------------------------------------------------------
 
@@ -539,7 +579,7 @@ class DockingOCP:
         X0[2] = x0[2] + np.unwrap(X0[2] - x0[2])           # the guess's heading on the start's branch
         p = np.concatenate([x0, berth, vc, bias, [halfplane[0][0], halfplane[0][1], halfplane[1]],
                             np.zeros(nf) if f_prev is None else f_prev])
-        w0 = np.concatenate([X0.T.ravel(), np.asarray(F0).T.ravel(), np.zeros(N + 1)])
+        w0 = np.tile(np.concatenate([X0.T.ravel(), np.asarray(F0).T.ravel(), np.zeros(N + 1)]), pr.n_scen)
         if self.free_time:
             w0 = np.append(w0, T0)
         else:
@@ -554,11 +594,13 @@ class DockingOCP:
         wopt = np.array(sol["x"]).ravel()
         X = wopt[:pr.nx].reshape(N + 1, 6).T
         F = wopt[pr.nx:pr.nx + pr.nF].reshape(N, nf).T
-        S = wopt[pr.nx + pr.nF:pr.nx + pr.nF + N + 1]
+        # slack and trajectories of every scenario (the first is the nominal plan)
+        S = np.concatenate([wopt[j * pr.nblock + pr.nx + pr.nF:(j + 1) * pr.nblock] for j in range(pr.n_scen)])
+        X_scen = [wopt[j * pr.nblock:j * pr.nblock + pr.nx].reshape(N + 1, 6).T for j in range(pr.n_scen)]
         T = float(wopt[-1]) if self.free_time else self.horizon
         ok = bool(st["success"]) or (self.acceptable and st.get("return_status") == "Solved_To_Acceptable_Level")
         t_eval = sum(float(v) for k, v in st.items() if k.startswith("t_wall_nlp_"))   # CasADi's function evaluations
-        return dict(ok=ok, X=X, F=F, T=T, t=np.linspace(0.0, T, N + 1), slack=float(np.max(S)),
+        return dict(ok=ok, X=X, F=F, T=T, t=np.linspace(0.0, T, N + 1), slack=float(np.max(S)), X_scen=X_scen,
                     t_eval=t_eval, t_wall=float(st.get("t_wall_total", 0.0)),
                     lam=(np.array(sol["lam_x"]).ravel(), np.array(sol["lam_g"]).ravel()),
                     cost=float(sol["f"]), iterations=int(st.get("iter_count", 0)), status=st.get("return_status", ""))

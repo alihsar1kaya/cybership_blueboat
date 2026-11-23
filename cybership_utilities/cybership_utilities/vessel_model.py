@@ -97,7 +97,7 @@ def added_mass_matrix(model, config_path=""):
         f"power-based A_eq, B_eq, w_p {h['wave_peak_frequency']} rad/s, w <= {w_max}, {os.path.basename(path)}"
 
 
-def model_parameters(config, rho=1000.0, g=9.81):
+def model_parameters(config, rho=1000.0, g=9.81):   # rho only for the box mass, as shoeboxpy
     """
     Return the 6DOF model plus the nonlinear terms:
     {'mass', 'inertia' (3), 'cg' (3), 'MRB' (6x6), 'MA' (6x6), 'B_eq' (6x6), 'D' (6x6, linear),
@@ -204,7 +204,7 @@ def _fossen_damping(d, M, G, B_eq=None):
     return D, extra
 
 
-def make_marine_craft(params, eta0=None, nu0=None, rho=1000.0):
+def make_marine_craft(params, eta0=None, nu0=None, rho=1025.0):
     """Build the Fossen marine craft model (cybership_utilities.marine_craft) from model_parameters()."""
     from cybership_utilities.marine_craft import MarineCraft
     nl = params["nonlinear"]

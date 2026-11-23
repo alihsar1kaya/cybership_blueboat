@@ -77,10 +77,34 @@ ENVIRONMENTS = {
 # plant, sensors, observer
 # ---------------------------------------------------------------------------------------------------------------
 
+def sway_variant(params, which):
+    """
+    The model parameters with other sway hydrodynamics (docs/project_log.md 23.11 (2)): "nominal" unchanged (A22 130 kg,
+    D22 = M22 / 1 s = 171 N s/m, cross-flow on one hull); "physical" = skin friction only in the linear term (10 N s/m)
+    and cross-flow on both hulls, the lee hull half shielded (x1.5); "team" = the team's Gazebo-default sway (A22 12.7
+    kg, D22 7.4 N s/m, quadratic 54 N s^2/m^2 ~ 0.19 of one hull's cross-flow).
+    """
+    if which == "nominal":
+        return params
+    p = dict(params)
+    p["MA"], p["D"] = params["MA"].copy(), params["D"].copy()
+    nl = dict(params["nonlinear"])
+    cf = dict(nl["cross_flow"])
+    if which == "physical":
+        p["D"][1, 1], cf["factor"] = 10.0, 1.5
+    elif which == "team":
+        p["MA"][1, 1], p["D"][1, 1], cf["factor"] = 12.7, 7.364, 0.19
+    else:
+        raise ValueError(f"sway model {which}")
+    nl["cross_flow"] = cf
+    p["nonlinear"] = nl
+    return p
+
+
 class Plant:
     """The simulator's physics: 6DOF craft, thrusters with latency, current and wind."""
 
-    def __init__(self, cfg, params, eta0, env, rng, k_mass=1.0, k_damp=1.0, latency=0.05):
+    def __init__(self, cfg, params, eta0, env, rng, k_mass=1.0, k_damp=1.0, latency=0.05, sway_model="nominal"):
         p = dict(params)
         p["MA"] = params["MA"] * k_mass
         p["D"] = params["D"] * k_damp
@@ -89,6 +113,7 @@ class Plant:
         for k in ("surge_quadratic", "yaw_quadratic"):
             nl[k] = nl[k] * k_damp
         p["nonlinear"] = nl
+        p = sway_variant(p, sway_model)
         self.craft = vessel_model.make_marine_craft(p, eta0=[eta0[0], eta0[1], 0, 0, 0, eta0[2]])
         tm = cfg.get("thruster_model") or {}
         self.thrusters = cfg["thrusters"]
@@ -168,13 +193,15 @@ class Plant:
 class Navigation:
     """RTK GNSS + compass into our DP Kalman filter, as dp_observer_node runs it."""
 
-    def __init__(self, params, rng, sigma_gnss=0.02, gnss_rate=5.0, gnss_delay=0.1, sigma_psi_deg=0.5,
+    def __init__(self, params, rng, sigma_gnss=0.02, gnss_rate=5.0, gnss_delay=0.1, sigma_psi_deg=0.5, q_nu_scale=1.0,
+                 q_bias_scale=1.0,
                  multipath=None):
         craft = vessel_model.make_marine_craft(params)
         idx = [0, 1, 5]
         damping = lambda nu: -craft.damping(np.array([nu[0], nu[1], 0, 0, 0, nu[2]]))[idx]
         kf = DPKalmanFilter(vessel_model.M_eff_3dof(params), vessel_model.D_3dof(params),
-                            q_bias=[0.2, 0.2, 0.02], q_nu=[0.05, 0.05, 0.005], damping=damping,
+                            q_bias=list(np.array([0.2, 0.2, 0.02]) * q_bias_scale),
+                            q_nu=list(np.array([0.05, 0.05, 0.005]) * q_nu_scale), damping=damping,
                             current={"q": 1e-5, "p0": 0.04})
         self.kf = kf
         self.obs = AsyncObserver(kf, 0.02, math.radians(sigma_psi_deg))
@@ -249,12 +276,15 @@ class Navigation:
 class DPLaw:
     """position_control_node._model_based_tau with bias feedforward and the current in the feedforward."""
 
-    def __init__(self, params, omega_n=(0.45, 0.6, 1.0), zeta=(0.9, 0.9, 0.9)):
+    def __init__(self, params, omega_n=(0.45, 0.6, 1.0), zeta=(0.9, 0.9, 0.9), kd_full=False, damping_ff=1.0):
         self.M = vessel_model.M_eff_3dof(params)
         m, d = np.diag(self.M), np.diag(vessel_model.D_3dof(params))
         w, z = np.asarray(omega_n), np.asarray(zeta)
-        self.Kp, self.Kd = m * w ** 2, np.maximum(2 * z * m * w - d, 0.0)
+        # kd_full: the closed-loop damping from the gain alone, not counting on the model's hull damping (which in
+        # sway is an assumption: with it subtracted, Kd22 is 14 N s/m and a less damped hull leaves the loop at zeta 0.3)
+        self.Kp, self.Kd = m * w ** 2, (2 * z * m * w if kd_full else np.maximum(2 * z * m * w - d, 0.0))
         self.craft = vessel_model.make_marine_craft(params)
+        self.damping_ff = float(damping_ff)                    # scale on the damping feedforward (1 = the model)
 
     def tau(self, est, eta_d, eta_d_dot, eta_d_ddot):
         psi = est["eta"][2]
@@ -266,7 +296,7 @@ class DPLaw:
         nu_c = R.T @ np.array([est["vc"][0], est["vc"][1], 0.0])
         nu_c_dot = -nu_d[2] * np.array([-nu_c[1], nu_c[0], 0.0])
         nu_rd, nu_rd_dot = nu_d - nu_c, nu_d_dot - nu_c_dot
-        damping_ff = -self.craft.damping(np.array([nu_rd[0], nu_rd[1], 0, 0, 0, nu_rd[2]]))[[0, 1, 5]]
+        damping_ff = -self.damping_ff * self.craft.damping(np.array([nu_rd[0], nu_rd[1], 0, 0, 0, nu_rd[2]]))[[0, 1, 5]]
         return self.M @ nu_rd_dot + damping_ff + self.Kp * (R.T @ e) + self.Kd * (nu_d - est["nu"]) - R.T @ est["bias"]
 
 
@@ -499,6 +529,14 @@ def make_strategy(name, cfg, params, belief, cpu_factor):
     the DP law; replan_pred: replanned from the previous plan's state while the boat follows it; *_nofunnel: the
     same without the funnel. nmpc: fixed 10 s horizon straight to the allocation.
     """
+    # *_ms: multi-stage with a second scenario, the physical sway estimate (robust horizon 1 step); *_msr: the same
+    # with the whole horizon shared (one thrust sequence that must work for both models)
+    ms = {}
+    if name.endswith("_msr") or name.endswith("_ms"):
+        ms = dict(scenario_params=[sway_variant(params, "physical")], robust_horizon=1)
+        if name.endswith("_msr"):
+            ms["robust_horizon"] = 40
+        name = name.rsplit("_", 1)[0]
     speed = SPEED_FUNNEL if name.endswith("_speed") else None
     name = name.replace("_speed", "")
     base = name.replace("_nofunnel", "").replace("_noheading", "")
@@ -506,7 +544,7 @@ def make_strategy(name, cfg, params, belief, cpu_factor):
     heading = None if name.endswith("_nofunnel") or name.endswith("_noheading") else HEADING_FUNNEL
     if base in ("plan_once", "replan", "replan_pred", "replan_event", "replan_event_lock"):
         ocp = DockingOCP.from_vessel_config(cfg, params, free_time=True, gap_min=GAP - 0.02, max_cpu_time=8.0,
-                                            corridor=corridor, heading_funnel=heading, speed_funnel=speed)
+                                            corridor=corridor, heading_funnel=heading, speed_funnel=speed, **ms)
         return PlanStrategy(ocp, belief, replan=(0.0 if base == "plan_once" else 2.0), cpu_factor=cpu_factor,
                             from_plan=(base == "replan_pred"), event=base.startswith("replan_event"),
                             lock_gap=(1.0 if base == "replan_event_lock" else 0.0))
@@ -544,12 +582,21 @@ def run(job):
     quay = Quay(QUAY)
     berth = quay.berth(FACE, SIDE, GAP, (L, B))             # the TRUE berth: what success is measured against
     k_mass, k_damp = rng.uniform(0.8, 1.2), rng.uniform(0.8, 1.2)
-    plant = Plant(cfg, params, start, ENVIRONMENTS[env_name], rng, k_mass, k_damp)
-    nav = Navigation(params, rng, multipath=(quay, FACE, (L, B)) if opts.get("multipath") else None)
-    law, alloc = DPLaw(params), Allocation(cfg)
+    plant = Plant(cfg, params, start, ENVIRONMENTS[env_name], rng, k_mass, k_damp,
+                  sway_model=opts.get("sway_model", "nominal"))
+    base = params
+    params = sway_variant(base, opts.get("model_sway", "nominal"))    # what the planner, DP and observer believe
+    # one block at a time with another sway model (to find which block's model error matters)
+    p_obs = sway_variant(base, opts["obs_sway"]) if opts.get("obs_sway") else params
+    p_dp = sway_variant(base, opts["dp_sway"]) if opts.get("dp_sway") else params
+    nav = Navigation(p_obs, rng, multipath=(quay, FACE, (L, B)) if opts.get("multipath") else None,
+                     q_nu_scale=opts.get("q_nu_scale", 1.0), q_bias_scale=opts.get("q_bias_scale", 1.0))
+    law = DPLaw(p_dp, kd_full=opts.get("kd_full", False), damping_ff=opts.get("damping_ff", 1.0))
+    alloc = Allocation(cfg)
     belief = QuayBelief(quay, FACE, (L, B), rng, map_err=opts.get("map_err", 0.0), lidar=opts.get("lidar", False))
     nav.true_face = (quay.normals[FACE], quay.offsets[FACE])
-    strat = make_strategy(strategy, cfg, params, belief, cpu_factor)
+    strat = make_strategy(strategy, cfg, sway_variant(base, opts["ocp_sway"]) if opts.get("ocp_sway") else params,
+                          belief, cpu_factor)
     tau_alloc, tau_cmd = np.zeros(3), np.zeros(3)
     t_start, t = 3.0, 0.0                          # the observer settles first (hold position)
     rec = dict(min_clear=np.inf, max_towards_near=0.0, co_towards_near=0.0, yaw_rate_near=0.0, energy=0.0,
@@ -712,6 +759,17 @@ def main():
     ap.add_argument("--multipath", action="store_true")
     ap.add_argument("--lidar", action="store_true")
     ap.add_argument("--lidar-obs", action="store_true")
+    ap.add_argument("--model-sway", default="nominal", choices=["nominal", "physical", "team"],
+                    help="the sway hydrodynamics the planner, DP and observer use")
+    for blk in ("obs", "dp", "ocp"):
+        ap.add_argument(f"--{blk}-sway", default="", choices=["", "nominal", "physical", "team"],
+                        help=f"sway model of the {blk} block only (overrides --model-sway there)")
+    ap.add_argument("--q-nu-scale", type=float, default=1.0, help="observer velocity process noise x this")
+    ap.add_argument("--q-bias-scale", type=float, default=1.0, help="observer bias process noise x this")
+    ap.add_argument("--damping-ff", type=float, default=1.0, help="scale on the DP's damping feedforward")
+    ap.add_argument("--kd-full", action="store_true", help="DP D-gain 2 zeta wn m, not minus the model's damping")
+    ap.add_argument("--sway-model", default="nominal", choices=["nominal", "physical", "team"],
+                    help="the plant's true sway hydrodynamics (the planner, DP and observer keep the model)")
     ap.add_argument("--out", default=os.path.expanduser("~/ros_ws/results/docking_bench"))
     a = ap.parse_args()
     cfg, _ = vessel_model.load_vessel_config("microampere")
@@ -721,7 +779,10 @@ def main():
     if a.quick:
         envs, n_starts = ["calm", "current_on"], 2
     starts = starts_for(berth, n_starts, seed=7)
-    opts = dict(thrusters=a.thrusters, map_err=a.map_err, multipath=a.multipath, lidar=a.lidar, lidar_obs=a.lidar_obs)
+    opts = dict(thrusters=a.thrusters, map_err=a.map_err, multipath=a.multipath, lidar=a.lidar, lidar_obs=a.lidar_obs,
+                sway_model=a.sway_model, kd_full=a.kd_full, model_sway=a.model_sway, damping_ff=a.damping_ff,
+                obs_sway=a.obs_sway, dp_sway=a.dp_sway, ocp_sway=a.ocp_sway,
+                q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale)
     jobs = [(s, e, st, 1000 * i + j, a.cpu_factor, a.t_max, opts)
             for s in a.strategies.split(",") for i, e in enumerate(envs) for j, st in enumerate(starts)]
     t0 = time.time()
