@@ -83,10 +83,10 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 **4. Start the simulator with a load:**
 
 ```bash
-ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true harbour:="" web:=false
 ```
 
-RViz opens. The orange ball is the load. Click **2D Goal Pose** on the map to move the boat. `Ctrl+C` stops it.
+`harbour:=""` leaves out the quay and docking, `web:=false` the web GUI. RViz opens. The orange ball is the load. Click **2D Goal Pose** on the map to move the boat. `Ctrl+C` stops it.
 
 **5. Add weather** at the end of the launch line:
 
