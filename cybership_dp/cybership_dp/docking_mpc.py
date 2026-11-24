@@ -96,14 +96,13 @@ class DockingOCP:
         # have; each gets its own trajectory, thrust and slack, all must keep the quay and funnel constraints, the
         # thrust is shared for the first robust_horizon steps (non-anticipativity: the planner does not know yet which
         # model is true), the cost is weighted over them (equal weights by default), T is shared. The plan the DP
-        # tracks is the nominal scenario's (the first). Free final time only.
+        # tracks is the nominal scenario's (the first); an NMPC (free_time False) applies the shared first input.
         self.scen = [(np.asarray(M, float), np.asarray(coeffs, float))] + [
             (np.asarray(m_, float), np.asarray(c_, float)) for m_, c_ in (scenarios or [])]
         wts = np.ones(len(self.scen)) if scenario_weights is None else np.asarray(scenario_weights, float)
         self.scen_w = wts / wts.sum()
         self.robust_horizon = int(robust_horizon)
-        if len(self.scen) > 1 and not self.free_time:
-            raise ValueError("multi-stage is for free_time plans only")
+
         # heading funnel (h0 [rad], kh [rad/m]): |psi - psi_berth| <= h0 + kh gap, so the boat has turned to the berth
         # heading before it is close. Without it the plan could still be turning in the last half metre; the DP lags
         # in yaw, and the hull corners swung into the quay in the benchmark (docking_bench_v1)
@@ -286,6 +285,11 @@ class DockingOCP:
                                       np.tile(self.f_lb, N), np.zeros(N + 1)]), n_scen)
         ubx = np.tile(np.concatenate([np.tile([np.inf, np.inf, np.inf, 1.0, 0.6, b["r_max"]], N + 1),
                                       np.tile(self.f_ub, N), np.full(N + 1, np.inf)]), n_scen)
+        # no box on the first state: it is the estimate (an equality), and a boat already turning a little faster
+        # than r_max made every solve infeasible until it slowed down by itself
+        nblock = 6 * (N + 1) + nf * N + N + 1
+        for j in range(n_scen):
+            lbx[j * nblock:j * nblock + 6], ubx[j * nblock:j * nblock + 6] = -np.inf, np.inf
         if self.free_time:
             lbx, ubx = np.append(lbx, 1.0), np.append(ubx, self.T_max)
         ipopt = {"print_level": 0, "sb": "yes", "max_iter": self.max_iter, "tol": 1e-4,

@@ -551,7 +551,7 @@ def make_strategy(name, cfg, params, belief, cpu_factor):
     if base == "nmpc":
         ocp = DockingOCP.from_vessel_config(cfg, params, free_time=False, N=25, horizon=10.0, substeps=3,
                                             gap_min=GAP - 0.02, max_cpu_time=2.0, max_iter=150, corridor=corridor,
-                                            heading_funnel=heading)
+                                            heading_funnel=heading, replan_cold=True, **ms)
         return NMPCStrategy(ocp, belief, period=0.5, cpu_factor=cpu_factor)
     raise ValueError(name)
 
