@@ -39,6 +39,11 @@ import casadi as ca
 import numpy as np
 
 
+def scaled_thrusters(thrusters, fraction):
+    """The vessel.yaml thruster entries with max_force scaled by fraction (planning margin)."""
+    return [dict(t, max_force=fraction * float(t.get("max_force", 67.0))) for t in thrusters]
+
+
 def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
@@ -48,13 +53,15 @@ class OCPPlanner:
                  u_max=0.6, u_min=-0.35, v_max=0.3, r_max_deg=25.0,
                  w_T=1.0, w_v=30.0, w_r=5.0, w_rev=8.0, w_xte=0.0, w_hold=40.0, w_f=2.0, w_df=20.0, max_iter=300,
                  tow=None, footprint=((-0.3, 0.0, 0.47), (0.0, 0.0, 0.47), (0.3, 0.0, 0.47)), max_obstacles=8,
-                 obstacle_margin=0.5):
+                 obstacle_margin=0.5, force_fraction=1.0):
         """
         M: (m11, m22, m33) incl. added mass. damping_coeffs: ((a_u, b_u), (a_v, b_v), (a_r, b_r)) for
         d_i(x) = a_i x + b_i x|x|. thrusters: vessel.yaml thruster entries (position, type, max_force,
         reverse_ratio, direction_deg). tow: (mass, a, b) of a towed load in surge, or None.
         footprint: circles (x, y, radius) [m] in BODY that cover the hull. max_obstacles: how many circular
         obstacles one plan can take. obstacle_margin [m]: extra clearance on top of hull and obstacle radius.
+        force_fraction: the share of each thruster's max_force a plan may use; the rest is left to the DP law
+        that tracks it (a plan at the full 20 N sideways left nothing for feedback: 20 cm behind the plan).
         """
         self.footprint = np.asarray(footprint, float).reshape(-1, 3)
         self.max_obstacles, self.margin = int(max_obstacles), float(obstacle_margin)
@@ -65,7 +72,7 @@ class OCPPlanner:
         self.bounds = dict(u_max=u_max, u_min=u_min, v_max=v_max, r_max=math.radians(r_max_deg))
         self.w = dict(T=w_T, v=w_v, r=w_r, rev=w_rev, xte=w_xte, hold=w_hold, f=w_f, df=w_df)
         self.max_iter = max_iter
-        self._thrusters(thrusters)
+        self._thrusters(scaled_thrusters(thrusters, force_fraction))
         # one problem per number of obstacle slots: unused slots slowed the free problem down (median 0.45 ->
         # 1.7 s) and made it fail more often (25 -> 22 of 25 short moves with the boat under way)
         sizes = sorted({0, min(3, self.max_obstacles), self.max_obstacles})

@@ -170,6 +170,7 @@ class PositionController(Node):
                 ('guidance.ocp.w_f', 2.0),
                 ('guidance.ocp.w_df', 20.0),
                 ('guidance.ocp.obstacle_margin', 0.5),   # [m] clearance to obstacles on top of hull and radius
+                ('guidance.ocp.force_fraction', 1.0),    # share of each thruster's force a plan may use
                 # Docking (cybership_dp/docking_mpc.py, results/docking_mpc_plan.md): berths from a harbour YAML,
                 # started with guidance/dock (berth name) or the ~/dock service (the first berth)
                 ('docking.harbour_file', ''),
@@ -177,6 +178,7 @@ class PositionController(Node):
                 ('docking.standoff', 2.0),               # [m] out from the berth: where docking starts from
                 ('docking.max_start_distance', 10.0),    # [m] further from the berth: go to the stand-off first
                 ('docking.gap_margin', 0.02),            # [m] the plan keeps berth gap - this from the face
+                ('docking.force_fraction', 1.0),         # share of each thruster's force a docking plan may use
                 ('docking.corridor', [0.15, 0.5, 1.5]),  # approach funnel w0 + k1 gap + k2 gap^2 [m]
                 # [deg, deg/m] lined up before close: |heading error| <= 3 deg + 15 deg/m gap. (5, 30) let the plan
                 # still turn 11 deg and back at 0.13 m/s 0.3 m off the face; with the DP's yaw lag a corner came
@@ -1056,7 +1058,7 @@ class PositionController(Node):
 
     def _ocp_planner(self):
         g = lambda n: self.get_parameter(f'guidance.ocp.{n}').value
-        weights = {k: g(k) for k in ('w_T', 'w_v', 'w_r', 'w_rev', 'w_xte', 'w_hold', 'w_f', 'w_df', 'obstacle_margin')}
+        weights = {k: g(k) for k in ('w_T', 'w_v', 'w_r', 'w_rev', 'w_xte', 'w_hold', 'w_f', 'w_df', 'obstacle_margin', 'force_fraction')}
         if getattr(self, '_ocp', None) is None or self._ocp_weights != weights:
             G = lambda n: self.get_parameter(f'guidance.{n}').value
             self._ocp = trajectory_planner.OCPPlanner.from_vessel_config(
@@ -1163,7 +1165,7 @@ class PositionController(Node):
             # replans try the multipliers first (30 iterations at most), then the shifted plan alone: 0.08 s for a
             # small offset, 0.14 s from 0.3 m / 10 deg (tools/docking_ocp_speed.py). On one slow core the typical
             # replan time is what keeps the boat from chasing plans (0.1-0.5 s with, 0.4-2.8 s without)
-            dual_warm=True)
+            dual_warm=True, force_fraction=g('force_fraction'))
             for gap in {b['gap'] for b in self._berths.values()}}
         self.create_subscription(String, 'guidance/dock', lambda m: self._start_dock(m.data), 10)
         self.create_service(Trigger, f'{self.get_name()}/dock', self._on_dock_service)

@@ -22,7 +22,7 @@
       ki_ratio: 0.1
       # Anti-windup limit on the integral force. The integral must be able to cancel slowly varying
       # forces (ocean current, wave drift; Fossen L7/L8), so allow up to what the thrusters can give.
-      max_integral_force: [100.0, 60.0, 30.0]   # [N, N, Nm]
+      max_integral_force: [100.0, 20.0, 30.0]   # [N, N, Nm]; sway: the azimuth gives 20 N
       # Position control gains
       p_gain:
         pos: 1.6     # Proportional gain for position
@@ -79,6 +79,7 @@
         w_f: 2.0
         w_df: 20.0
         obstacle_margin: 0.5       # [m] clearance to obstacles on top of hull and obstacle radius (the boat lags the plan up to ~0.4 m in tight turns)
+        force_fraction: 0.8        # plans use 80 % of each thruster, the DP law keeps the rest (at 100 % the boat fell 20 cm behind)
       turn_then_go: true
       # [m] goals closer than this: plain DP (small corrections, crab with the azimuth); farther goals:
       # turn the bow to the goal and drive. 5 m made the boat crab sideways for normal moves.
@@ -101,7 +102,7 @@
       # The reference moves no faster than these speeds (forward_speed, reverse_speed, sway_speed as an
       # ellipse in the body frame), through the water when the observer estimates the current. Without
       # the limit the reference filter's speed grows with the distance: 4 m sideways asked for more sway
-      # force than the bow azimuth has (0.2 m/s sideways takes about 45 of its 67 N).
+      # force than the bow azimuth has (0.2 m/s sideways takes about 45 N, the azimuth gives 20 N).
       sway_speed: 0.1            # [m/s] 0 = no speed limit; the azimuth's 20 N holds about 0.1 m/s sideways
       min_speed: 0.05            # [m/s] over ground when the current alone uses up the limit
       max_turn_rate_deg_s: 25.0  # [deg/s] heading reference; a 180 deg step gave 35 deg/s and 1 m of drift

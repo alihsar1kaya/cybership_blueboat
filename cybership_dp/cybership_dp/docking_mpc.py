@@ -44,7 +44,7 @@ from types import SimpleNamespace
 import casadi as ca
 import numpy as np
 
-from cybership_dp.trajectory_planner import OCPPlanner
+from cybership_dp.trajectory_planner import OCPPlanner, scaled_thrusters
 
 DEFAULT_WEIGHTS = {
     # free final time: as the OCP planner, plus the slack
@@ -65,7 +65,7 @@ class DockingOCP:
                  k_gap=0.25, weights=None, max_iter=300, max_cpu_time=3.0, relax_first=False, terminal="soft",
                  acceptable=False, T_max=60.0, corridor=None, dual_warm=False, heading_funnel=None,
                  speed_funnel=None, compiled=True, mapped=False, compile_flags="-O1", warm_max_iter=30, warm_mu_init=1e-4, replan_cold=False, scenarios=None,
-                 scenario_weights=None, robust_horizon=1):
+                 scenario_weights=None, robust_horizon=1, force_fraction=1.0):
         self.M, self.dc = np.asarray(M, float), np.asarray(coeffs, float)
         self.L, self.Bh = float(hull[0]), float(hull[1])
         self.free_time, self.N, self.horizon, self.substeps = bool(free_time), int(N), float(horizon), int(substeps)
@@ -121,7 +121,8 @@ class DockingOCP:
         # tools/docking_ocp_speed.py). Without a C compiler: the inlined SX graph. mapped=True without compiling is
         # only for comparison: the MX evaluation is then 2x slower than the inlined graph.
         self.compiled, self.mapped, self.compile_flags = bool(compiled), bool(mapped), str(compile_flags)
-        OCPPlanner._thrusters(self, thrusters)            # B, f_lb, f_ub, fmax, azimuth_idx, nf
+        # B, f_lb, f_ub, fmax, azimuth_idx, nf; force_fraction < 1 keeps thrust in reserve for the DP law
+        OCPPlanner._thrusters(self, scaled_thrusters(thrusters, force_fraction))
         self.corners = np.array([[self.L / 2, self.Bh / 2], [self.L / 2, -self.Bh / 2],
                                  [-self.L / 2, -self.Bh / 2], [-self.L / 2, self.Bh / 2]])
         self._pr = self._build()

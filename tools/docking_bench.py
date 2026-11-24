@@ -523,7 +523,7 @@ HEADING_FUNNEL = (math.radians(5.0), math.radians(30.0))     # 5 deg + 30 deg pe
 SPEED_FUNNEL = (0.05, 0.3, math.radians(2.0), math.radians(10.0))   # along the face and yaw rate near it
 
 
-def make_strategy(name, cfg, params, belief, cpu_factor):
+def make_strategy(name, cfg, params, belief, cpu_factor, force_fraction=1.0):
     """
     plan_once / replan: free-time OCP (soft berth, 4 RK4 substeps, T <= 60 s) with the approach funnel, tracked by
     the DP law; replan_pred: replanned from the previous plan's state while the boat follows it; *_nofunnel: the
@@ -544,7 +544,8 @@ def make_strategy(name, cfg, params, belief, cpu_factor):
     heading = None if name.endswith("_nofunnel") or name.endswith("_noheading") else HEADING_FUNNEL
     if base in ("plan_once", "replan", "replan_pred", "replan_event", "replan_event_lock"):
         ocp = DockingOCP.from_vessel_config(cfg, params, free_time=True, gap_min=GAP - 0.02, max_cpu_time=8.0,
-                                            corridor=corridor, heading_funnel=heading, speed_funnel=speed, **ms)
+                                            corridor=corridor, heading_funnel=heading, speed_funnel=speed,
+                                            force_fraction=force_fraction, **ms)
         return PlanStrategy(ocp, belief, replan=(0.0 if base == "plan_once" else 2.0), cpu_factor=cpu_factor,
                             from_plan=(base == "replan_pred"), event=base.startswith("replan_event"),
                             lock_gap=(1.0 if base == "replan_event_lock" else 0.0))
@@ -596,7 +597,7 @@ def run(job):
     belief = QuayBelief(quay, FACE, (L, B), rng, map_err=opts.get("map_err", 0.0), lidar=opts.get("lidar", False))
     nav.true_face = (quay.normals[FACE], quay.offsets[FACE])
     strat = make_strategy(strategy, cfg, sway_variant(base, opts["ocp_sway"]) if opts.get("ocp_sway") else params,
-                          belief, cpu_factor)
+                          belief, cpu_factor, opts.get("force_fraction", 1.0))
     tau_alloc, tau_cmd = np.zeros(3), np.zeros(3)
     t_start, t = 3.0, 0.0                          # the observer settles first (hold position)
     rec = dict(min_clear=np.inf, max_towards_near=0.0, co_towards_near=0.0, yaw_rate_near=0.0, energy=0.0,
@@ -766,6 +767,7 @@ def main():
                         help=f"sway model of the {blk} block only (overrides --model-sway there)")
     ap.add_argument("--q-nu-scale", type=float, default=1.0, help="observer velocity process noise x this")
     ap.add_argument("--q-bias-scale", type=float, default=1.0, help="observer bias process noise x this")
+    ap.add_argument("--force-fraction", type=float, default=1.0, help="share of each thruster's force a plan may use")
     ap.add_argument("--damping-ff", type=float, default=1.0, help="scale on the DP's damping feedforward")
     ap.add_argument("--kd-full", action="store_true", help="DP D-gain 2 zeta wn m, not minus the model's damping")
     ap.add_argument("--sway-model", default="nominal", choices=["nominal", "physical", "team"],
@@ -782,7 +784,7 @@ def main():
     opts = dict(thrusters=a.thrusters, map_err=a.map_err, multipath=a.multipath, lidar=a.lidar, lidar_obs=a.lidar_obs,
                 sway_model=a.sway_model, kd_full=a.kd_full, model_sway=a.model_sway, damping_ff=a.damping_ff,
                 obs_sway=a.obs_sway, dp_sway=a.dp_sway, ocp_sway=a.ocp_sway,
-                q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale)
+                q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale, force_fraction=a.force_fraction)
     jobs = [(s, e, st, 1000 * i + j, a.cpu_factor, a.t_max, opts)
             for s in a.strategies.split(",") for i, e in enumerate(envs) for j, st in enumerate(starts)]
     t0 = time.time()
