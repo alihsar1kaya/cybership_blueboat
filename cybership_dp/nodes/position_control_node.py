@@ -1001,7 +1001,7 @@ class PositionController(Node):
         Largest speed over ground [m/s] along `course` that keeps the velocity through the water inside
         the boat's envelope: an ellipse in the body frame with forward_speed / reverse_speed along surge
         and sway_speed along sway. Sway is the narrow one: the linear sway damping is large and only
-        the bow azimuth pushes sideways, so 0.2 m/s already takes about 45 N of its 67 N.
+        the bow azimuth pushes sideways, so 0.1 m/s already takes most of its 20 N.
         """
         g = lambda n: self.get_parameter(f'guidance.{n}').value
         d = np.array([np.cos(course - yaw), np.sin(course - yaw)])

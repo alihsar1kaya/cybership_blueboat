@@ -102,7 +102,7 @@
       # ellipse in the body frame), through the water when the observer estimates the current. Without
       # the limit the reference filter's speed grows with the distance: 4 m sideways asked for more sway
       # force than the bow azimuth has (0.2 m/s sideways takes about 45 of its 67 N).
-      sway_speed: 0.2            # [m/s] 0 = no speed limit
+      sway_speed: 0.1            # [m/s] 0 = no speed limit; the azimuth's 20 N holds about 0.1 m/s sideways
       min_speed: 0.05            # [m/s] over ground when the current alone uses up the limit
       max_turn_rate_deg_s: 25.0  # [deg/s] heading reference; a 180 deg step gave 35 deg/s and 1 m of drift
       max_dp_distance: 3.5       # [m] moving directly is an option up to here (short repositioning)

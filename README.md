@@ -217,7 +217,7 @@ ros2 param set /microampere/sim environment.current.speed 0.15
 ros2 param set /microampere/sim environment.current.direction_deg 90
 ```
 
-Current is the hardest load for this boat. Sideways it can only push back with the bow thruster, and a side current above roughly 0.25 m/s is more than that thruster can hold. Head-on the stern thrusters take it easily, so if the current gets strong, give the boat a goal heading that points the bow into it.
+Current is the hardest load for this boat. Sideways it can only push back with the bow thruster, and the azimuth is limited to 20 N, so a side current above roughly 0.1 m/s is more than it can hold (in our model; the real sway damping, and with it this limit, is still unmeasured). Head-on the stern thrusters take it easily, so if the current gets strong, give the boat a goal heading that points the bow into it.
 
 ### 6. Everything at once
 
@@ -669,7 +669,7 @@ The settings are in [`cybership_config/config/microampere/controller_position.ya
 | `guidance.ocp.w_rev` | backs up less | backs up more often |
 | `guidance.ocp.w_f`, `w_df` | calmer, slower moves | quicker moves with more thrust |
 | `guidance.forward_speed` | faster transit | slower transit |
-| `guidance.sway_speed` | faster sideways moves, until the bow thruster saturates (0.2 m/s takes about 45 of its 67 N) | gentler on the bow thruster |
+| `guidance.sway_speed` | faster sideways moves, until the bow thruster saturates (0.1 m/s takes most of its 20 N) | gentler on the bow thruster |
 | `guidance.max_turn_rate_deg_s` | quicker turns; above about 30 °/s the stern thrusters saturate and the boat slides off the spot | slower turns |
 | `guidance.max_dp_distance` | longer moves are done without turning first | the boat turns and drives more often |
 | `guidance.dubins_radius` | wider, gentler curves | tighter turns; 0 switches the curves off (turn on the spot, drive straight, turn again) |
@@ -745,7 +745,7 @@ subject to
 ```
 the model between the steps            (Runge-Kutta 4, multiple shooting)
 start = the boat now,  end = the goal pose with ν = 0
-−0.8 f_max ≤ f_port, f_starboard ≤ f_max,   f_x² + f_y² ≤ f_max²   (bow azimuth, f_max = 67 N)
+−0.78 f_max ≤ f_port, f_starboard ≤ f_max,   f_x² + f_y² ≤ f_max²   (stern f_max = 51.5 N at 16 V, reverse 0.78; bow azimuth f_max = 20 N)
 −0.35 ≤ u ≤ 0.6 m/s,   |v| ≤ 0.3 m/s,   |r| ≤ 25°/s
 ```
 
@@ -824,7 +824,7 @@ The unit tests check the boat model, the weather, the sensors, the Kalman filter
 
 ## Known limitations
 
-- Several boat values are still estimates (centre of gravity, inertia, surge time constant, thruster positions, the thrust at speed, and which voltage the 67 N thruster rating refers to). They are marked ESTIMATE in `vessel.yaml` and should be measured on the real boat.
+- Several boat values are still estimates (centre of gravity, inertia, surge time constant, thruster positions, the thrust at speed, and the T200 datasheet thrust at 16 V, which nobody has measured on the boat). They are marked ESTIMATE in `vessel.yaml` and should be measured on the real boat.
 - The slow drift force from waves (second order) is not modelled. The Kalman filter's bias estimate absorbs it, as it would on the real boat.
 - The wind areas come from the CAD model. The real boat's antennas and electronics are not in it.
 - There is no connection to the real boat yet. The topics are laid out for it, but the drivers still have to be written.

@@ -153,19 +153,18 @@ sensors:
 
 # Thruster operating conditions (cybership_utilities/marine_craft/actuators.py, ThrusterConditions).
 # Battery voltage: full thrust follows the T200 datasheet (bluerobotics.com, T200 R2: 3.71 / 5.25 / 6.7 kgf
-# forward at 12 / 16 / 20 V). max_force = 67 N above equals the 20 V value (6.7 kgf); the datasheet gives
-# 5.25 kgf = 51.5 N at the nominal 16 V (390 W). CHECK with the team which voltage the boat runs on (a
-# 4S battery is 13-16.8 V) and what "67 N at 400 W" was measured at. Change it live:
+# forward at 12 / 16 / 20 V). The boat runs on a 4S LiPo, ~16 V (team, 2026-11-24), so max_force is the
+# 16 V datasheet value, 5.25 kgf = 51.5 N (the team's numbers are from the datasheet too, not measured).
+# A 4S battery is 13-16.8 V; lower voltage gives less thrust. Change it live:
 #   ros2 param set /microampere/sim battery.voltage 14.8
 # Speed: with a linear K_T(J) (Fossen 9.1) full throttle gives no thrust at the inflow speed u_0 (pitch
-# speed). ESTIMATE from the datasheet: theoretical jet speed 4.45 m/s at 16 V (3600 rpm), scaled to 20 V
-# with sqrt(thrust) -> ~5.0 m/s. The hull resistance (model.damping) does not depend on this value, so
+# speed). ESTIMATE from the datasheet: theoretical jet speed 4.45 m/s at 16 V (3600 rpm). The hull resistance (model.damping) does not depend on this value, so
 # the top speed follows from the two: ~2.3 m/s on the stern thrusters. MEASURE: bollard pull and top speed.
 thruster_model:
-  rated_voltage: 20.0          # [V] voltage at which max_force applies
-  battery_voltage: 20.0        # [V] start value of the parameter battery.voltage
+  rated_voltage: 16.0          # [V] voltage at which max_force applies
+  battery_voltage: 16.0        # [V] start value of the parameter battery.voltage (4S LiPo)
   thrust_vs_voltage: {volts: [12.0, 16.0, 20.0], thrust: [3.71, 5.25, 6.7]}   # [kgf], only the ratio is used
-  zero_thrust_speed: 5.0       # [m/s] u_0 at rated voltage, null = thrust independent of speed
+  zero_thrust_speed: 4.45      # [m/s] u_0 at rated voltage, null = thrust independent of speed
 
 # Latency [s]: a sensor message is published this long after the measurement (stamped with the measurement
 # time), a thruster command acts this long after it is sent. The observer compensates the GNSS delay
@@ -291,8 +290,8 @@ thrusters:
     # 123 mm below the waterline with 2 batteries -> ~177 mm at Microampere's 30.2 kg. x is an estimate.
     position: [-0.55, -0.29, 0.177]   # y from the Microampere team sketch (F2)
     direction_deg: 0.0               # pushes forward
-    max_force: 67.0                  # [N] at 400 W (Microampere team)
-    reverse_ratio: 0.8               # reverse thrust = 80 % of forward (typical T200-type propeller)
+    max_force: 51.5                  # [N] T200 datasheet at 16 V (5.25 kgf)
+    reverse_ratio: 0.78              # T200 datasheet at 16 V: 4.1 / 5.25 kgf
     time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
     pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
@@ -303,8 +302,8 @@ thrusters:
     frame: stern_starboard_thruster_link
     position: [-0.55, 0.29, 0.177]    # y from the Microampere team sketch (F3)
     direction_deg: 0.0
-    max_force: 67.0
-    reverse_ratio: 0.8
+    max_force: 51.5
+    reverse_ratio: 0.78
     time_constant: 0.1
     pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
@@ -314,9 +313,9 @@ thrusters:
     type: azimuth                    # rotates freely, no angle limit (Microampere team)
     frame: bow_azimuth_thruster_link
     position: [0.37, 0.0, 0.248]     # [m] Microampere team sketch (F1): 370 mm ahead of CO, 248 mm deep
-    max_force: 67.0                  # [N] at 400 W (Microampere team)
+    max_force: 20.0                  # [N] what the azimuth unit is designed and tested for (team, 2026-11-24)
     max_rate_deg_s: 90.0             # 4 s per 360 deg (Microampere team)
-    reverse_ratio: 0.8               # T200 pushes both ways: reverse instead of a half turn
+    reverse_ratio: 0.78              # T200 pushes both ways (team allocator rotates instead; can be changed)
     time_constant: 0.1               # [s] thrust build-up (Fossen's Otter: propeller T_n = 0.1 s)
     pwm: {neutral: 1500, deadzone: 25, half_range: 400}   # T200 + Basic ESC [us], see below
     allocation:
