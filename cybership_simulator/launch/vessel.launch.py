@@ -63,6 +63,8 @@ def _launch_setup(context, *args, **kwargs):
 
     map_shift = [float(v) for v in lc("map_shift").split()]
     harbour = lc("harbour")
+    if harbour.lower() in ("false", "none", "off", "''", '""'):
+        harbour = ""
     if harbour == "auto":
         harbour = os.path.join(get_package_share_directory("cybership_config"), "config", vessel, "harbour.yaml")
         harbour = harbour if os.path.exists(harbour) else ""
@@ -396,7 +398,7 @@ def generate_launch_description():
         launch.actions.DeclareLaunchArgument(
             "harbour", default_value="auto",
             description="Quays and berths for docking (YAML); auto = cybership_config/config/<vessel>/harbour.yaml if "
-                        "it exists. Dock with: ros2 topic pub --once /<ns>/guidance/dock std_msgs/String \"data: ''\""),
+                        "it exists; false = no quay. Dock with: ros2 topic pub --once /<ns>/guidance/dock std_msgs/String \"data: ''\""),
         launch.actions.DeclareLaunchArgument(
             "map_shift", default_value="0.0 0.0",
             description="Test a map error: the DP's harbour map moved by 'north east' [m]; the simulator keeps the true quay"),
