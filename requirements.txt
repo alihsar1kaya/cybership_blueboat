@@ -12,10 +12,14 @@ matplotlib>=3.6         # plots in tools/
 skadipy @ git+https://github.com/incebellipipo/skadipy.git@master
 shoeboxpy @ git+https://github.com/incebellipipo/shoeboxpy.git
 
-# Trajectory planner (cybership_dp/trajectory_planner.py): optimal control with IPOPT
+# Trajectory planner and docking OCP: optimal control with IPOPT (the docking OCP is compiled with gcc, apt build-essential)
 casadi>=3.6
+
+# tests
+pytest>=7
 
 # Optional: only to recompute the hydrodynamics from the hull CAD (cybership_config/tools/)
 # capytaine>=2.2
 # trimesh>=4.0
 # xarray
+# shapely>=2.0          # wind areas (cybership_config/tools/wind_areas.py)

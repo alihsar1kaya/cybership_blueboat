@@ -29,7 +29,7 @@ You need Ubuntu 24.04 and ROS 2 Jazzy ([install guide](https://docs.ros.org/en/j
 
 ```bash
 # 1. system packages
-sudo apt install ros-jazzy-desktop ros-dev-tools python3-venv python3-pip \
+sudo apt install ros-jazzy-desktop ros-dev-tools python3-venv python3-pip build-essential \
                  ros-jazzy-topic-tools ros-jazzy-nav2-msgs ros-jazzy-xacro
 
 # 2. get the code
@@ -58,83 +58,68 @@ cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && s
 
 ## Towing on Windows (WSL)
 
-This is the short path for the towing work if you are on Windows. You run Ubuntu inside WSL2, and RViz opens as a normal window.
+Step by step for the towing work on a Windows PC.
 
-### Set up once
-
-In PowerShell, as administrator:
+**1. Install Ubuntu** (PowerShell as administrator, then restart):
 
 ```powershell
 wsl --install -d Ubuntu-24.04
 ```
 
-Restart if it asks you to, open "Ubuntu 24.04" from the Start menu, and pick a user name and password. Then follow [Install](#install) above inside that Ubuntu window, from the ROS 2 Jazzy guide to `colcon build`.
+**2. Install ROS 2 and this repo:** open "Ubuntu 24.04" from the Start menu and do every step in [Install](#install).
 
-You only need the next step if you want to talk to the real boat or another PC. WSL hides behind its own network by default, and ROS 2 then cannot find other machines. Create `C:\Users\<you>\.wslconfig` with these two lines:
+**3. Source every new terminal:**
+
+```bash
+cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && source install/setup.bash
+```
+
+**4. Start the simulator with a load:**
+
+```bash
+ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true
+```
+
+RViz opens. The orange ball is the load. Click **2D Goal Pose** on the map to move the boat. `Ctrl+C` stops it.
+
+**5. Add weather** at the end of the launch line:
+
+| Weather | Add |
+|---|---|
+| Waves | `waves:=true wave_hs:=0.1` |
+| Wind | `wind_speed:=6 wind_dir:=90` |
+| No RViz | `use_gui:=false` |
+
+**6. Change weather while it runs** (second terminal, sourced as in step 3):
+
+```bash
+ros2 param set /microampere/sim environment.current.speed 0.1          # current on [m/s]
+ros2 param set /microampere/sim environment.current.direction_deg 90   # towards east
+ros2 param set /microampere/sim environment.waves.Hs 0                 # waves off
+ros2 param set /microampere/sim environment.wind.speed 0               # wind off
+```
+
+Directions are where things move towards: 0 = north, 90 = east.
+
+**7. Where things are:**
+
+| What | Where |
+|---|---|
+| Load settings (mass, bar, tow point) | `cybership_config/config/microampere/vessel.yaml`, section `tow` |
+| Load physics | `cybership_utilities/cybership_utilities/marine_craft/tow.py` |
+| Bar force | topic `/microampere/sim/tow/tension` |
+| Load cell | topic `/microampere/sensor/tow_force` |
+
+Restart the launch after editing `vessel.yaml`. More on the model: [Towing a load](#10-towing-a-load).
+
+**Only to talk to the real boat or another PC:** create `C:\Users\<you>\.wslconfig` with
 
 ```
 [wsl2]
 networkingMode=mirrored
 ```
 
-Then run `wsl --shutdown` in PowerShell and open Ubuntu again. This needs Windows 11 22H2 or newer. The simulator alone works without it.
-
-### Start the simulator with a load
-
-Each new Ubuntu terminal needs this first:
-
-```bash
-cd ~/ros_ws && source /opt/ros/jazzy/setup.bash && source venv/bin/activate && source install/setup.bash
-```
-
-Then:
-
-```bash
-ros2 launch cybership_simulator vessel.launch.py vessel:=microampere dp:=true observer:=true gnss:=rtk tow:=true
-```
-
-RViz shows the boat with an orange ball behind it. That ball is the load. Give the boat a goal with **2D Goal Pose** and watch the bar: red while it pulls, blue while it pushes. `Ctrl+C` stops everything.
-
-### Weather
-
-Add any of these to the end of the launch line:
-
-| What | Add | Example |
-|---|---|---|
-| Waves | `waves:=true wave_hs:=<m>` | `waves:=true wave_hs:=0.1` (choppy for this boat) |
-| Wave direction | `wave_dir:=<deg>` | `wave_dir:=90` (travelling towards east) |
-| Wind | `wind_speed:=<m/s> wind_dir:=<deg>` | `wind_speed:=6 wind_dir:=90` |
-| No RViz | `use_gui:=false` | |
-
-Current has no launch argument. You set it while the simulator runs. You can also turn everything up, down or off the same way. Use a second terminal (sourced as above):
-
-```bash
-ros2 param set /microampere/sim environment.current.speed 0.1          # current on, 0.1 m/s
-ros2 param set /microampere/sim environment.current.direction_deg 90   # flowing towards east
-ros2 param set /microampere/sim environment.waves.Hs 0                 # waves off
-ros2 param set /microampere/sim environment.wind.speed 0               # wind off
-ros2 param set /microampere/sim environment.wind.sigma 0.5             # gusts on
-```
-
-Directions are where things move towards, with 0 = north and 90 = east. So a wind coming from the north is `wind_dir:=180`.
-
-### Where things are
-
-| What | Where |
-|---|---|
-| The load: mass, bar length, tow point, rope or bar, float or hull | `cybership_config/config/microampere/vessel.yaml`, section `tow` |
-| Load and bar physics | `cybership_utilities/cybership_utilities/marine_craft/tow.py` |
-| Simulator node | `cybership_simulator/src/cybership_simulator/vessel.py` |
-| Bar force (negative = pushing) | topic `/microampere/sim/tow/tension` |
-| Simulated load cell at the tow point | topic `/microampere/sensor/tow_force` |
-
-After you edit `vessel.yaml`, restart the launch. You do not need to rebuild, thanks to `--symlink-install`. `tow_model:=false` turns off the controller's knowledge of the load, so you can see the difference. [Towing a load](#10-towing-a-load) explains the model in more detail.
-
-### If something does not work
-
-- **RViz is black or very slow.** Update WSL with `wsl --update` in PowerShell, and update the graphics driver in Windows.
-- **Gazebo (`gazebo:=true`) is slow or crashes.** This is common in WSL. Towing does not need it.
-- **`ros2 topic list` shows nothing from another machine.** Use the mirrored network described above, and set the same `ROS_DOMAIN_ID` on both machines.
+and run `wsl --shutdown` (Windows 11 22H2 or newer). Gazebo (`gazebo:=true`) can be slow in WSL; towing does not need it.
 
 ---
 
