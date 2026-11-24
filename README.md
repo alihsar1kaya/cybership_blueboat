@@ -28,6 +28,12 @@ The boat model follows Fossen's marine craft equations. The added mass and dampi
 You need Ubuntu 24.04 and ROS 2 Jazzy ([install guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)). The rest takes about ten minutes.
 
 ```bash
+# 0. the ROS 2 package source (skip if ROS 2 Jazzy is already installed)
+sudo apt update && sudo apt install -y software-properties-common curl git && sudo add-apt-repository -y universe
+V=$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F tag_name | awk -F'"' '{print $4}')
+curl -L -o /tmp/ros2-apt-source.deb "https://github.com/ros-infrastructure/ros-apt-source/releases/download/$V/ros2-apt-source_$V.noble_all.deb"
+sudo dpkg -i /tmp/ros2-apt-source.deb && sudo apt update
+
 # 1. system packages
 sudo apt install ros-jazzy-desktop ros-dev-tools python3-venv python3-pip build-essential \
                  ros-jazzy-topic-tools ros-jazzy-nav2-msgs ros-jazzy-xacro
