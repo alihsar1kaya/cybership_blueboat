@@ -195,14 +195,18 @@ class Navigation:
 
     def __init__(self, params, rng, sigma_gnss=0.02, gnss_rate=5.0, gnss_delay=0.1, sigma_psi_deg=0.5, q_nu_scale=1.0,
                  q_bias_scale=1.0,
-                 multipath=None):
+                 multipath=None, adapt_sway=None):
         craft = vessel_model.make_marine_craft(params)
+        d22 = float(vessel_model.D_3dof(params)[1, 1])
+        # adapt_sway: estimate a correction to the linear sway damping (observer.py), within 5 % .. 2x of the model's
+        sd = None if not adapt_sway else dict(q=adapt_sway.get("q", 50.0), p0=adapt_sway.get("p0", 1e4),
+                                              v_min=adapt_sway.get("v_min", 0.03), bounds=(-0.95 * d22, d22))
         idx = [0, 1, 5]
         damping = lambda nu: -craft.damping(np.array([nu[0], nu[1], 0, 0, 0, nu[2]]))[idx]
         kf = DPKalmanFilter(vessel_model.M_eff_3dof(params), vessel_model.D_3dof(params),
                             q_bias=list(np.array([0.2, 0.2, 0.02]) * q_bias_scale),
                             q_nu=list(np.array([0.05, 0.05, 0.005]) * q_nu_scale), damping=damping,
-                            current={"q": 1e-5, "p0": 0.04})
+                            current={"q": 1e-5, "p0": 0.04}, sway_damping=sd)
         self.kf = kf
         self.obs = AsyncObserver(kf, 0.02, math.radians(sigma_psi_deg))
         self.rng, self.sigma_gnss, self.sigma_psi = rng, sigma_gnss, math.radians(sigma_psi_deg)
@@ -266,7 +270,8 @@ class Navigation:
     def estimate(self):
         kf = self.kf
         cur = np.asarray(kf.current, float) if kf.nc else np.zeros(2)
-        return dict(eta=np.array(kf.eta, float), nu=np.array(kf.nu, float), bias=np.array(kf.bias, float), vc=cur)
+        return dict(eta=np.array(kf.eta, float), nu=np.array(kf.nu, float), bias=np.array(kf.bias, float), vc=cur,
+                    dv=kf.sway_damping)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -283,6 +288,7 @@ class DPLaw:
         # kd_full: the closed-loop damping from the gain alone, not counting on the model's hull damping (which in
         # sway is an assumption: with it subtracted, Kd22 is 14 N s/m and a less damped hull leaves the loop at zeta 0.3)
         self.Kp, self.Kd = m * w ** 2, (2 * z * m * w if kd_full else np.maximum(2 * z * m * w - d, 0.0))
+        self.kd_full, self.Kd_raw, self.d = kd_full, 2 * z * m * w, d
         self.craft = vessel_model.make_marine_craft(params)
         self.damping_ff = float(damping_ff)                    # scale on the damping feedforward (1 = the model)
 
@@ -297,7 +303,14 @@ class DPLaw:
         nu_c_dot = -nu_d[2] * np.array([-nu_c[1], nu_c[0], 0.0])
         nu_rd, nu_rd_dot = nu_d - nu_c, nu_d_dot - nu_c_dot
         damping_ff = -self.damping_ff * self.craft.damping(np.array([nu_rd[0], nu_rd[1], 0, 0, 0, nu_rd[2]]))[[0, 1, 5]]
-        return self.M @ nu_rd_dot + damping_ff + self.Kp * (R.T @ e) + self.Kd * (nu_d - est["nu"]) - R.T @ est["bias"]
+        # the observer's sway damping correction (adaptive): in the feedforward and in the gain, which subtracts the
+        # hull's own damping (Kd = 2 zeta wn m - d)
+        dv = est.get("dv", 0.0)
+        damping_ff[1] += dv * nu_rd[1]
+        Kd = self.Kd.copy()
+        if dv and not self.kd_full:
+            Kd[1] = max(self.Kd_raw[1] - (self.d[1] + dv), 0.0)
+        return self.M @ nu_rd_dot + damping_ff + self.Kp * (R.T @ e) + Kd * (nu_d - est["nu"]) - R.T @ est["bias"]
 
 
 class Allocation:
@@ -591,7 +604,8 @@ def run(job):
     p_obs = sway_variant(base, opts["obs_sway"]) if opts.get("obs_sway") else params
     p_dp = sway_variant(base, opts["dp_sway"]) if opts.get("dp_sway") else params
     nav = Navigation(p_obs, rng, multipath=(quay, FACE, (L, B)) if opts.get("multipath") else None,
-                     q_nu_scale=opts.get("q_nu_scale", 1.0), q_bias_scale=opts.get("q_bias_scale", 1.0))
+                     q_nu_scale=opts.get("q_nu_scale", 1.0), q_bias_scale=opts.get("q_bias_scale", 1.0),
+                     adapt_sway=dict(q=opts["adapt_sway"]) if opts.get("adapt_sway") else None)
     law = DPLaw(p_dp, kd_full=opts.get("kd_full", False), damping_ff=opts.get("damping_ff", 1.0))
     alloc = Allocation(cfg)
     belief = QuayBelief(quay, FACE, (L, B), rng, map_err=opts.get("map_err", 0.0), lidar=opts.get("lidar", False))
@@ -702,6 +716,7 @@ def run(job):
                 tube_n_max=float(max(rec["tube_n"])) if rec["tube_n"] else 0.0,
                 tube_psi_max_deg=float(math.degrees(max(rec["tube_psi"]))) if rec["tube_psi"] else 0.0,
                 final_pos_err=float(math.hypot(err[0], err[1])), final_psi_err_deg=float(math.degrees(err[2])),
+                sway_dv=float(nav.kf.sway_damping),
                 solves=strat.solves, failures=strat.failures, solve_median=float(np.median(st)),
                 solve_p95=float(np.percentile(st, 95)), solve_max=float(np.max(st)), log=log)
 
@@ -768,6 +783,8 @@ def main():
     ap.add_argument("--q-nu-scale", type=float, default=1.0, help="observer velocity process noise x this")
     ap.add_argument("--q-bias-scale", type=float, default=1.0, help="observer bias process noise x this")
     ap.add_argument("--force-fraction", type=float, default=1.0, help="share of each thruster's force a plan may use")
+    ap.add_argument("--adapt-sway", type=float, default=0.0,
+                    help="observer estimates the sway damping, process noise q [(N s/m)^2/s]; 0 = off")
     ap.add_argument("--damping-ff", type=float, default=1.0, help="scale on the DP's damping feedforward")
     ap.add_argument("--kd-full", action="store_true", help="DP D-gain 2 zeta wn m, not minus the model's damping")
     ap.add_argument("--sway-model", default="nominal", choices=["nominal", "physical", "team"],
@@ -784,7 +801,8 @@ def main():
     opts = dict(thrusters=a.thrusters, map_err=a.map_err, multipath=a.multipath, lidar=a.lidar, lidar_obs=a.lidar_obs,
                 sway_model=a.sway_model, kd_full=a.kd_full, model_sway=a.model_sway, damping_ff=a.damping_ff,
                 obs_sway=a.obs_sway, dp_sway=a.dp_sway, ocp_sway=a.ocp_sway,
-                q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale, force_fraction=a.force_fraction)
+                q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale, force_fraction=a.force_fraction,
+                adapt_sway=a.adapt_sway)
     jobs = [(s, e, st, 1000 * i + j, a.cpu_factor, a.t_max, opts)
             for s in a.strategies.split(",") for i, e in enumerate(envs) for j, st in enumerate(starts)]
     t0 = time.time()

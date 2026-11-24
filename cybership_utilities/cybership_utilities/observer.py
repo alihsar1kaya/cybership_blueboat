@@ -37,7 +37,18 @@ A constant force bias cannot do that: it is fixed in NED, while the drag from a 
 the hull lies in it. The bias is kept for what is a force (wind, wave drift, thrust errors). At rest
 on a fixed heading the two cannot be told apart; they separate when the heading or speed changes.
 
-State x = [xi (6, with the wave filter), eta (3), b (3), nu (3), v_c (2, with the current)].
+Sway damping (optional, adaptive): the linear sway damping is the least known number of the model (assumed from a
+time constant, a physical estimate 4-5x lower), and docking fails when the observer and the DP law use a wrong one
+(tools/docking_bench.py). The filter can estimate a correction d_v to it as one more state, a random walk:
+
+    M nu_r_dot = -d(nu_r) - [0, d_v v_r, 0] + R(psi)^T b + tau,      d_v_dot = w_a
+
+It is only observable while the boat moves sideways through the water (at rest d_v v_r = 0 and the bias takes the
+force), so below v_min it is frozen (no process noise, no correlation with the other states) and keeps what it has
+learnt. Parameter estimation by
+state augmentation (Fossen 2021, Ch. 13.3; Simon 2006, Ch. 13.4).
+
+State x = [xi (6, with the wave filter), eta (3), b (3), nu (3), v_c (2, with the current), d_v (1, adaptive)].
 """
 
 import math
@@ -58,7 +69,7 @@ def Rz(psi):
 
 class DPKalmanFilter:
     def __init__(self, M, D, q_bias, q_nu, P0=None, x0=None, T_b=None, damping=None, wave_filter=None,
-                 current=None):
+                 current=None, sway_damping=None):
         """
         M, D:    3x3 (surge, sway, yaw) mass incl. added mass and linear damping
         q_bias:  3 process noise intensities of the bias [N^2/s, N^2/s, (N m)^2/s]
@@ -70,6 +81,8 @@ class DPKalmanFilter:
                  the peak (encounter) frequency and damping of the WF model, Fossen 13.4.6
         current: optional dict(q (2 intensities of w_c [(m/s)^2/s]), p0 (initial variance [(m/s)^2])):
                  estimate the current velocity; the velocity state is then relative to the water
+        sway_damping: optional dict(q [(N s/m)^2/s], p0 [(N s/m)^2], v_min [m/s], bounds (lo, hi) [N s/m]):
+                 estimate a correction d_v to the linear sway damping (the module docstring)
         """
         self.damping = damping
         self.M = np.asarray(M, dtype=float)
@@ -78,10 +91,15 @@ class DPKalmanFilter:
         self.Tb_inv = np.zeros(3) if T_b is None else 1.0 / np.asarray(T_b, dtype=float)
         self.nw = 6 if wave_filter else 0
         self.nc = 2 if current else 0
-        self.n = self.nw + 9 + self.nc
+        self.na = 1 if sway_damping else 0
+        self.n = self.nw + 9 + self.nc + self.na
         w = self.nw
         self.i_eta, self.i_b, self.i_nu = slice(w, w + 3), slice(w + 3, w + 6), slice(w + 6, w + 9)
         self.i_c = slice(w + 9, w + 9 + self.nc)
+        self.i_a = w + 9 + self.nc                       # index of d_v (with sway_damping)
+        sd = sway_damping or {}
+        self.a_v_min = float(sd.get("v_min", 0.03))
+        self.a_bounds = tuple(sd.get("bounds", (-np.inf, np.inf)))
         q_w = []
         if wave_filter:
             w0 = float(wave_filter["omega0"])
@@ -90,10 +108,12 @@ class DPKalmanFilter:
                                  [-w0**2 * np.eye(3), -2 * lam * w0 * np.eye(3)]])
             q_w = list(wave_filter.get("q", [0.1, 0.1, 0.001]))
         q_c = list(np.broadcast_to(current.get("q", 1e-4), 2)) if current else []
-        self.Qc = np.diag(np.r_[q_w, q_bias, q_nu, q_c])
+        q_a = [float(sd.get("q", 50.0))] if self.na else []
+        self.Qc = np.diag(np.r_[q_w, q_bias, q_nu, q_c, q_a])
         self.x = np.zeros(self.n) if x0 is None else np.asarray(x0, dtype=float).copy()
         p0 = [1.0, 1.0, 0.1, 100.0, 100.0, 10.0, 0.1, 0.1, 0.01]
         p0 += [float(current.get("p0", 0.04))] * self.nc if current else []
+        p0 += [float(sd.get("p0", 1e4))] * self.na
         self.P = np.diag([0.01] * w + p0) if P0 is None else P0.copy()
 
     # --- model ---------------------------------------------------------------------------------
@@ -120,14 +140,18 @@ class DPKalmanFilter:
         A[e, v] = R
         A[b, b] = -np.diag(self.Tb_inv)
         A[v, b] = self.Minv @ R.T
-        A[v, v] = -self.Minv @ self.damping_jacobian(self.x[v] if nu is None else nu)
+        nu_ = self.x[v] if nu is None else nu
+        A[v, v] = -self.Minv @ self.damping_jacobian(nu_)
+        if self.na:
+            A[v, v] -= self.Minv @ np.diag([0.0, self.x[self.i_a], 0.0])
+            A[v, self.i_a] = -self.Minv @ np.array([0.0, nu_[1], 0.0])
         if self.nc:
             A[self.nw:self.nw + 2, self.i_c] = np.eye(2)
         return A
 
     def E(self):
-        """Process noise input: [w_w (3, on xi2), w_b (3), w_nu (3), w_c (2)]."""
-        E = np.zeros((self.n, self.nw // 2 + 6 + self.nc))
+        """Process noise input: [w_w (3, on xi2), w_b (3), w_nu (3), w_c (2), w_a (1)]."""
+        E = np.zeros((self.n, self.nw // 2 + 6 + self.nc + self.na))
         k = self.nw // 2
         if self.nw:
             E[3:6, 0:3] = np.eye(3)
@@ -135,6 +159,8 @@ class DPKalmanFilter:
         E[self.i_nu, k + 3:k + 6] = self.Minv
         if self.nc:
             E[self.i_c, k + 6:k + 8] = np.eye(2)
+        if self.na:
+            E[self.i_a, -1] = 1.0
         return E
 
     # --- Kalman filter ----------------------------------------------------------------------------
@@ -146,15 +172,26 @@ class DPKalmanFilter:
         # state: Euler step of the (nonlinear) model
         eta, b, nu = self.x[self.i_eta], self.x[self.i_b], self.x[self.i_nu]
         R = Rz(eta[2])
-        nu_dot = self.Minv @ (-self.damping_force(nu) + R.T @ b + np.asarray(tau, dtype=float))
+        f_a = np.array([0.0, -self.x[self.i_a] * nu[1], 0.0]) if self.na else np.zeros(3)
+        nu_dot = self.Minv @ (-self.damping_force(nu) + f_a + R.T @ b + np.asarray(tau, dtype=float))
         xi_dot = self.A_w @ self.x[0:6] if self.nw else np.zeros(0)
         eta_dot = R @ nu
         if self.nc:
             eta_dot[0:2] += self.x[self.i_c]        # nu is relative to the water when the current is estimated
-        self.x = self.x + h * np.r_[xi_dot, eta_dot, -self.Tb_inv * b, nu_dot, np.zeros(self.nc)]
+        self.x = self.x + h * np.r_[xi_dot, eta_dot, -self.Tb_inv * b, nu_dot, np.zeros(self.nc + self.na)]
         self._wrap()
-        self.P = Ad @ self.P @ Ad.T + h * Ed @ self.Qc @ Ed.T
+        Qc = self.Qc
+        frozen = self.na and abs(nu[1]) < self.a_v_min
+        if frozen:                                          # not moving sideways: d_v is not observable
+            Qc = Qc.copy()
+            Qc[-1, -1] = 0.0
+        self.P = Ad @ self.P @ Ad.T + h * Ed @ Qc @ Ed.T
         self.P = 0.5 * (self.P + self.P.T)
+        if frozen:
+            # hold it: no correlation with the other states, so no measurement moves it either. Without this a
+            # constant side force with a slow drift (v below v_min) was explained as damping, d_v ran to its bound
+            a = self.i_a
+            self.P[a, :a] = self.P[:a, a] = 0.0
 
     def correct(self, y, C, Rd, angle_rows=()):
         """Corrector with measurement y = C x + eps, eps ~ N(0, Rd); angle rows use ssa innovations."""
@@ -174,6 +211,8 @@ class DPKalmanFilter:
     def _wrap(self):
         k = self.nw + 2
         self.x[k] = ssa(self.x[k])
+        if self.na:
+            self.x[self.i_a] = min(max(self.x[self.i_a], self.a_bounds[0]), self.a_bounds[1])
 
     def correct_gnss(self, north, east, sigma):
         """y = [N, E] + xi2_NE (WF position) + eps."""
@@ -254,6 +293,11 @@ class DPKalmanFilter:
     def current(self):
         """Current velocity in NED [V_N, V_E] (zeros without the current estimate)."""
         return self.x[self.i_c] if self.nc else np.zeros(2)
+
+    @property
+    def sway_damping(self):
+        """Estimated correction d_v to the linear sway damping [N s/m] (0 without the adaptive state)."""
+        return float(self.x[self.i_a]) if self.na else 0.0
 
     @property
     def eta_wf(self):

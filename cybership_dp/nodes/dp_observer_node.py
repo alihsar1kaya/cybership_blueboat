@@ -12,6 +12,8 @@ state the controller uses.
     navigation/odom             Odometry   <- eta_hat (pose) and nu_hat (twist over ground, BODY)
     navigation/bias             Vector3Stamped <- bias force b_hat in NED [N, N, N m]
     navigation/current          Vector3Stamped <- current velocity estimate in NED [m/s] (current.estimate)
+    navigation/sway_damping     Float64    <- estimated correction to the linear sway damping [N s/m]
+                                (sway_damping.estimate; the controller adds it to its model)
     perception/quay             PoseWithCovarianceStamped -> with harbour_file: the lidar's quay face (quay_detector_node,
                                 BODY FRD), matched to a mapped face; corrects the position ACROSS that face and the
                                 heading (DPKalmanFilter.correct_line). Near a quay GNSS suffers from multipath, and the
@@ -51,6 +53,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Imu, NavSatFix
+from std_msgs.msg import Float64
 
 from cybership_utilities import blueboat_io, vessel_model
 from cybership_utilities.marine_craft.tow import LoadCell
@@ -81,6 +84,13 @@ class DPObserverNode(Node):
         self.declare_parameter("current.estimate", True)
         self.declare_parameter("current.q", 1.0e-5)             # [(m/s)^2/s]
         self.declare_parameter("current.p0", 0.04)              # [(m/s)^2] initial variance (0.2 m/s)
+        # adaptive sway damping (observer.py): the least known model number, estimated while the boat moves sideways
+        # (bench, sway 4x lower than the model: 6 -> 36 of 36 safe dockings). Frozen below v_min, kept within
+        # -95 % .. +100 % of the model's linear sway damping
+        self.declare_parameter("sway_damping.estimate", True)
+        self.declare_parameter("sway_damping.q", 50.0)          # [(N s/m)^2/s]
+        self.declare_parameter("sway_damping.p0", 1.0e4)        # [(N s/m)^2] initial variance (100 N s/m)
+        self.declare_parameter("sway_damping.v_min", 0.03)      # [m/s] sideways through the water
         self.declare_parameter("delay_compensation", True)
         self.declare_parameter("input", "sim")                  # "sim" or "lekf" (see the module docstring)
         self.declare_parameter("lekf.topic", "/navigation/odometry/ned")
@@ -117,10 +127,15 @@ class DPObserverNode(Node):
         current = None
         if self.get_parameter("current.estimate").value:
             current = {"q": self.get_parameter("current.q").value, "p0": self.get_parameter("current.p0").value}
+        sway = None
+        if self.get_parameter("sway_damping.estimate").value:
+            d22 = float(vessel_model.D_3dof(params)[1, 1])
+            sway = {"q": self.get_parameter("sway_damping.q").value, "p0": self.get_parameter("sway_damping.p0").value,
+                    "v_min": self.get_parameter("sway_damping.v_min").value, "bounds": (-0.95 * d22, d22)}
         self.kf = DPKalmanFilter(M, vessel_model.D_3dof(params),
                                  q_bias=self.get_parameter("q_bias").value,
                                  q_nu=self.get_parameter("q_nu").value, damping=damping, wave_filter=wf,
-                                 current=current)
+                                 current=current, sway_damping=sway)
         s = config.get("sensors", {})
         gnss = gnss_config(config, self.get_parameter("gnss_profile").value) if "gnss" in s else {}
         compass = s.get("compass", {})
@@ -157,6 +172,7 @@ class DPObserverNode(Node):
         self.pub_odom = self.create_publisher(Odometry, "navigation/odom", 10)
         self.pub_bias = self.create_publisher(Vector3Stamped, "navigation/bias", 10)
         self.pub_current = self.create_publisher(Vector3Stamped, "navigation/current", 10)
+        self.pub_sway = self.create_publisher(Float64, "navigation/sway_damping", 10)
         from cybership_utilities.loop_timing import LoopTimer
         self.timing_step = LoopTimer(self, "filter step", period=self.h)
         self.timing_meas = LoopTimer(self, "measurements")
@@ -173,7 +189,8 @@ class DPObserverNode(Node):
         else:
             measurements = (f"GNSS sigma {self.sigma_gnss:.2f} m, compass {math.degrees(self.sigma_psi):.1f} deg, "
                             f"lever arm {self.lever_arm.tolist()}")
-        self.get_logger().info(f"DP Kalman filter (Fossen 13.4.6, wave filter {wf}, current {current}) from {path}: "
+        self.get_logger().info(f"DP Kalman filter (Fossen 13.4.6, wave filter {wf}, current {current}, adaptive sway "
+                               f"damping {sway}) from {path}: "
                                f"{measurements}")
 
     def on_tau(self, msg):
@@ -394,6 +411,8 @@ class DPObserverNode(Node):
             c.header.stamp, c.header.frame_id = stamp, odom.header.frame_id
             c.vector.x, c.vector.y = (float(v) for v in self.kf.current)
             self.pub_current.publish(c)
+        if self.kf.na:
+            self.pub_sway.publish(Float64(data=self.kf.sway_damping))
 
 
 def main(args=None):

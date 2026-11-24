@@ -331,6 +331,9 @@ class PositionController(Node):
         self._plan_pub = self.create_publisher(Path, 'guidance/plan', 1)
         self.bias_hat = None            # observer bias b_hat in NED [N, N, N m] (navigation/bias)
         self.create_subscription(Vector3Stamped, 'navigation/bias', self._on_bias, 10)
+        self.sway_damping_hat = 0.0     # observer's correction to the linear sway damping [N s/m]
+        self.create_subscription(Float64, 'navigation/sway_damping',
+                                 lambda m: setattr(self, 'sway_damping_hat', float(m.data)), 10)
         self.current_hat = None         # observer current velocity in NED [m/s, m/s] (navigation/current)
         self.create_subscription(Vector3Stamped, 'navigation/current', self._on_current, 10)
 
@@ -455,7 +458,8 @@ class PositionController(Node):
             w = np.asarray(self.get_parameter('control.omega_n').value, dtype=float)
             z = np.asarray(self.get_parameter('control.zeta').value, dtype=float)
             self.Kp_mb = m * w**2
-            self.Kd_mb = np.maximum(2.0 * z * m * w - d, 0.0)
+            self.Kd_mb_raw = 2.0 * z * m * w
+            self.Kd_mb = np.maximum(self.Kd_mb_raw - d, 0.0)
             self.Ki_mb = self.get_parameter('control.ki_ratio').value * w * self.Kp_mb
             self.max_integral_force = np.asarray(
                 self.get_parameter('control.max_integral_force').value, dtype=float)
@@ -922,8 +926,16 @@ class PositionController(Node):
         else:
             damping_ff = self.D_eff @ nu_rd
         damping_ff[0] += self._tow_drag(nu_rd[0])
+        # the observer's sway damping (adaptive): the same model in the feedforward and in Kd = 2 zeta wn m - d,
+        # which counts on the hull's own damping (with one too high the loop is underdamped)
+        dv = self.sway_damping_hat
+        damping_ff[1] += dv * nu_rd[1]
+        Kd = self.Kd_mb
+        if dv:
+            Kd = Kd.copy()
+            Kd[1] = max(self.Kd_mb_raw[1] - (np.diag(self.D_eff)[1] + dv), 0.0)
         tau_ff = self.M_eff @ nu_rd_dot + damping_ff
-        tau_fb = self.Kp_mb * e_body + self.Kd_mb * (nu_d - nu) + tau_i
+        tau_fb = self.Kp_mb * e_body + Kd * (nu_d - nu) + tau_i
         self._tau_parts = (tau_ff, tau_fb)
         tau = tau_ff + tau_fb
         return float(tau[0]), float(tau[1]), float(tau[2])

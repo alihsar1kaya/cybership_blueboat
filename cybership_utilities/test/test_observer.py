@@ -276,3 +276,37 @@ def test_estimate_stays_out_of_the_quay_when_a_fender_stops_the_boat():
         worst[constrain] = max(depth)
     assert worst[False] > 0.03
     assert worst[True] < 0.005
+
+
+def _linear_microampere(d22_offset=0.0):
+    """The filter's own linear 3DOF model as a 6DOF craft, with the true linear sway damping moved by d22_offset."""
+    p = microampere()
+    M3 = np.diag(np.diag(vessel_model.M_eff_3dof(p)))
+    D3 = np.diag(np.diag(vessel_model.D_3dof(p)))
+    M = np.diag([30.2, 30.2, 30.2, 4.0, 3.0, 3.0])
+    D = np.diag([0, 0, 200.0, 20.0, 20.0, 0])
+    M[np.ix_(IDX, IDX)], D[np.ix_(IDX, IDX)] = M3, D3
+    D[1, 1] += d22_offset
+    craft = MarineCraft(M, np.zeros((6, 6)), D, np.diag([0, 0, 2581.0, 300.0, 150.0, 0]))
+    kf = DPKalmanFilter(M3, D3, q_bias=Q_BIAS, q_nu=Q_NU,
+                        sway_damping=dict(q=50.0, p0=1e4, v_min=0.03, bounds=(-0.95 * D3[1, 1], D3[1, 1])))
+    return craft, kf, D3[1, 1]
+
+
+def test_adaptive_sway_damping_finds_a_lower_true_damping():
+    """The boat's sway damping is 120 N s/m lower than the model's (the physical estimate is 4-5x lower than the
+    assumed 171 N s/m): moving sideways back and forth, the filter's correction d_v finds it."""
+    craft, kf, d22 = _linear_microampere(-120.0)
+    tau = lambda t: np.array([0.0, 12.0 * math.sin(0.15 * t), 0.0])
+    log = run(craft, kf, tau, 300.0)
+    assert kf.sway_damping == pytest.approx(-120.0, abs=30.0)
+    last = log[log[:, 0] > 200]
+    assert np.sqrt(np.mean((last[:, 11] - last[:, 5]) ** 2)) < 0.03       # sway velocity follows the truth
+
+
+def test_adaptive_sway_damping_holds_still_at_rest():
+    """At rest with a constant force the sway damping is not observable (the bias takes the force): the
+    correction must stay where it was instead of drifting."""
+    craft, kf, d22 = _linear_microampere(0.0)
+    run(craft, kf, lambda t: np.zeros(3), 200.0, tau_ext_ned=np.array([0.0, 2.0, 0.0]))   # drifts 0.012 m/s
+    assert abs(kf.sway_damping) < 20.0
