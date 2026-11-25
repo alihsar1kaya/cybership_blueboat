@@ -596,7 +596,10 @@ def run(job):
     quay = Quay(QUAY)
     berth = quay.berth(FACE, SIDE, GAP, (L, B))             # the TRUE berth: what success is measured against
     k_mass, k_damp = rng.uniform(0.8, 1.2), rng.uniform(0.8, 1.2)
-    plant = Plant(cfg, params, start, ENVIRONMENTS[env_name], rng, k_mass, k_damp,
+    env = dict(ENVIRONMENTS[env_name])
+    if "current" in env and opts.get("current_scale", 1.0) != 1.0:      # --current-scale: the same direction, slower/faster
+        env["current"] = (env["current"][0] * opts["current_scale"], env["current"][1])
+    plant = Plant(cfg, params, start, env, rng, k_mass, k_damp,
                   sway_model=opts.get("sway_model", "nominal"))
     base = params
     params = sway_variant(base, opts.get("model_sway", "nominal"))    # what the planner, DP and observer believe
@@ -783,6 +786,7 @@ def main():
     ap.add_argument("--q-nu-scale", type=float, default=1.0, help="observer velocity process noise x this")
     ap.add_argument("--q-bias-scale", type=float, default=1.0, help="observer bias process noise x this")
     ap.add_argument("--force-fraction", type=float, default=1.0, help="share of each thruster's force a plan may use")
+    ap.add_argument("--current-scale", type=float, default=1.0, help="current speeds x this (0.10 m/s in the envs)")
     ap.add_argument("--adapt-sway", type=float, default=0.0,
                     help="observer estimates the sway damping, process noise q [(N s/m)^2/s]; 0 = off")
     ap.add_argument("--damping-ff", type=float, default=1.0, help="scale on the DP's damping feedforward")
@@ -802,7 +806,7 @@ def main():
                 sway_model=a.sway_model, kd_full=a.kd_full, model_sway=a.model_sway, damping_ff=a.damping_ff,
                 obs_sway=a.obs_sway, dp_sway=a.dp_sway, ocp_sway=a.ocp_sway,
                 q_nu_scale=a.q_nu_scale, q_bias_scale=a.q_bias_scale, force_fraction=a.force_fraction,
-                adapt_sway=a.adapt_sway)
+                adapt_sway=a.adapt_sway, current_scale=a.current_scale)
     jobs = [(s, e, st, 1000 * i + j, a.cpu_factor, a.t_max, opts)
             for s in a.strategies.split(",") for i, e in enumerate(envs) for j, st in enumerate(starts)]
     t0 = time.time()
